@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "model": {
+    "layers": [{
+      "id": "conversion_test", "tokens": 2, "model_width": 4,
+      "q_heads": 1, "kv_heads": 1, "qk_head_width": 4,
+      "value_head_width": 4, "ffn_width": 8,
+      "norm": "pre", "activation": "gelu", "attention_mask": "none",
+      "qkv_bias": false, "output_bias": false, "ffn_bias": false,
+      "attention_residual": true, "ffn_residual": true
+    }]
+  },
+  "numeric": {"mpc_ring_bits": 43, "mpc_scale_bits": 13},
+  "conversion": {
+    "statistical_security_bits": 40,
+    "fft_scale_bits": 24,
+    "allow_internal_mod_switch": true
+  },
+  "softmax": {
+    "clip_threshold": -13.0,
+    "masked_shift": -14.0,
+    "exp_divisor_bits": 6,
+    "exp_squarings": 6,
+    "row_padding": "next_power_of_two"
+  },
+  "he_parameter_profiles": {
+    "conversion_test": {
+      "polynomial_degree": 2048,
+      "coefficient_modulus_bits": [40, 30, 40],
+      "default_scale_bits": 20,
+      "input_scale_bits": 20,
+      "output_scale_bits": 20,
+      "declared_depth": 1,
+      "terminal_prime_count": 1,
+      "require_exact_terminal_level": true,
+      "security_level": "none"
+    }
+  },
+  "layers": [{
+    "id": "conversion_test",
+    "he_regions": {
+      "region1": {"profile": "conversion_test", "input_layout": "spatial", "output_layout": "reduction"},
+      "region2": {"profile": "conversion_test", "input_layout": "spatial", "output_layout": "attention_output"},
+      "region3": {"profile": "conversion_test", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
+      "region4": {"profile": "conversion_test", "input_layout": "attention_output", "output_layout": "reduction"},
+      "region5": {"profile": "conversion_test", "input_layout": "spatial", "output_layout": "spatial"}
+    }
+  }],
+  "placement": {
+    "ln_statistics": "region1", "attention_main": "region2",
+    "softmax_polynomial": "region3", "attention_output_ln2": "region4",
+    "ffn_activation": "region5"
+  },
+  "execution": {"threads": 1}
+}

@@ -1,0 +1,231 @@
+diff --git a/src/BuildingBlocks/aux-protocols.h b/src/BuildingBlocks/aux-protocols.h
+--- a/src/BuildingBlocks/aux-protocols.h
++++ b/src/BuildingBlocks/aux-protocols.h
+@@ -49,5 +49,9 @@ public:
+       // bitwidth of x
+       int32_t bw_x);
+
++  // BLB extension: wrap bit for additive shares modulo an odd prime Q.
++  void wrap_computation_prime(uint64_t *x, uint8_t *y, int32_t size,
++                              int32_t bw_x, uint64_t Q);
++
+   // y = sel * x
+   void multiplexer(
+diff --git a/src/BuildingBlocks/aux-protocols.cpp b/src/BuildingBlocks/aux-protocols.cpp
+--- a/src/BuildingBlocks/aux-protocols.cpp
++++ b/src/BuildingBlocks/aux-protocols.cpp
+@@ -55,5 +55,17 @@ void AuxProtocols::wrap_computation(uint64_t *x, uint8_t *y, int32_t size,
+   delete[] tmp_x;
+ }
+
++void AuxProtocols::wrap_computation_prime(uint64_t *x, uint8_t *y,
++                                          int32_t size, int32_t bw_x,
++                                          uint64_t Q) {
++  assert(bw_x <= 64);
++  uint64_t *tmp_x = new uint64_t[size];
++  for (int i = 0; i < size; ++i) {
++    tmp_x[i] = party == sci::ALICE ? x[i] % Q : (Q - 1 - x[i]) % Q;
++  }
++  mill->compare(y, tmp_x, size, bw_x, true);
++  delete[] tmp_x;
++}
++
+ void AuxProtocols::multiplexer(uint8_t *sel, uint64_t *x, uint64_t *y,
+                                int32_t size, int32_t bw_x, int32_t bw_y) {
+diff --git a/src/FloatingPoint/fixed-point.h b/src/FloatingPoint/fixed-point.h
+--- a/src/FloatingPoint/fixed-point.h
++++ b/src/FloatingPoint/fixed-point.h
+@@ -24,5 +24,7 @@
+ #include "FloatingPoint/bool-data.h"
+ #include "Math/math-functions.h"
+ #include <tuple>
++#include <vector>
++using std::vector;
+
+ // #define MSNZB_GC
+diff --git a/src/LinearHE/CMakeLists.txt b/src/LinearHE/CMakeLists.txt
+--- a/src/LinearHE/CMakeLists.txt
++++ b/src/LinearHE/CMakeLists.txt
+@@ -1,26 +1,4 @@
+ find_package(OpenMP REQUIRED)
+-# find_package(OpenFHE)
+-# set(CMAKE_CXX_FLAGS "${OpenFHE_CXX_FLAGS} -Wno-error")
+-find_package(SEAL 4.1.1 EXACT QUIET PATHS "${PROJECT_SOURCE_DIR}/build/" NO_DEFAULT_PATH)
+-if (NOT SEAL_FOUND)
+-    message(STATUS "SEAL 4.1.1 was not found: clone and install SEAL locally")
+-    if (NOT EXISTS "${PROJECT_SOURCE_DIR}/extern/SEAL/CMakeLists.txt")
+-        find_package(Git REQUIRED)
+-        message(STATUS "initialize Git submodule: extern/SEAL")
+-        execute_process(COMMAND git submodule update --init --recursive extern/SEAL
+-                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+-        execute_process(COMMAND git apply "${PROJECT_SOURCE_DIR}/cmake/seal.patch"
+-            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/extern/SEAL")
+-    endif ()
+-    execute_process(COMMAND ${CMAKE_COMMAND} -DCMAKE_INSTALL_PREFIX=${PROJECT_SOURCE_DIR}/build .
+-            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/extern/SEAL/")
+-    execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
+-        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/extern/SEAL/")
+-    find_package(SEAL 4.1.1 EXACT REQUIRED PATHS "${PROJECT_SOURCE_DIR}/build/" NO_DEFAULT_PATH)
+-endif()
+-
+-
+-execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
+-            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/extern/SEAL/")
++find_package(SEAL 4.4.5 EXACT CONFIG REQUIRED)
+
+ # link_directories( ${OpenFHE_LIBDIR} )
+diff --git a/cmake/SCIConfig.cmake.in b/cmake/SCIConfig.cmake.in
+--- a/cmake/SCIConfig.cmake.in
++++ b/cmake/SCIConfig.cmake.in
+@@ -10,7 +10,7 @@ find_dependency(Threads REQUIRED)
+
+ set_and_check(INSTALL_DIR "@PACKAGE_INSTALL_DIR@")
+ find_dependency(Eigen3 REQUIRED PATHS "@PACKAGE_BUILD_DIR@/../extern/eigen/build" NO_DEFAULT_PATH)
+-find_dependency(SEAL REQUIRED PATHS "@PACKAGE_BUILD_DIR@" NO_DEFAULT_PATH)
++find_dependency(SEAL 4.4.5 EXACT CONFIG REQUIRED)
+ find_dependency(OpenMP REQUIRED)
+
+ # Add the targets file
+diff --git a/src/utils/net_io_channel.h b/src/utils/net_io_channel.h
+--- a/src/utils/net_io_channel.h
++++ b/src/utils/net_io_channel.h
+@@ -25,9 +25,13 @@ SOFTWARE.
+ #define NETWORK_IO_CHANNEL
+
+ #include "utils/io_channel.h"
++#include <chrono>
+ #include <iostream>
++#include <poll.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <string>
++#include <stdexcept>
++#include <thread>
+ using std::string;
+@@ -79,15 +83,35 @@ public:
+       setsockopt(mysocket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse,
+                  sizeof(reuse));
+       if (::bind(mysocket, (struct sockaddr *)&serv, sizeof(struct sockaddr)) <
+           0) {
+-        perror("error: bind");
+-        exit(1);
++        const int saved_errno = errno;
++        close(mysocket);
++        mysocket = -1;
++        throw std::runtime_error(
++            string("SCI NetIO bind failed: ") + strerror(saved_errno));
+       }
+       if (listen(mysocket, 1) < 0) {
+-        perror("error: listen");
+-        exit(1);
++        const int saved_errno = errno;
++        close(mysocket);
++        mysocket = -1;
++        throw std::runtime_error(
++            string("SCI NetIO listen failed: ") + strerror(saved_errno));
+       }
++      pollfd listener{mysocket, POLLIN, 0};
++      if (poll(&listener, 1, 30000) <= 0) {
++        close(mysocket);
++        mysocket = -1;
++        throw std::runtime_error("SCI NetIO accept deadline exceeded");
++      }
+       consocket = accept(mysocket, (struct sockaddr *)&dest, &socksize);
++      if (consocket < 0) {
++        const int saved_errno = errno;
++        close(mysocket);
++        mysocket = -1;
++        throw std::runtime_error(
++            string("SCI NetIO accept failed: ") + strerror(saved_errno));
++      }
+       close(mysocket);
++      mysocket = -1;
+     } else {
+       addr = string(address);
+@@ -95,14 +118,34 @@ public:
+       dest.sin_addr.s_addr = inet_addr(address);
+       dest.sin_port = htons(port);
+
++      const auto deadline = std::chrono::steady_clock::now() +
++                            std::chrono::seconds(30);
+       while (1) {
+         consocket = socket(AF_INET, SOCK_STREAM, 0);
+
+         if (connect(consocket, (struct sockaddr *)&dest,
+                     sizeof(struct sockaddr)) == 0) {
++          sockaddr_in local_endpoint{};
++          sockaddr_in peer_endpoint{};
++          socklen_t local_size = sizeof(local_endpoint);
++          socklen_t peer_size = sizeof(peer_endpoint);
++          if (getsockname(consocket, (struct sockaddr *)&local_endpoint,
++                          &local_size) == 0 &&
++              getpeername(consocket, (struct sockaddr *)&peer_endpoint,
++                          &peer_size) == 0 &&
++              local_endpoint.sin_port == peer_endpoint.sin_port &&
++              local_endpoint.sin_addr.s_addr == peer_endpoint.sin_addr.s_addr) {
++            close(consocket);
++            consocket = -1;
++            usleep(1000);
++            continue;
++          }
+           break;
+         }
+
+         close(consocket);
++        consocket = -1;
++        if (std::chrono::steady_clock::now() >= deadline)
++          throw std::runtime_error("SCI NetIO connect deadline exceeded");
+         usleep(1000);
+       }
+@@ -123,5 +131,10 @@ public:
+     //   std::cout << "connected\n";
+   }
+
++  void cancel() noexcept {
++    if (consocket >= 0) shutdown(consocket, SHUT_RDWR);
++    if (mysocket >= 0) shutdown(mysocket, SHUT_RDWR);
++  }
++
+   ~NetIO() {
+     fflush(stream);
+@@ -173,9 +187,8 @@ public:
+     int sent = 0;
+     while (sent < len) {
+       int res = fwrite(sent + (char *)data, 1, len - sent, stream);
+-      if (res >= 0)
+-        sent += res;
+-      else
+-        fprintf(stderr, "error: net_send_data %d\n", res);
++      if (res <= 0)
++        throw std::runtime_error("SCI NetIO send failed or was cancelled");
++      sent += res;
+     }
+     has_sent = true;
+@@ -192,9 +205,8 @@ public:
+     int sent = 0;
+     while (sent < len) {
+       int res = fread(sent + (char *)data, 1, len - sent, stream);
+-      if (res >= 0)
+-        sent += res;
+-      else
+-        fprintf(stderr, "error: net_send_data %d\n", res);
++      if (res <= 0)
++        throw std::runtime_error("SCI NetIO receive failed or was cancelled");
++      sent += res;
+     }
+   }
+diff --git a/src/utils/io_pack.h b/src/utils/io_pack.h
+--- a/src/utils/io_pack.h
++++ b/src/utils/io_pack.h
+@@ -27,6 +27,12 @@ public:
+
+   uint64_t get_comm() { return io->counter + io_rev->counter + io_GC->counter; }
+
++  void cancel() noexcept {
++    if (io != nullptr) io->cancel();
++    if (io_rev != nullptr) io_rev->cancel();
++    if (io_GC != nullptr) io_GC->cancel();
++  }
++
+   ~IOPack() {

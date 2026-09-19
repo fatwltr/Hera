@@ -1,0 +1,47 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "framework",
+      "displayName": "Framework only",
+      "binaryDir": "${sourceDir}/build/framework",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "full",
+      "displayName": "Full SEAL/HERA-SCI runtime",
+      "binaryDir": "${sourceDir}/build/full",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "HERA_ENABLE_FULL_RUNTIME": "ON",
+        "SEAL_DIR": "${sourceDir}/.deps/build/seal-4.4.5/install/lib/cmake/SEAL-4.4",
+        "SCI_DIR": "${sourceDir}/.deps/build/hera-sci/install/lib/cmake/SCI",
+        "Eigen3_DIR": "${sourceDir}/.deps/build/hera-sci/SCI/extern/eigen/build"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "framework", "configurePreset": "framework", "jobs": 2 },
+    { "name": "full", "configurePreset": "full", "jobs": 2 }
+  ],
+  "testPresets": [
+    {
+      "name": "framework",
+      "configurePreset": "framework",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "full",
+      "configurePreset": "full",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 1 }
+    }
+  ]
+}

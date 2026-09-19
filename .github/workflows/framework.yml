@@ -1,0 +1,17 @@
+name: framework
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake --preset framework
+      - name: Build
+        run: cmake --build --preset framework
+      - name: Test
+        run: ctest --preset framework
