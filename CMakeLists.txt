@@ -119,15 +119,21 @@ if(HERA_ENABLE_CONVERSION)
             "SCI_DIR at its install/lib/cmake/SCI directory.")
     endif()
     file(READ "${HERA_SCI_MANIFEST}" HERA_SCI_MANIFEST_CONTENT)
-    if(NOT HERA_SCI_MANIFEST_CONTENT MATCHES "(^|\n)HERA_SCI_ABI=2(\n|$)")
+    if(NOT HERA_SCI_MANIFEST_CONTENT MATCHES "(^|\n)HERA_SCI_ABI=3(\n|$)")
         message(FATAL_ERROR
             "The selected HERA-SCI package has an incompatible ABI; "
-            "HERA_SCI_ABI=2 is required.")
+            "HERA_SCI_ABI=3 is required.")
     endif()
     if(NOT HERA_SCI_MANIFEST_CONTENT MATCHES "(^|\n)SEAL_VERSION=4\\.4\\.5(\n|$)")
         message(FATAL_ERROR
             "The selected HERA-SCI package was not built against exact "
             "Microsoft SEAL 4.4.5.")
+    endif()
+    if(NOT HERA_SCI_MANIFEST_CONTENT MATCHES
+       "(^|\n)OT_BACKEND=VOLE_SILENT_OT(\n|$)")
+        message(FATAL_ERROR
+            "The selected HERA-SCI package does not use the required "
+            "VOLE/Silent-OT backend.")
     endif()
 
     add_library(hera_conversion STATIC
@@ -135,6 +141,7 @@ if(HERA_ENABLE_CONVERSION)
         conversion/conversion_types.cpp
         conversion/random_source.cpp
         conversion/random_sampling.cpp
+        conversion/mpc_session.cpp
         conversion/netio_transport.cpp
         conversion/protocol_wire.cpp
         conversion/fixed_ckks_transform.cpp
@@ -161,6 +168,17 @@ if(HERA_ENABLE_CONVERSION)
              COMMAND hera_conversion_unit_tests)
     set_tests_properties(hera_conversion_unit_tests PROPERTIES
         PASS_REGULAR_EXPRESSION "HERA_CONVERSION_UNIT_STATUS=PASS")
+
+    add_executable(hera_vole_ot_tests tests/vole_ot_tests.cpp)
+    target_link_libraries(hera_vole_ot_tests PRIVATE
+        SCI::SCI-FloatingPoint Threads::Threads)
+    target_compile_options(hera_vole_ot_tests PRIVATE
+        -Wall -Wextra -Wpedantic -Wno-pedantic)
+    add_test(NAME hera_vole_ot_tests COMMAND hera_vole_ot_tests)
+    set_tests_properties(hera_vole_ot_tests PROPERTIES
+        TIMEOUT 120
+        RESOURCE_LOCK hera_conversion_ports
+        PASS_REGULAR_EXPRESSION "HERA_VOLE_OT_STATUS=PASS")
 
     add_executable(hera_conversion_protocol_tests
         tests/conversion_protocol_tests.cpp)

@@ -9,6 +9,8 @@
 
 namespace hera {
 
+class SharedMpcSession;
+
 struct SoftmaxInputs {
     TensorHandle scaled_attention_scores;
     PublicAttentionMask mask;
@@ -79,14 +81,15 @@ public:
 class MpcSoftmaxRuntime {
 public:
     MpcSoftmaxRuntime(PartyRole role, std::string peer_address, int port);
+    explicit MpcSoftmaxRuntime(std::shared_ptr<SharedMpcSession> session);
     ~MpcSoftmaxRuntime();
     MpcSoftmaxRuntime(MpcSoftmaxRuntime &&) noexcept;
     MpcSoftmaxRuntime &operator=(MpcSoftmaxRuntime &&) noexcept;
     MpcSoftmaxRuntime(const MpcSoftmaxRuntime &) = delete;
     MpcSoftmaxRuntime &operator=(const MpcSoftmaxRuntime &) = delete;
 
-    // Ends the current SCI channel so another protocol family can use its
-    // own OT session. The next operation reconnects lazily.
+    // Releases only this runtime's algorithm wrapper.  The underlying shared
+    // session remains alive so later sequential kernels reuse VOLE state.
     void ReleaseSession();
     void Cancel() noexcept;
 
@@ -111,9 +114,7 @@ public:
 
 private:
     class Impl;
-    PartyRole role_;
-    std::string peer_address_;
-    int port_{};
+    std::shared_ptr<SharedMpcSession> session_;
     std::shared_ptr<Impl> impl_;
 };
 

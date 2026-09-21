@@ -503,7 +503,8 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
         auto inverse = mpc_layer_norm_.ReciprocalSqrt(
             variance.value(), layer.attention_norm_rsqrt_bits, nullptr);
         if (!inverse.ok()) return inverse.status();
-        mpc_layer_norm_.ReleaseSession();
+        // The LayerNorm runtime is shared by the orchestrator; retaining its
+        // Ferret state avoids another base/setup phase at LN2 and next layers.
         if (report)
             report->mpc_milliseconds += std::chrono::duration<double,
                 std::milli>(Clock::now() - mpc_started).count();
@@ -586,6 +587,10 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
             if (!stored.ok()) return stored.status();
             stored = arena_.he.Put(value_id, values.take_value());
             if (!stored.ok()) return stored.status();
+            arena_.he.Erase(evaluated.value().scaled_attention_scores.id);
+            arena_.he.Erase(evaluated.value().value.id);
+            arena_.he.Erase(centered_id);
+            arena_.he.Erase(inverse_id);
         }
         if (report)
             report->he_milliseconds = std::chrono::duration<double,
@@ -912,6 +917,9 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
             if (coordinator_) coordinator_->Abort(block2.status(), index, 0);
             return block2.status();
         }
+        // Once Pre-LN has refreshed a previous-layer result, that ciphertext
+        // is dead. Preserve only the caller-owned network input for repeats.
+        if (hidden.id != input.id) arena_.he.Erase(hidden.id);
         AppendStage(report, index, "pre_ln_block2", started, Status::Ok(),
                     Metrics(entry_report, layer.tokens));
         if (coordinator_) {
@@ -933,6 +941,7 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
             if (coordinator_) coordinator_->Abort(probabilities.status(), index, 1);
             return probabilities.status();
         }
+        arena_.he.Erase(block2.value().block2.scaled_attention_scores.id);
         AppendStage(report, index, "softmax", started, Status::Ok(),
                     Metrics(softmax_report));
         if (coordinator_) {
@@ -956,6 +965,9 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
             if (coordinator_) coordinator_->Abort(ln2.status(), index, 2);
             return ln2.status();
         }
+        arena_.mpc.Erase(probabilities.value().probability_shares.id);
+        arena_.he.Erase(block2.value().block2.value.id);
+        arena_.he.Erase(block2.value().attention_residual.id);
         AppendStage(report, index, "attention_ln2", started, Status::Ok(),
                     Metrics(attention_report));
         if (coordinator_) {
@@ -978,6 +990,8 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
             if (coordinator_) coordinator_->Abort(activation.status(), index, 3);
             return activation.status();
         }
+        arena_.mpc.Erase(ln2.value().centered_shares.id);
+        arena_.mpc.Erase(ln2.value().inverse_stddev_shares.id);
         AppendStage(report, index, "ffn_gelu", started, Status::Ok(),
                     Metrics(ffn_report));
         if (coordinator_) {
@@ -1002,6 +1016,8 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
             if (coordinator_) coordinator_->Abort(closed.status(), index, 4);
             return closed.status();
         }
+        arena_.mpc.Erase(activation.value().activation_shares.id);
+        arena_.he.Erase(ln2.value().ffn_residual.id);
         hidden = closed.value().hidden_states;
         AppendStage(report, index, "block5_bridge", started, Status::Ok(),
                     Metrics(bridge_report));

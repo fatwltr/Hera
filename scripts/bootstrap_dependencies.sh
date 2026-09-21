@@ -79,7 +79,7 @@ seal_manifest="$seal_output/install/share/hera-seal/manifest.txt"
 grep -qx "SEAL_VERSION=$SEAL_VERSION" "$seal_manifest"
 grep -qx "SEAL_COMMIT=$SEAL_COMMIT" "$seal_manifest"
 
-sci_output="$build_root/hera-sci"
+sci_output="$build_root/hera-sci-abi-$HERA_SCI_ABI"
 sci_dir="$sci_output/install/lib/cmake/SCI"
 if [[ ! -f "$sci_dir/SCIConfig.cmake" ]]; then
   [[ ! -e "$sci_output" ]] || {
@@ -95,6 +95,7 @@ fi
 sci_manifest="$sci_output/install/share/hera-sci/manifest.txt"
 grep -qx "HERA_SCI_ABI=$HERA_SCI_ABI" "$sci_manifest"
 grep -qx "SEAL_VERSION=$SEAL_VERSION" "$sci_manifest"
+grep -qx "OT_BACKEND=VOLE_SILENT_OT" "$sci_manifest"
 grep -qx "BLB_COMMIT=$BLB_COMMIT" "$sci_manifest"
 grep -qx "BOLT_COMMIT=$BOLT_COMMIT" "$sci_manifest"
 

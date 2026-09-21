@@ -53,6 +53,19 @@ Result<MpcShareTensor> CryptoTensorStore::GetMpcShare(TensorId id) const
     return found->second;
 }
 
+void CryptoTensorStore::Erase(TensorId id) noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ciphertexts_.erase(id);
+    mpc_shares_.erase(id);
+}
+
+std::size_t CryptoTensorStore::Size() const noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ciphertexts_.size() + mpc_shares_.size();
+}
+
 Result<ConversionPackingRegistry::Key>
 ConversionPackingRegistry::MakeKey(const TensorSpec &spec)
 {

@@ -21,6 +21,8 @@ public:
 
     Result<std::optional<SealCipherBatch>> GetCiphertext(TensorId id) const;
     Result<MpcShareTensor> GetMpcShare(TensorId id) const;
+    void Erase(TensorId id) noexcept;
+    std::size_t Size() const noexcept;
 
 private:
     mutable std::mutex mutex_;

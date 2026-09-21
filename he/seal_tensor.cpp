@@ -456,6 +456,18 @@ Result<TensorHandle> SealCipherTensorStore::Allocate(SealCipherTensor tensor)
     return TensorHandle{id, spec};
 }
 
+void SealCipherTensorStore::Erase(TensorId id) noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    tensors_.erase(id);
+}
+
+std::size_t SealCipherTensorStore::Size() const noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tensors_.size();
+}
+
 Result<void> SealPlainParameterStore::PutMatrix(
     const WeightHandle &handle, std::vector<double> row_major)
 {

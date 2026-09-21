@@ -6,6 +6,8 @@
 
 namespace hera {
 
+class SharedMpcSession;
+
 struct AttentionLn2Inputs {
     TensorHandle probability_shares;
     TensorHandle value;
@@ -122,6 +124,7 @@ public:
 class MpcLayerNormRuntime {
 public:
     MpcLayerNormRuntime(PartyRole role, std::string peer_address, int port);
+    explicit MpcLayerNormRuntime(std::shared_ptr<SharedMpcSession> session);
     ~MpcLayerNormRuntime();
     MpcLayerNormRuntime(MpcLayerNormRuntime &&) noexcept;
     MpcLayerNormRuntime &operator=(MpcLayerNormRuntime &&) noexcept;
@@ -137,9 +140,7 @@ public:
 
 private:
     class Impl;
-    PartyRole role_;
-    std::string peer_address_;
-    int port_{};
+    std::shared_ptr<SharedMpcSession> session_;
     std::shared_ptr<Impl> impl_;
 };
 

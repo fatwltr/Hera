@@ -1,4 +1,5 @@
 #include "hera/private_runtime.h"
+#include "hera/mpc_session.h"
 
 #include <seal/seal.h>
 
@@ -146,9 +147,14 @@ PartyResult RunParty(
                     ? std::vector<std::uint8_t>{2, 3, 5, 7}
                     : std::vector<std::uint8_t>{11, 13, 17, 19}),
             "127.0.0.1", base + 100, 1);
-        hera::MpcSoftmaxRuntime softmax(role, "127.0.0.1", base + 300);
-        hera::MpcLayerNormRuntime norm(role, "127.0.0.1", base + 500);
-        hera::MpcGeluRuntime gelu(role, "127.0.0.1", base + 700);
+        auto nonlinear_session = std::make_shared<hera::SharedMpcSession>(
+            role, "127.0.0.1", base + 300);
+        hera::MpcSoftmaxRuntime softmax(nonlinear_session);
+        hera::MpcLayerNormRuntime norm(nonlinear_session);
+        hera::MpcGeluRuntime gelu(nonlinear_session);
+        auto session_ready = nonlinear_session->Prepare();
+        if (!session_ready.ok())
+            return {false, {}, session_ready.status().message()};
         auto runtime = std::make_shared<hera::SealSciTransformerRuntime>(
             config, contexts, arena, parameters, converter, softmax, norm,
             gelu);
@@ -196,6 +202,11 @@ PartyResult RunParty(
         if (!output.ok()) return {false, {}, output.status().message()};
         Require(report.stages.size() == config.layers.size() * 5,
                 "runtime did not report five fused stages per layer");
+        const auto expected_he = role == hera::PartyRole::kServer
+            ? std::size_t{2} : std::size_t{0};
+        if (arena.he.Size() != expected_he || arena.mpc.Size() != 0)
+            return {false, {},
+                    "runtime arena retained dead intermediate tensors"};
         return {true, output.value().tensor, {}};
     } catch (const std::exception &error) {
         return {false, {}, error.what()};

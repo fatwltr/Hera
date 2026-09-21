@@ -1,6 +1,29 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -10,7 +10,8 @@ include(CMakeFindDependencyMacro)
+ project (SCI)
+ set(NAME "SCI")
+ 
+-add_definitions(-DUSE_VOLE=0)
++# HERA uses BLB's Ferret/PCG silent-OT path instead of SplitIKNP.
++add_compile_definitions(USE_VOLE=1)
+ 
+ option(NO_REVEAL_OUTPUT "Only output secret shares after 2PC" OFF)
+ message(STATUS "Option: NO_REVEAL_OUTPUT = ${NO_REVEAL_OUTPUT}")
 diff --git a/src/BuildingBlocks/aux-protocols.h b/src/BuildingBlocks/aux-protocols.h
 --- a/src/BuildingBlocks/aux-protocols.h
 +++ b/src/BuildingBlocks/aux-protocols.h
+@@ -25,7 +25,9 @@
+ #include "Millionaire/millionaire.h"
+ #include "Millionaire/millionaire_with_equality.h"
+ #include "OT/emp-ot.h"
++#if !USE_VOLE
+ #include "GC/emp-sh2pc.h"
++#endif
+ 
+ class AuxProtocols {
+ public:
 @@ -49,5 +49,9 @@ public:
        // bitwidth of x
        int32_t bw_x);
@@ -11,6 +34,36 @@ diff --git a/src/BuildingBlocks/aux-protocols.h b/src/BuildingBlocks/aux-protoco
 +
    // y = sel * x
    void multiplexer(
+diff --git a/src/FloatingPoint/CMakeLists.txt b/src/FloatingPoint/CMakeLists.txt
+--- a/src/FloatingPoint/CMakeLists.txt
++++ b/src/FloatingPoint/CMakeLists.txt
+@@ -1,4 +1,7 @@
+ add_library(SCI-FloatingPoint fp-math.cpp floating-point.cpp fixed-point.cpp bool-data.cpp)
++# OTPack is a public header type. Export the selected backend macro so every
++# consumer sees the same class layout as the compiled SCI libraries.
++target_compile_definitions(SCI-FloatingPoint PUBLIC USE_VOLE=1)
+ target_link_libraries(SCI-FloatingPoint
+     PUBLIC SCI-BuildingBlocks SCI-Math
+ )
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -113,8 +113,15 @@ install(FILES
+         "cleartext_library_fixed.h"
+         "cleartext_library_fixed_uniform.h"
+         "cleartext_library_float.h"
+         DESTINATION include)
++
++# Public VOLE/Silent-OT headers include <emp-ot/ferret/...>. Install the
++# vendored, patched headers with SCI so consumers never pick an incompatible
++# system emp-ot release.
++install(DIRECTORY
++        "${PROJECT_SOURCE_DIR}/deps/emp-ot/emp-ot"
++        DESTINATION include)
+ 
+ install(FILES
+         "${CMAKE_CURRENT_SOURCE_DIR}/utils/cmake/FindGMP.cmake"
+         "${CMAKE_CURRENT_SOURCE_DIR}/utils/cmake/source_of_randomness.cmake"
 diff --git a/src/BuildingBlocks/aux-protocols.cpp b/src/BuildingBlocks/aux-protocols.cpp
 --- a/src/BuildingBlocks/aux-protocols.cpp
 +++ b/src/BuildingBlocks/aux-protocols.cpp
@@ -32,6 +85,256 @@ diff --git a/src/BuildingBlocks/aux-protocols.cpp b/src/BuildingBlocks/aux-proto
 +
  void AuxProtocols::multiplexer(uint8_t *sel, uint64_t *x, uint64_t *y,
                                 int32_t size, int32_t bw_x, int32_t bw_y) {
+@@ -74,6 +86,21 @@ void AuxProtocols::multiplexer(uint8_t *sel, uint64_t *x, uint64_t *y,
+   for (int i = 0; i < size; i++) {
+     corr_data[i] = (x[i] * (1 - 2 * uint64_t(sel[i]))) & mask_y;
+   }
++#if USE_VOLE
++  // Ferret uses independent straight/reversed transports. Keep a stable wire
++  // order so the two directions never concurrently mutate a shared protocol
++  // object during lazy extension.
++  if (party == sci::ALICE) {
++    otpack->iknp_straight->send_cot(data_S, corr_data, size, bw_y);
++  } else {
++    otpack->iknp_straight->recv_cot(data_R, (bool *)sel, size, bw_y);
++  }
++  if (party == sci::ALICE) {
++    otpack->iknp_reversed->recv_cot(data_R, (bool *)sel, size, bw_y);
++  } else {
++    otpack->iknp_reversed->send_cot(data_S, corr_data, size, bw_y);
++  }
++#else
+ #pragma omp parallel num_threads(2)
+   {
+     if (omp_get_thread_num() == 1) {
+@@ -90,6 +118,7 @@ void AuxProtocols::multiplexer(uint8_t *sel, uint64_t *x, uint64_t *y,
+       }
+     }
+   }
++#endif
+   for (int i = 0; i < size; i++) {
+     y[i] = ((x[i] * uint64_t(sel[i]) + data_R[i] - data_S[i]) & mask_y);
+   }
+@@ -657,4 +669,9 @@ void AuxProtocols::msnzb_GC(uint64_t *x, uint8_t *one_hot_vector, int32_t bw_x,
+                             int32_t size) {
++#if USE_VOLE
++  // The GC shortcut imports SplitIKNP base keys directly. Silent OT does not
++  // expose compatible base-key state, so use the equivalent SCI protocol.
++  msnzb_one_hot(x, one_hot_vector, bw_x, size);
++#else
+   int batch_size = (bw_x * size < (1 << 20)) ? bw_x * size : (1 << 20);
+   SemiHonestParty<NetIO> *prot_exec =
+       setup_semi_honest<NetIO>(iopack->io_GC, party, batch_size);
+@@ -729,6 +746,7 @@ void AuxProtocols::msnzb_GC(uint64_t *x, uint8_t *one_hot_vector, int32_t bw_x,
+   delete prot_exec;
+ 
+   return;
++#endif
+ }
+ 
+ template void AuxProtocols::lookup_table(uint64_t **spec, uint64_t *x,
+diff --git a/src/OT/vole_ot_pack.h b/src/OT/vole_ot_pack.h
+--- a/src/OT/vole_ot_pack.h
++++ b/src/OT/vole_ot_pack.h
+@@ -55,7 +55,7 @@ public:
+   NetIO *ios[1];
++  NetIO *ios_reversed[1];
+ 
+   OTPack(IOPack *iopack, int party, bool do_setup = false) {
+-    std::cout << "using PCG ot-extension" << std::endl;
+     this->party = party;
+     this->do_setup = do_setup;
+     this->iopack = iopack;
+@@ -63,13 +63,11 @@ public:
+     ios[0] = iopack->io;
++    ios_reversed[0] = iopack->io_rev;
+ 
+-    silent_ot = new cheetah::SilentOT<NetIO>(party, 1, ios, false, true,
+-                                         party == sci::ALICE
+-                                             ? PRE_OT_DATA_REG_SEND_FILE_ALICE
+-                                             : PRE_OT_DATA_REG_RECV_FILE_BOB);
++    // HERA sessions are independently keyed. Do not reuse BLB's fixed,
++    // process-global preprocessing files across ports or concurrent runs.
++    silent_ot = new cheetah::SilentOT<NetIO>(party, 1, ios, false, true, "");
+     silent_ot_reversed = new cheetah::SilentOT<NetIO>(
+-        3 - party, 1, ios, false, true,
+-        party == sci::ALICE ? PRE_OT_DATA_REG_RECV_FILE_ALICE
+-                            : PRE_OT_DATA_REG_SEND_FILE_BOB);
++        3 - party, 1, ios_reversed, false, true, "");
+ 
+     for (int i = 0; i < KKOT_TYPES; i++) {
+       kkot[i] = new cheetah::SilentOTN<NetIO>(silent_ot, 1 << (i + 1));
+@@ -144,3 +137,3 @@ public:
+ };
+ } // namespace sci
+-#endif OT_VOLE_H__
++#endif // OT_VOLE_H__
+diff --git a/src/OT/ferret/silent_ot.h b/src/OT/ferret/silent_ot.h
+--- a/src/OT/ferret/silent_ot.h
++++ b/src/OT/ferret/silent_ot.h
+@@ -12,8 +12,9 @@
+ #include "utils/performance.h"
+ #include "OT/split-utils.h"
+ #include "OT/np.h"
+-using namespace std;
+ namespace cheetah {
++using namespace std;
++using namespace emp;
+ 
+ template <typename IO>
+ class SilentOT : public sci::OT<SilentOT<IO>> {
+@@ -36,6 +37,5 @@ public:
+     ferret = new FerretCOT<IO>(party, threads, ios, malicious, run_setup, pre_file);
+     if (warm_up) {
+-      std::cout << "warm up\n";
+       block tmp;
+       ferret->rcot(&tmp, 1);
+     }
+@@ -701,5 +701,5 @@ public:
+             pad[(k - j) * num_hashes + h] = sci::xorBlocks(rcm_data[ot_idx], sci::toBlock(h));
+             pad[pad1_offset + (k - j) * num_hashes + h] =
+-                sci::xorBlocks(pad[(k - j) * num_hashes + h], block_s);
++                sci::xorBlocks(pad[(k - j) * num_hashes + h], ferret->Delta);
+           }
+         }
+@@ -923,5 +923,5 @@ public:
+           pad[(k - j) * num_hashes + h] = sci::xorBlocks(rcm_data[ot_idx], sci::toBlock(h));
+           pad[pad1_offset + (k - j) * num_hashes + h] =
+-              sci::xorBlocks(pad[(k - j) * num_hashes + h], block_s);
++              sci::xorBlocks(pad[(k - j) * num_hashes + h], ferret->Delta);
+         }
+       }
+diff --git a/deps/emp-ot/emp-ot/ferret/spcot_sender.h b/deps/emp-ot/emp-ot/ferret/spcot_sender.h
+--- a/deps/emp-ot/emp-ot/ferret/spcot_sender.h
++++ b/deps/emp-ot/emp-ot/ferret/spcot_sender.h
+@@ -8 +8 @@
+-using namespace emp;
++namespace emp {
+@@ -91,4 +91,5 @@ class SPCOT_Sender { public:
+ 	}
+ };
++} // namespace emp
+ 
+ #endif
+diff --git a/deps/emp-ot/emp-ot/ferret/spcot_recver.h b/deps/emp-ot/emp-ot/ferret/spcot_recver.h
+--- a/deps/emp-ot/emp-ot/ferret/spcot_recver.h
++++ b/deps/emp-ot/emp-ot/ferret/spcot_recver.h
+@@ -8 +8 @@
+-using namespace emp;
++namespace emp {
+@@ -103,3 +103,4 @@ public:
+ 	}
+ };
++} // namespace emp
+ #endif
+diff --git a/deps/emp-ot/emp-ot/ferret/preot.h b/deps/emp-ot/emp-ot/ferret/preot.h
+--- a/deps/emp-ot/emp-ot/ferret/preot.h
++++ b/deps/emp-ot/emp-ot/ferret/preot.h
+@@ -5 +5 @@
+-using namespace emp;
++namespace emp {
+@@ -89,3 +89,4 @@ class OTPre { public:
+ 	}
+ };
++} // namespace emp
+ #endif// _PRE_OT__
+diff --git a/deps/emp-ot/emp-ot/ferret/mpcot_reg.h b/deps/emp-ot/emp-ot/ferret/mpcot_reg.h
+--- a/deps/emp-ot/emp-ot/ferret/mpcot_reg.h
++++ b/deps/emp-ot/emp-ot/ferret/mpcot_reg.h
+@@ -7,5 +7,5 @@
+ #include "emp-ot/ferret/spcot_recver.h"
+ #include "emp-ot/ferret/preot.h"
+ 
+-using namespace emp;
++namespace emp {
+ using std::future;
+@@ -212,3 +212,4 @@ public:
+ 	}
+ };
++} // namespace emp
+ #endif
+diff --git a/deps/emp-ot/emp-ot/ferret/lpn_f2.h b/deps/emp-ot/emp-ot/ferret/lpn_f2.h
+--- a/deps/emp-ot/emp-ot/ferret/lpn_f2.h
++++ b/deps/emp-ot/emp-ot/ferret/lpn_f2.h
+@@ -5 +5 @@
+-using namespace emp;
++namespace emp {
+@@ -110,3 +110,4 @@ class LpnF2 { public:
+ 
+ };
++} // namespace emp
+ #endif
+diff --git a/deps/emp-ot/emp-ot/ferret/twokeyprp.h b/deps/emp-ot/emp-ot/ferret/twokeyprp.h
+--- a/deps/emp-ot/emp-ot/ferret/twokeyprp.h
++++ b/deps/emp-ot/emp-ot/ferret/twokeyprp.h
+@@ -5 +5 @@
+-using namespace emp;
++namespace emp {
+@@ -86,3 +86,4 @@ class TwoKeyPRP { public:
+ #endif
+ };
++} // namespace emp
+ #endif
+diff --git a/deps/emp-ot/emp-ot/ferret/ferret_cot.h b/deps/emp-ot/emp-ot/ferret/ferret_cot.h
+--- a/deps/emp-ot/emp-ot/ferret/ferret_cot.h
++++ b/deps/emp-ot/emp-ot/ferret/ferret_cot.h
+@@ -52,5 +52,6 @@ private:
+ 	int64_t M;
+ 	bool is_malicious;
+ 	bool extend_initialized;
++	bool persist_preprocessing;
+ 
+	block one;
+diff --git a/deps/emp-ot/emp-ot/ferret/base_cot.h b/deps/emp-ot/emp-ot/ferret/base_cot.h
+--- a/deps/emp-ot/emp-ot/ferret/base_cot.h
++++ b/deps/emp-ot/emp-ot/ferret/base_cot.h
+@@ -4,4 +4,5 @@
+ #include "emp-ot/ferret/preot.h"
+ 
++namespace emp {
+ template<typename IO>
+ class BaseCot { public:
+@@ -118,4 +119,5 @@ class BaseCot { public:
+ 	}
+ };
++} // namespace emp
+ 
+ #endif
+diff --git a/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp b/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp
+--- a/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp
++++ b/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp
+@@ -7,3 +7,4 @@ FerretCOT<T>::FerretCOT(int party, int threads, T **ios,
+ 	this->ios = ios;
+ 	this->is_malicious = malicious;
++	this->persist_preprocessing = !pre_file.empty();
+ 	one = makeBlock(0xFFFFFFFFFFFFFFFFLL,0xFFFFFFFFFFFFFFFELL);
+@@ -27,4 +28,6 @@ FerretCOT<T>::~FerretCOT() {
+ 	if (ot_pre_data != nullptr) {
+-		if(party == ALICE) write_pre_data128_to_file((void*)ot_pre_data, (__uint128_t)Delta, pre_ot_filename);
+-		else write_pre_data128_to_file((void*)ot_pre_data, (__uint128_t)0, pre_ot_filename);
++		if(persist_preprocessing) {
++			if(party == ALICE) write_pre_data128_to_file((void*)ot_pre_data, (__uint128_t)Delta, pre_ot_filename);
++			else write_pre_data128_to_file((void*)ot_pre_data, (__uint128_t)0, pre_ot_filename);
++		}
+ 		delete[] ot_pre_data;
+@@ -106,14 +109,12 @@ void FerretCOT<T>::setup(block Deltain, std::string pre_file) {
+ template<typename T>
+ void FerretCOT<T>::setup(std::string pre_file) {
+-	if(pre_file != "") pre_ot_filename = pre_file;
+-	else {
+-		pre_ot_filename=(party==ALICE?PRE_OT_DATA_REG_SEND_FILE:PRE_OT_DATA_REG_RECV_FILE);
+-	}
++	if(persist_preprocessing) pre_ot_filename = pre_file;
++	else pre_ot_filename.clear();
+ 
+ 	ThreadPool pool2(1);
+ 	auto fut = pool2.enqueue([this](){
+ 		extend_initialization();
+ 	});
+ 
+ 	ot_pre_data = new block[n_pre];
+-	bool hasfile = file_exists(pre_ot_filename), hasfile2;
++	bool hasfile = persist_preprocessing && file_exists(pre_ot_filename), hasfile2;
 diff --git a/src/FloatingPoint/fixed-point.h b/src/FloatingPoint/fixed-point.h
 --- a/src/FloatingPoint/fixed-point.h
 +++ b/src/FloatingPoint/fixed-point.h
@@ -86,10 +389,22 @@ diff --git a/cmake/SCIConfig.cmake.in b/cmake/SCIConfig.cmake.in
  find_dependency(OpenMP REQUIRED)
 
  # Add the targets file
+diff --git a/src/utils/mitccrh.h b/src/utils/mitccrh.h
+--- a/src/utils/mitccrh.h
++++ b/src/utils/mitccrh.h
+@@ -9,5 +9,8 @@
+ #include <string>
+ 
+ namespace cheetah {
++using emp::block;
++using emp::AES_opt_key_schedule;
++using emp::ParaEnc;
+ 
+ /*
 diff --git a/src/utils/net_io_channel.h b/src/utils/net_io_channel.h
 --- a/src/utils/net_io_channel.h
 +++ b/src/utils/net_io_channel.h
-@@ -25,9 +25,13 @@ SOFTWARE.
+@@ -25,9 +25,14 @@ SOFTWARE.
  #define NETWORK_IO_CHANNEL
 
  #include "utils/io_channel.h"
@@ -102,6 +417,7 @@ diff --git a/src/utils/net_io_channel.h b/src/utils/net_io_channel.h
  #include <string>
 +#include <stdexcept>
 +#include <thread>
++#include <vector>
  using std::string;
 @@ -79,15 +83,35 @@ public:
        setsockopt(mysocket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse,
@@ -178,13 +494,27 @@ diff --git a/src/utils/net_io_channel.h b/src/utils/net_io_channel.h
 +          throw std::runtime_error("SCI NetIO connect deadline exceeded");
          usleep(1000);
        }
-@@ -123,5 +131,10 @@ public:
+@@ -123,5 +132,24 @@ public:
      //   std::cout << "connected\n";
    }
 
 +  void cancel() noexcept {
 +    if (consocket >= 0) shutdown(consocket, SHUT_RDWR);
 +    if (mysocket >= 0) shutdown(mysocket, SHUT_RDWR);
++  }
++
++  void send_bool(const bool *data, int len) {
++    std::vector<unsigned char> packed((len + 7) / 8, 0);
++    for (int i = 0; i < len; ++i)
++      packed[i / 8] |= static_cast<unsigned char>(data[i]) << (i % 8);
++    if (!packed.empty()) send_data(packed.data(), packed.size());
++  }
++
++  void recv_bool(bool *data, int len) {
++    std::vector<unsigned char> packed((len + 7) / 8, 0);
++    if (!packed.empty()) recv_data(packed.data(), packed.size());
++    for (int i = 0; i < len; ++i)
++      data[i] = ((packed[i / 8] >> (i % 8)) & 1U) != 0;
 +  }
 +
    ~NetIO() {

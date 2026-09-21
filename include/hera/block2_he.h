@@ -88,6 +88,8 @@ public:
     Result<void> Put(TensorId id, SealCipherTensor tensor);
     Result<SealCipherTensor> Get(TensorId id) const;
     Result<TensorHandle> Allocate(SealCipherTensor tensor);
+    void Erase(TensorId id) noexcept;
+    std::size_t Size() const noexcept;
 
 private:
     mutable std::mutex mutex_;

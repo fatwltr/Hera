@@ -1,4 +1,5 @@
 #include "hera/softmax.h"
+#include "hera/detail/mpc_session_internal.h"
 
 #include "OT/split-kkot.h"
 #include "FloatingPoint/fixed-point.h"
@@ -403,16 +404,10 @@ Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
 
 class MpcSoftmaxRuntime::Impl {
 public:
-    Impl(PartyRole role, std::string peer_address, int port)
-        : role_(role), party_(role == PartyRole::kServer ? sci::ALICE
-                                                         : sci::BOB),
-          io_(std::make_unique<sci::IOPack>(
-              party_, port,
-              role == PartyRole::kServer ? std::string{} : peer_address)),
-          ot_(std::make_unique<sci::OTPack>(io_.get(), party_))
-    {
-        fix_ = std::make_unique<FixOp>(party_, io_.get(), ot_.get());
-    }
+    explicit Impl(std::shared_ptr<SharedMpcSession> session)
+        : session_(std::move(session)), native_(session_->Acquire()),
+          party_(native_->party())
+    {}
 
     FixArray Secret(const std::vector<std::uint64_t> &shares,
                     const NumericFormat &numeric)
@@ -435,11 +430,12 @@ public:
                                          array.data + array.size);
     }
 
-    std::uint64_t communication() const { return io_->get_comm(); }
-    std::uint64_t rounds() const { return io_->get_rounds(); }
-    void Cancel() noexcept { if (io_) io_->cancel(); }
+    std::uint64_t communication() const
+    { return native_->communication_bytes(); }
+    std::uint64_t rounds() const { return native_->rounds(); }
+    void Cancel() noexcept { session_->Cancel(); }
     int party() const { return party_; }
-    FixOp &fix() { return *fix_; }
+    FixOp &fix() { return native_->fix(); }
 
     FixArray MultiplyUnsigned(const FixArray &left, const FixArray &right,
                               int output_bits)
@@ -449,34 +445,7 @@ public:
             output_bits >= 64)
             throw std::invalid_argument(
                 "unsupported unsigned multiplication contract");
-        auto left_wide = fix_->extend(left, output_bits);
-        auto right_wide = fix_->extend(right, output_bits);
-        std::vector<std::uint64_t> alice_left(left.size, 0);
-        std::vector<std::uint64_t> bob_left(left.size, 0);
-        if (party_ == sci::ALICE)
-            std::copy(left_wide.data, left_wide.data + left.size,
-                      alice_left.begin());
-        else
-            std::copy(left_wide.data, left_wide.data + left.size,
-                      bob_left.begin());
-
-        FixArray alice_product(party_, left.size, false, output_bits,
-                               left.s + right.s);
-        FixArray bob_product(party_, left.size, false, output_bits,
-                             left.s + right.s);
-        // The installed BLB-SCI fork disables the parallel reversed-COT arm
-        // used by MultMode::None. Two one-sided products use the intact
-        // straight-COT arm and exactly reconstruct
-        // (left_alice + left_bob) * right.
-        fix_->mult->hadamard_product(
-            left.size, alice_left.data(), right_wide.data,
-            alice_product.data, output_bits, output_bits, output_bits,
-            false, false, MultMode::Alice_has_A);
-        fix_->mult->hadamard_product(
-            left.size, bob_left.data(), right_wide.data,
-            bob_product.data, output_bits, output_bits, output_bits,
-            false, false, MultMode::Bob_has_A);
-        auto product = fix_->add(alice_product, bob_product);
+        auto product = fix().mul(left, right, output_bits);
         product.s = left.s + right.s;
         product.signed_ = false;
         return product;
@@ -503,28 +472,28 @@ public:
         // Softmax guarantees denominator >= 1.0, hence the reciprocal lies
         // in [0,1] and needs one integer bit plus s fractional bits.
         const int work_bits = output_bits + 1;
-        auto remainder = fix_->extend(numerator, work_bits);
-        auto divisor = fix_->extend(denominator, work_bits);
-        auto divisor_minus_one = fix_->sub(divisor, std::uint64_t{1});
+        auto remainder = fix().extend(numerator, work_bits);
+        auto divisor = fix().extend(denominator, work_bits);
+        auto divisor_minus_one = fix().sub(divisor, std::uint64_t{1});
 
         // This SCI fork has an incorrect Boolean NOT implementation.  On an
         // integer ring, a >= b is exactly a > b-1 and avoids NOT entirely.
-        auto take = fix_->GT(remainder, divisor_minus_one);
-        auto difference = fix_->sub(remainder, divisor);
-        remainder = fix_->if_else(take, difference, remainder);
-        auto quotient = fix_->B2A(take, false, output_bits);
-        quotient = fix_->mul(
+        auto take = fix().GT(remainder, divisor_minus_one);
+        auto difference = fix().sub(remainder, divisor);
+        remainder = fix().if_else(take, difference, remainder);
+        auto quotient = fix().B2A(take, false, output_bits);
+        quotient = fix().mul(
             quotient, std::uint64_t{1} << output_scale, output_bits);
 
         for (int bit = output_scale - 1; bit >= 0; --bit) {
-            auto doubled = fix_->mul(remainder, std::uint64_t{2}, work_bits);
-            take = fix_->GT(doubled, divisor_minus_one);
-            difference = fix_->sub(doubled, divisor);
-            remainder = fix_->if_else(take, difference, doubled);
-            auto quotient_bit = fix_->B2A(take, false, output_bits);
-            auto contribution = fix_->mul(
+            auto doubled = fix().mul(remainder, std::uint64_t{2}, work_bits);
+            take = fix().GT(doubled, divisor_minus_one);
+            difference = fix().sub(doubled, divisor);
+            remainder = fix().if_else(take, difference, doubled);
+            auto quotient_bit = fix().B2A(take, false, output_bits);
+            auto contribution = fix().mul(
                 quotient_bit, std::uint64_t{1} << bit, output_bits);
-            quotient = fix_->add(quotient, contribution);
+            quotient = fix().add(quotient, contribution);
         }
         quotient.s = output_scale;
         quotient.signed_ = false;
@@ -536,40 +505,46 @@ public:
         std::vector<std::uint64_t> zero_shares(values.size, 0);
         NumericFormat format{values.ell, values.s, values.signed_};
         auto secret_zero = Secret(zero_shares, format);
-        auto zero = fix_->EQ(values, secret_zero);
+        auto zero = fix().EQ(values, secret_zero);
         BoolArray any_zero(party_, 1);
         any_zero.data[0] = zero.data[0];
         for (int i = 1; i < zero.size; ++i) {
             BoolArray next(party_, 1);
             next.data[0] = zero.data[i];
-            auto either = fix_->bool_op->XOR(any_zero, next);
-            auto both = fix_->bool_op->AND(any_zero, next);
-            any_zero = fix_->bool_op->XOR(either, both);
+            auto either = fix().bool_op->XOR(any_zero, next);
+            auto both = fix().bool_op->AND(any_zero, next);
+            any_zero = fix().bool_op->XOR(either, both);
         }
-        auto server_result = fix_->bool_op->output(
+        auto server_result = fix().bool_op->output(
             sci::ALICE, any_zero);
         std::uint8_t any = 0;
         if (party_ == sci::ALICE) {
             any = server_result.data[0] & std::uint8_t{1};
-            io_->io->send_data(&any, sizeof(any));
+            native_->fix().iopack->io->send_data(&any, sizeof(any));
         } else {
-            io_->io->recv_data(&any, sizeof(any));
+            native_->fix().iopack->io->recv_data(&any, sizeof(any));
         }
         return any != 0;
     }
 
 private:
-    PartyRole role_;
+    std::shared_ptr<SharedMpcSession> session_;
+    std::shared_ptr<SharedMpcSession::Impl> native_;
     int party_;
-    std::unique_ptr<sci::IOPack> io_;
-    std::unique_ptr<sci::OTPack> ot_;
-    std::unique_ptr<FixOp> fix_;
 };
 
 MpcSoftmaxRuntime::MpcSoftmaxRuntime(
     PartyRole role, std::string peer_address, int port)
-    : role_(role), peer_address_(std::move(peer_address)), port_(port)
+    : session_(std::make_shared<SharedMpcSession>(
+          role, std::move(peer_address), port))
 {}
+
+MpcSoftmaxRuntime::MpcSoftmaxRuntime(
+    std::shared_ptr<SharedMpcSession> session)
+    : session_(std::move(session))
+{
+    if (!session_) throw std::invalid_argument("MPC session is null");
+}
 
 MpcSoftmaxRuntime::~MpcSoftmaxRuntime() = default;
 MpcSoftmaxRuntime::MpcSoftmaxRuntime(MpcSoftmaxRuntime &&) noexcept = default;
@@ -583,8 +558,7 @@ void MpcSoftmaxRuntime::ReleaseSession()
 
 void MpcSoftmaxRuntime::Cancel() noexcept
 {
-    auto active = std::atomic_load(&impl_);
-    if (active) active->Cancel();
+    if (session_) session_->Cancel();
 }
 
 Result<MpcShareTensor> MpcSoftmaxRuntime::CenterAndMask(
@@ -596,7 +570,7 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::CenterAndMask(
     try {
         if (!std::atomic_load(&impl_))
             std::atomic_store(&impl_, std::make_shared<Impl>(
-                role_, peer_address_, port_));
+                session_));
         auto score_valid = scores.Validate();
         if (!score_valid.ok()) return score_valid.status();
         if (scores.physical_shape !=
@@ -673,7 +647,7 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::ClipAndNormalize(
     try {
         if (!std::atomic_load(&impl_))
             std::atomic_store(&impl_, std::make_shared<Impl>(
-                role_, peer_address_, port_));
+                session_));
         auto shifted_valid = shifted_scores.Validate();
         if (!shifted_valid.ok()) return shifted_valid.status();
         auto exp_valid = exponentials.Validate();
@@ -879,9 +853,10 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
         auto shifted = mpc_.CenterAndMask(
             scores.value(), layer_, inputs.mask, config_.softmax, report);
         if (!shifted.ok()) return shifted.status();
-        // BLB-SCI's OT state is session-scoped. Close the nonlinear channel
-        // before the converter resumes its independent MPC-to-CKKS session.
-        mpc_.ReleaseSession();
+        // Keep the independent Softmax OT session alive across the HE
+        // exponent segment. Ferret supports a stream of OT requests and the
+        // converter uses different sockets, so rebuilding the session here
+        // would only repeat its expensive setup.
 
         auto block3_map = SoftmaxPackingPlanner::RealRows(
             layer_, block3_context.slot_count(),
@@ -951,10 +926,8 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
             shifted.value(), exponentials.value(), layer_, inputs.mask,
             config_.softmax, report);
         if (!probabilities.ok()) return probabilities.status();
-        // The following Attention/LN2 stage owns a distinct SCI session.
-        // Closing this one avoids carrying OT state across independently
-        // framed conversion and reciprocal-square-root protocols.
-        mpc_.ReleaseSession();
+        // The session is retained for the next layer/inference. Its protocol
+        // stream is independent from Attention/LN2 and conversion transports.
 
         TensorSpec output_spec;
         output_spec.shape = probabilities.value().physical_shape;

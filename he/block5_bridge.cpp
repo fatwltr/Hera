@@ -598,7 +598,7 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
             variance.value(), next.attention_norm_rsqrt_bits,
             report ? &report->layer_norm : nullptr);
         if (!inverse.ok()) return inverse.status();
-        mpc_layer_norm_.ReleaseSession();
+        // Keep the shared LayerNorm OT stream available to the orchestrator.
 
         const auto centered_id = allocate_id();
         const auto inverse_id = allocate_id();

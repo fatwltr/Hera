@@ -1,4 +1,5 @@
 #include "hera/private_runtime.h"
+#include "hera/mpc_session.h"
 
 #include <seal/seal.h>
 #include <seal/version.h>
@@ -19,12 +20,12 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 // Each SCI IOPack owns three sockets at p, p+50, and p+100. Keep complete
-// ranges disjoint; adjacent nominal ports would otherwise collide once all
-// nonlinear runtimes are alive in the same process.
+// ranges disjoint. All sequential nonlinear kernels share the Softmax range;
+// the former LayerNorm/GeLU ranges remain reserved for wire compatibility.
 constexpr int kConversionWorkerOffset = 100;
 constexpr int kSoftmaxOffset = 300;
-constexpr int kLayerNormOffset = 500;
-constexpr int kGeluOffset = 700;
+// Keep the historical +500/+700 ranges reserved so deployments can upgrade
+// without changing their firewall allowance.
 constexpr int kRuntimePortExtent = 800;
 
 void Check(const Result<void> &result)
@@ -299,11 +300,11 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
         MakeProductionRandomSource(), options.ip,
         options.port + kConversionWorkerOffset,
         options.threads);
-    MpcSoftmaxRuntime softmax(
+    auto nonlinear_session = std::make_shared<SharedMpcSession>(
         role, options.ip, options.port + kSoftmaxOffset);
-    MpcLayerNormRuntime norm(
-        role, options.ip, options.port + kLayerNormOffset);
-    MpcGeluRuntime gelu(role, options.ip, options.port + kGeluOffset);
+    MpcSoftmaxRuntime softmax(nonlinear_session);
+    MpcLayerNormRuntime norm(nonlinear_session);
+    MpcGeluRuntime gelu(nonlinear_session);
     auto coordinator = RuntimeCoordinator::Connect(
         role, role == PartyRole::kClient ? options.ip : "",
         options.port + 1);
@@ -317,6 +318,9 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
         control->Cancel();
     });
     Check(coordinator.value()->Start());
+    // Establish the large VOLE/Silent-OT state once in setup.  All nonlinear
+    // kernels consume the same ordered stream during online evaluation.
+    Check(nonlinear_session->Prepare());
     auto runtime = std::make_shared<SealSciTransformerRuntime>(
         config, contexts, arena, parameters, converter, softmax, norm, gelu,
         coordinator.value().get());

@@ -110,6 +110,16 @@ state is converted once to shares and independently refreshed to Region-1 L0
 for statistics and shared Region-2/4 L0 for the new attention residual. It is
 never incorrectly added directly to a next-layer level-6 value.
 
+The ordered Softmax, LayerNorm-rsqrt and GeLU MPC calls share one
+`SharedMpcSession`. Its sockets and Ferret/PCG Silent-OT state are prepared
+once during setup and then reused across all layers. Conversion deliberately
+keeps separate worker sessions because its workers execute concurrently and
+must not interleave their stateful OT streams with nonlinear calls. Finished
+stage inputs are erased from `RuntimeTensorArena` as soon as the next stage
+has consumed them; only the caller-owned input and final output survive a
+one-layer evaluation. This prevents ciphertext/share payload growth across
+layers and repeated benchmark runs.
+
 Build and run the small functional profile with:
 
 ```bash
@@ -129,10 +139,12 @@ cmake --build build-runtime --target \
 machines. `--verify` is intentionally accepted only in local test mode and
 decrypts only the final returned ciphertext. The control channel uses `port`,
 the coordinator uses `port+1`, and conversion uses `port+10` with workers
-from `port+100`. Softmax, LayerNorm and GeLU use disjoint SCI `IOPack` ranges
-beginning at `port+300`, `port+500` and `port+700`; each range includes the
-internal `+50` and `+100` sockets. The complete range must stay below 32768
-so loopback clients cannot self-connect through Linux's ephemeral port range.
+from `port+100`. Softmax, LayerNorm and GeLU sequentially share the SCI
+`IOPack` range beginning at `port+300`, including its internal `+50` and
+`+100` sockets. Historical `port+500` and `port+700` ranges remain reserved
+for deployment compatibility. The complete `base..base+800` range must stay
+below 32768 so loopback clients cannot self-connect through Linux's ephemeral
+port range.
 The CLI reports
 setup, online compute, final-output transfer, communication bytes and rounds
 separately. `runtime_tiny.json` is a functional CI profile; the Figure-10
@@ -375,7 +387,8 @@ column-first physical packing, and evaluates:
  -> signed 43-bit/scale-13 GeLU shares
 ```
 
-The MPC implementation uses the configured HERA-SCI IKNP OT backend. The HE
+The MPC implementation uses HERA-SCI's VOLE/Silent-OT backend, implemented by
+the Ferret/PCG correlated-OT extension. The HE
 polynomial shares `x^2`, `x^3` and `x^4` between both branches:
 
 ```text
@@ -409,12 +422,21 @@ levels, server secret-key absence, and a full two-process
 MPC-to-CKKS-to-HE-to-MPC-to-GeLU execution. Decryption/reconstruction occurs
 only in test code after the stage finishes.
 The unified HERA-SCI package is required for conversion and nonlinear builds.
-It retains BOLT's enabled two-direction IKNP COT path, which is required by
-BLB's reciprocal-square-root implementation. HERA's Softmax multiplication
-also keeps its two one-sided straight-COT formulation. Both paths operate on
-shares and do not reconstruct an intermediate value. CMake rejects an
-unmarked original BLB-SCI installation because its disabled reverse COT arm
-silently produces incorrect `MultMode::None` products.
+It retains BOLT's two-direction COT API but dispatches both directions through
+BLB's VOLE/Silent-OT implementation; this API is required by BLB's
+reciprocal-square-root implementation. Softmax multiplication now uses SCI's
+native `MultMode::None` secret-share product over the independent straight and
+reversed Ferret transports. The patched boolean wire format and Ferret delta
+handling are covered by dedicated comparison, mux, batched multiplication and
+1-out-of-N OT tests. These paths operate on shares and do not reconstruct an
+intermediate value. CMake rejects a SCI installation without the ABI-3 VOLE
+manifest marker.
+
+The upstream Ferret construction still bootstraps its base correlated OTs once
+with emp-ot's IKNP primitive; all HERA online OT extension calls use the
+Ferret/PCG Silent-OT objects. Eliminating even this setup-only bootstrap would
+require replacing Ferret's base-COT construction and is not part of this
+backend switch.
 
 The execution report counts the two CKKS-to-MPC calls, one internal
 MPC-to-CKKS call, HE multiplications/rescales, MPC operations, conversion and
@@ -434,13 +456,13 @@ Enable the third concrete stage with the repository-built HERA-SCI package:
 ```bash
 scripts/prepare_seal.sh /path/to/SEAL-v4.4.5 build/seal-4.4.5 4
 scripts/prepare_hera_sci.sh /path/to/BLB/SCI /path/to/BOLT/SCI \
-  "$PWD/build/seal-4.4.5/install/lib/cmake/SEAL-4.4" build/hera-sci 4
+  "$PWD/build/seal-4.4.5/install/lib/cmake/SEAL-4.4" build/hera-sci-abi-3 4
 cmake -S . -B build-attention-ln2 \
   \
   -DHERA_ENABLE_ATTENTION_LN2=ON \
   -DSEAL_DIR=$PWD/build/seal-4.4.5/install/lib/cmake/SEAL-4.4 \
-  -DSCI_DIR=$PWD/build/hera-sci/install/lib/cmake/SCI \
-  -DEigen3_DIR=$PWD/build/hera-sci/SCI/extern/eigen/build
+  -DSCI_DIR=$PWD/build/hera-sci-abi-3/install/lib/cmake/SCI \
+  -DEigen3_DIR=$PWD/build/hera-sci-abi-3/SCI/extern/eigen/build
 cmake --build build-attention-ln2 --target hera_attention_ln2_tests -j
 ```
 

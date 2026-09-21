@@ -21,7 +21,8 @@ CKKS hidden states
 - 支持多层 Pre-LN + GeLU、MHA/GQA/MQA 和非方阵 Wq/Wk/Wv/Wo/Wu/Wd。
 - HE 参数由 JSON 中每个 region 的 profile 独立配置。
 - 服务端持有模型与密文，客户端持有 CKKS secret key。
-- MPC 使用修补后的 HERA-SCI/IKNP OT；SEAL 固定为 4.4.5。
+- MPC 使用修补后的 HERA-SCI VOLE/Silent-OT（Ferret/PCG）后端；SEAL 固定为 4.4.5。
+- Softmax、LayerNorm rsqrt、GeLU 顺序复用同一个预热 MPC 会话；stage 完成后立即释放失效的密文/分享 payload。
 - `runtime_tiny.json` 用于可执行回归；`figure10_smoke.json` 是资源开销较大的研究配置。
 - 参数允许 `security_level=none`，因此本仓库不是生产安全实现。
 
@@ -175,7 +176,3 @@ runtime/      整体编排、协调、abort/heartbeat
 tests/        单元、协议和端到端测试
 scripts/      依赖准备和复现脚本
 ```
-
-## 发布前注意
-
-本目录已初始化为 Git 仓库，但没有擅自替项目选择开源许可证。公开发布到 GitHub 前，请由代码所有者确定许可证，并审阅 [第三方依赖说明](THIRD_PARTY.md)。

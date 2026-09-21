@@ -21,6 +21,11 @@ repo_root=$(dirname "$script_dir")
   echo "Not a BLB-SCI source tree: $blb_source" >&2
   exit 2
 }
+[[ -f "$blb_source/src/OT/vole_ot_pack.h" &&
+   -f "$blb_source/src/OT/ferret/silent_ot.h" ]] || {
+  echo "BLB-SCI source tree does not contain the VOLE/Silent-OT backend: $blb_source" >&2
+  exit 2
+}
 [[ -f "$bolt_source/src/FloatingPoint/fp-math.cpp" ]] || {
   echo "Not a BOLT-SCI source tree: $bolt_source" >&2
   exit 2
@@ -73,6 +78,15 @@ cmake -S "$output/SCI/extern/eigen" \
 # migrated onto the BLB copy, then the small BLB prime-wrap extension is added
 # back by a reviewable repository patch.
 rsync -a "$bolt_source/src/" "$output/SCI/src/"
+
+# BOLT's src overlay carries only the IKNP OTPack. Restore BLB's selectable
+# OTPack facade and its Ferret/PCG (USE_VOLE) implementation. The HERA patch
+# below makes USE_VOLE mandatory and adapts the one GC-only IKNP code path.
+rsync -a "$blb_source/src/OT/ot_pack.h" \
+  "$blb_source/src/OT/iknp_ot_pack.h" \
+  "$blb_source/src/OT/vole_ot_pack.h" \
+  "$output/SCI/src/OT/"
+rsync -a "$blb_source/src/OT/ferret/" "$output/SCI/src/OT/ferret/"
 patch -d "$output/SCI" -p1 < "$repo_root/third_party/hera-sci.patch"
 
 cmake -S "$output/SCI" -B "$output/build" \
@@ -104,8 +118,9 @@ if git -C "$eigen_source" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 mkdir -p "$output/install/share/hera-sci"
 printf '%s\n' \
-  'HERA_SCI_ABI=2' \
+  'HERA_SCI_ABI=3' \
   'SEAL_VERSION=4.4.5' \
+  'OT_BACKEND=VOLE_SILENT_OT' \
   "BLB_COMMIT=$blb_commit" \
   "BOLT_COMMIT=$bolt_commit" \
   "EIGEN_COMMIT=$eigen_commit" \

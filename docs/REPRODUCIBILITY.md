@@ -2,14 +2,14 @@
 
 ## What is pinned
 
-`dependencies.lock` fixes the exact upstream revisions of SEAL, BLB and BOLT. The build rejects any SEAL version other than 4.4.5 and any HERA-SCI package without `HERA_SCI_ABI=2`.
+`dependencies.lock` fixes the exact upstream revisions of SEAL, BLB and BOLT. The build rejects any SEAL version other than 4.4.5 and any HERA-SCI package without `HERA_SCI_ABI=3` and `OT_BACKEND=VOLE_SILENT_OT`.
 
 The dependency pipeline is:
 
 1. Build a static Release installation of SEAL 4.4.5 under `.deps/build/`.
 2. Copy the pinned BLB SCI tree to a build directory.
 3. Overlay the pinned BOLT `SCI/src` implementation.
-4. Apply `third_party/hera-sci.patch` for odd-prime wrapping, SEAL 4.4.5 ABI alignment and cancellable networking.
+4. Restore BLB's Ferret/PCG Silent-OT implementation and apply `third_party/hera-sci.patch` for the VOLE backend selection, odd-prime wrapping, SEAL 4.4.5 ABI alignment and cancellable networking.
 5. Build and install the resulting HERA-SCI package under `.deps/build/`.
 6. Configure HERA against only those two package locations.
 
@@ -39,7 +39,7 @@ For an experiment, retain:
 - the HERA Git commit;
 - `dependencies.lock`;
 - `.deps/build/seal-4.4.5/install/share/hera-seal/manifest.txt`;
-- `.deps/build/hera-sci/install/share/hera-sci/manifest.txt`;
+- `.deps/build/hera-sci-abi-3/install/share/hera-sci/manifest.txt`;
 - the JSON configuration;
 - compiler/CMake versions, CPU model, thread count, party topology and command line.
 

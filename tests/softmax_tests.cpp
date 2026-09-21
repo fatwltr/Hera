@@ -230,6 +230,7 @@ void TestMpc(const hera::HeraConfig &root_config)
 
     struct ChildPacket {
         int ok{};
+        std::uint64_t shifted[4]{};
         std::uint64_t probabilities[4]{};
     };
     int result_pipe[2];
@@ -246,10 +247,14 @@ void TestMpc(const hera::HeraConfig &root_config)
         ChildPacket packet;
         packet.ok = client_result.error.empty() &&
                     client_result.probabilities != nullptr;
-        if (packet.ok)
+        if (packet.ok) {
+            std::copy(client_result.shifted->local_share.begin(),
+                      client_result.shifted->local_share.end(),
+                      packet.shifted);
             std::copy(client_result.probabilities->local_share.begin(),
                       client_result.probabilities->local_share.end(),
                       packet.probabilities);
+        }
         const auto written = write(result_pipe[1], &packet, sizeof(packet));
         close(result_pipe[1]);
         _exit(written == static_cast<ssize_t>(sizeof(packet)) && packet.ok
@@ -271,6 +276,20 @@ void TestMpc(const hera::HeraConfig &root_config)
             "MPC client failed");
     Require(server_result.probabilities != nullptr,
             "MPC Softmax did not return probability shares");
+    for (std::size_t index = 0; index < 4; ++index) {
+        const auto bits = (server_result.shifted->local_share[index] +
+                           packet.shifted[index]) & ring_mask;
+        const auto signed_bits = bits >= (std::uint64_t{1} << 42)
+            ? static_cast<std::int64_t>(bits - (std::uint64_t{1} << 43))
+            : static_cast<std::int64_t>(bits);
+        const double shifted = std::ldexp(
+            static_cast<double>(signed_bits), -13);
+        Require(std::abs(shifted - clear_shifted[index]) < 1e-6,
+                "MPC Softmax centered value mismatch at index " +
+                    std::to_string(index) + ": actual=" +
+                    std::to_string(shifted) + ", expected=" +
+                    std::to_string(clear_shifted[index]));
+    }
     for (std::size_t row = 0; row < 2; ++row) {
         double sum = 0.0;
         const double expected_sum = row == 0
@@ -287,7 +306,10 @@ void TestMpc(const hera::HeraConfig &root_config)
                 : clear_exponentials[index] / expected_sum;
             Require(probability >= 0.0 && probability <= 1.0 &&
                         std::abs(probability - expected) < 0.02,
-                    "MPC Softmax probability mismatch");
+                    "MPC Softmax probability mismatch at index " +
+                        std::to_string(index) + ": actual=" +
+                        std::to_string(probability) + ", expected=" +
+                        std::to_string(expected));
             sum += probability;
         }
         Require(std::abs(sum - 1.0) < 0.02,

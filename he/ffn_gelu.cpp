@@ -1,4 +1,5 @@
 #include "hera/ffn_gelu.h"
+#include "hera/detail/mpc_session_internal.h"
 
 #include <FloatingPoint/fixed-point.h>
 #include <FloatingPoint/fp-math.h>
@@ -991,13 +992,9 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
 
 class MpcGeluRuntime::Impl {
 public:
-    Impl(PartyRole role, const std::string &peer_address, int port)
-        : party_(role == PartyRole::kServer ? sci::ALICE : sci::BOB),
-          io_(std::make_unique<sci::IOPack>(
-              party_, port,
-              role == PartyRole::kServer ? std::string{} : peer_address)),
-          ot_(std::make_unique<sci::OTPack>(io_.get(), party_)),
-          fix_(std::make_unique<FixOp>(party_, io_.get(), ot_.get()))
+    explicit Impl(std::shared_ptr<SharedMpcSession> session)
+        : session_(std::move(session)), native_(session_->Acquire()),
+          party_(native_->party())
     {}
 
     FixArray Secret(const MpcShareTensor &tensor)
@@ -1029,40 +1026,49 @@ public:
             return static_cast<std::uint64_t>(scaled) &
                    RingMask(input.numeric.ring_bits);
         };
-        auto b0 = fix_->LT(x, encode(-threshold));
-        auto b1 = fix_->LT(x, std::uint64_t{0});
-        auto b2 = fix_->GT(x, encode(threshold));
-        auto z0 = fix_->bool_op->XOR(b0, b1);
-        auto z1 = fix_->bool_op->XOR(b1, b2);
+        auto &fix = native_->fix();
+        auto b0 = fix.LT(x, encode(-threshold));
+        auto b1 = fix.LT(x, std::uint64_t{0});
+        auto b2 = fix.GT(x, encode(threshold));
+        auto z0 = fix.bool_op->XOR(b0, b1);
+        auto z1 = fix.bool_op->XOR(b1, b2);
         if (party_ == sci::ALICE)
             for (int i = 0; i < z1.size; ++i) z1.data[i] ^= 1U;
         FixArray zero(party_, x.size, true, x.ell, x.s);
         std::fill(zero.data, zero.data + zero.size, std::uint64_t{0});
-        auto r0 = fix_->if_else(z0, f0, zero);
-        auto r1 = fix_->if_else(z1, f1, zero);
-        auto r2 = fix_->if_else(b2, x, zero);
-        auto result = fix_->add(fix_->add(r0, r1), r2);
+        auto r0 = fix.if_else(z0, f0, zero);
+        auto r1 = fix.if_else(z1, f1, zero);
+        auto r2 = fix.if_else(b2, x, zero);
+        auto result = fix.add(fix.add(r0, r1), r2);
         return MpcShareTensor{
             std::vector<std::uint64_t>(result.data,
                                        result.data + result.size),
             input.physical_shape, input.numeric, ComplexComponent::kReal};
     }
 
-    std::uint64_t communication() const { return io_->get_comm(); }
-    std::uint64_t rounds() const { return io_->get_rounds(); }
-    void Cancel() noexcept { if (io_) io_->cancel(); }
+    std::uint64_t communication() const
+    { return native_->communication_bytes(); }
+    std::uint64_t rounds() const { return native_->rounds(); }
+    void Cancel() noexcept { session_->Cancel(); }
 
 private:
+    std::shared_ptr<SharedMpcSession> session_;
+    std::shared_ptr<SharedMpcSession::Impl> native_;
     int party_{};
-    std::unique_ptr<sci::IOPack> io_;
-    std::unique_ptr<sci::OTPack> ot_;
-    std::unique_ptr<FixOp> fix_;
 };
 
 MpcGeluRuntime::MpcGeluRuntime(
     PartyRole role, std::string peer_address, int port)
-    : role_(role), peer_address_(std::move(peer_address)), port_(port)
+    : session_(std::make_shared<SharedMpcSession>(
+          role, std::move(peer_address), port))
 {}
+
+MpcGeluRuntime::MpcGeluRuntime(
+    std::shared_ptr<SharedMpcSession> session)
+    : session_(std::move(session))
+{
+    if (!session_) throw std::invalid_argument("MPC session is null");
+}
 
 MpcGeluRuntime::~MpcGeluRuntime() = default;
 MpcGeluRuntime::MpcGeluRuntime(MpcGeluRuntime &&) noexcept = default;
@@ -1093,7 +1099,7 @@ Result<MpcShareTensor> MpcGeluRuntime::Evaluate(
             return Status::Invalid("GeLU branch share contracts differ");
         if (!std::atomic_load(&impl_))
             std::atomic_store(&impl_, std::make_shared<Impl>(
-                role_, peer_address_, port_));
+                session_));
         const auto before_bytes = impl_->communication();
         const auto before_rounds = impl_->rounds();
         auto result = impl_->Evaluate(input, negative_branch,
@@ -1122,8 +1128,7 @@ void MpcGeluRuntime::ReleaseSession()
 
 void MpcGeluRuntime::Cancel() noexcept
 {
-    auto active = std::atomic_load(&impl_);
-    if (active) active->Cancel();
+    if (session_) session_->Cancel();
 }
 
 SealSciFfnGeluExecutor::SealSciFfnGeluExecutor(
@@ -1440,7 +1445,7 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
             x_share.value(), f0_share.value(), f1_share.value(),
             config_.gelu.threshold, report);
         if (!activation.ok()) return activation.status();
-        mpc_.ReleaseSession();
+        // Preserve the GeLU Ferret session for subsequent layers/runs.
 
         TensorSpec spec;
         spec.shape = output_shape;

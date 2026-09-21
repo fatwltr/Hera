@@ -7,6 +7,8 @@
 
 namespace hera {
 
+class SharedMpcSession;
+
 struct FfnGeluInputs {
     TensorHandle centered_shares;
     TensorHandle inverse_stddev_shares;
@@ -152,6 +154,7 @@ public:
 class MpcGeluRuntime {
 public:
     MpcGeluRuntime(PartyRole role, std::string peer_address, int port);
+    explicit MpcGeluRuntime(std::shared_ptr<SharedMpcSession> session);
     ~MpcGeluRuntime();
     MpcGeluRuntime(MpcGeluRuntime &&) noexcept;
     MpcGeluRuntime &operator=(MpcGeluRuntime &&) noexcept;
@@ -169,9 +172,7 @@ public:
 
 private:
     class Impl;
-    PartyRole role_;
-    std::string peer_address_;
-    int port_{};
+    std::shared_ptr<SharedMpcSession> session_;
     std::shared_ptr<Impl> impl_;
 };
 

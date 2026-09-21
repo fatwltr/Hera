@@ -1,4 +1,5 @@
 #include "hera/attention_ln2.h"
+#include "hera/detail/mpc_session_internal.h"
 
 #include "OT/split-kkot.h"
 #include "FloatingPoint/fp-math.h"
@@ -1344,15 +1345,10 @@ Result<LayerNormStatisticsOutputs> LayerNormStatisticsKernel::Evaluate(
 
 class MpcLayerNormRuntime::Impl {
 public:
-    Impl(PartyRole role, const std::string &peer_address, int port)
-        : party_(role == PartyRole::kServer ? sci::ALICE : sci::BOB),
-          io_(std::make_unique<sci::IOPack>(
-              party_, port,
-              role == PartyRole::kServer ? std::string{} : peer_address)),
-          ot_(std::make_unique<sci::OTPack>(io_.get(), party_))
-    {
-        math_ = std::make_unique<FPMath>(party_, io_.get(), ot_.get());
-    }
+    explicit Impl(std::shared_ptr<SharedMpcSession> session)
+        : session_(std::move(session)), native_(session_->Acquire()),
+          party_(native_->party())
+    {}
 
     Result<MpcShareTensor> ReciprocalSqrt(
         const MpcShareTensor &variance, int working_ring_bits)
@@ -1379,14 +1375,15 @@ public:
         const auto mask = RingMask(working_ring_bits);
         for (std::size_t i = 0; i < variance.local_share.size(); ++i)
             input.data[i] = variance.local_share[i] & mask;
-        auto output = math_->sqrt(input, true);
+        auto output = native_->math().sqrt(input, true);
         // rsqrt is positive. SCI's zero extension converts the working-ring
         // additive shares back to the public HERA tensor contract without
         // revealing the carry.
         output.signed_ = false;
         auto widened = working_ring_bits == variance.numeric.ring_bits
             ? output
-            : math_->fix->extend(output, variance.numeric.ring_bits);
+            : native_->math().fix->extend(
+                output, variance.numeric.ring_bits);
         return MpcShareTensor{
             std::vector<std::uint64_t>(widened.data,
                                        widened.data + widened.size),
@@ -1394,21 +1391,29 @@ public:
             ComplexComponent::kReal};
     }
 
-    std::uint64_t communication() const { return io_->get_comm(); }
-    std::uint64_t rounds() const { return io_->get_rounds(); }
-    void Cancel() noexcept { if (io_) io_->cancel(); }
+    std::uint64_t communication() const
+    { return native_->communication_bytes(); }
+    std::uint64_t rounds() const { return native_->rounds(); }
+    void Cancel() noexcept { session_->Cancel(); }
 
 private:
+    std::shared_ptr<SharedMpcSession> session_;
+    std::shared_ptr<SharedMpcSession::Impl> native_;
     int party_{};
-    std::unique_ptr<sci::IOPack> io_;
-    std::unique_ptr<sci::OTPack> ot_;
-    std::unique_ptr<FPMath> math_;
 };
 
 MpcLayerNormRuntime::MpcLayerNormRuntime(
     PartyRole role, std::string peer_address, int port)
-    : role_(role), peer_address_(std::move(peer_address)), port_(port)
+    : session_(std::make_shared<SharedMpcSession>(
+          role, std::move(peer_address), port))
 {}
+
+MpcLayerNormRuntime::MpcLayerNormRuntime(
+    std::shared_ptr<SharedMpcSession> session)
+    : session_(std::move(session))
+{
+    if (!session_) throw std::invalid_argument("MPC session is null");
+}
 
 MpcLayerNormRuntime::~MpcLayerNormRuntime() = default;
 MpcLayerNormRuntime::MpcLayerNormRuntime(MpcLayerNormRuntime &&) noexcept = default;
@@ -1423,7 +1428,7 @@ Result<MpcShareTensor> MpcLayerNormRuntime::ReciprocalSqrt(
     try {
         if (!std::atomic_load(&impl_))
             std::atomic_store(&impl_, std::make_shared<Impl>(
-                role_, peer_address_, port_));
+                session_));
         const auto before_bytes = impl_->communication();
         const auto before_rounds = impl_->rounds();
         auto result = impl_->ReciprocalSqrt(variance, working_ring_bits);
@@ -1450,8 +1455,7 @@ void MpcLayerNormRuntime::ReleaseSession()
 
 void MpcLayerNormRuntime::Cancel() noexcept
 {
-    auto active = std::atomic_load(&impl_);
-    if (active) active->Cancel();
+    if (session_) session_->Cancel();
 }
 
 SealSciAttentionLn2Executor::SealSciAttentionLn2Executor(
@@ -1697,7 +1701,8 @@ Result<AttentionLn2Outputs> SealSciAttentionLn2Executor::Evaluate(
         auto inverse = mpc_.ReciprocalSqrt(
             variance.value(), layer_.attention_norm_rsqrt_bits, report);
         if (!inverse.ok()) return inverse.status();
-        mpc_.ReleaseSession();
+        // Reuse the LayerNorm Ferret session across layers. Conversion runs
+        // on independent transports and does not require resetting OT state.
 
         TensorSpec centered_spec;
         centered_spec.shape = centered.value().physical_shape;

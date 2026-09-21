@@ -5,7 +5,7 @@ HERA does not vendor the following upstream repositories. The reproducibility sc
 | Dependency | Pinned source | Purpose |
 |---|---|---|
 | Microsoft SEAL | `microsoft/SEAL` 4.4.5 | CKKS runtime |
-| BLB | `best-orange/blb` | SCI baseline and BLB conversion extensions |
+| BLB | `best-orange/blb` | SCI baseline, conversion extensions and Ferret/PCG Silent-OT backend |
 | BOLT | `cmu-cryptosystems/BOLT` | Validated SCI nonlinear implementation |
 
 SEAL and BOLT publish their own license files. BLB did not expose a top-level license in the pinned repository revision when this dependency recipe was prepared. Because this repository applies and links code derived from those projects, verify all upstream license obligations before public redistribution.
