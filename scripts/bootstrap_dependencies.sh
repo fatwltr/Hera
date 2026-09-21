@@ -93,6 +93,11 @@ if [[ ! -f "$sci_dir/SCIConfig.cmake" ]]; then
 fi
 
 sci_manifest="$sci_output/install/share/hera-sci/manifest.txt"
+test -f "$sci_output/install/include/emp-tool/emp-tool.h" || {
+  echo "Incomplete HERA-SCI package: emp-tool headers are absent" >&2
+  echo "Move $sci_output aside and rerun dependency bootstrap." >&2
+  exit 2
+}
 grep -qx "HERA_SCI_ABI=$HERA_SCI_ABI" "$sci_manifest"
 grep -qx "SEAL_VERSION=$SEAL_VERSION" "$sci_manifest"
 grep -qx "OT_BACKEND=VOLE_SILENT_OT" "$sci_manifest"

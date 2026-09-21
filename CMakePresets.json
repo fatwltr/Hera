@@ -22,8 +22,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "HERA_ENABLE_FULL_RUNTIME": "ON",
         "SEAL_DIR": "${sourceDir}/.deps/build/seal-4.4.5/install/lib/cmake/SEAL-4.4",
-        "SCI_DIR": "${sourceDir}/.deps/build/hera-sci/install/lib/cmake/SCI",
-        "Eigen3_DIR": "${sourceDir}/.deps/build/hera-sci/SCI/extern/eigen/build"
+        "SCI_DIR": "${sourceDir}/.deps/build/hera-sci-abi-3/install/lib/cmake/SCI",
+        "Eigen3_DIR": "${sourceDir}/.deps/build/hera-sci-abi-3/SCI/extern/eigen/build"
       }
     }
   ],

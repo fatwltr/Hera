@@ -27,6 +27,8 @@ CKKS hidden states
 - 参数允许 `security_level=none`，因此本仓库不是生产安全实现。
 
 详细设计和各阶段 level/packing contract 见 [实现说明](docs/IMPLEMENTATION.md)，复现边界与已知限制见 [复现说明](docs/REPRODUCIBILITY.md)。
+本机 tiny profile 的基线记录位于
+[`docs/benchmarks/`](docs/benchmarks/runtime_tiny_local_2026-09-19.md)。
 
 ## 环境
 
@@ -36,7 +38,14 @@ CKKS hidden states
 sudo apt-get update
 sudo apt-get install -y \
   build-essential cmake git patch rsync \
-  libssl-dev libgmp-dev libmpfr-dev
+  libssl-dev libgmp-dev libmpfr-dev libboost-dev
+```
+
+获取源码：
+
+```bash
+git clone https://github.com/fatwltr/Hera.git
+cd Hera
 ```
 
 完整构建会从 `dependencies.lock` 指定的提交拉取：
@@ -162,17 +171,19 @@ cmake --build build/bert-base-variable \
 ## 仓库结构
 
 ```text
-app/          CLI 入口
-backend/      recording/unavailable backend
-config/       JSON 解析与严格校验
-configs/      tiny、conversion 和 Figure-10 风格配置
-conversion/   复数 CKKS↔MPC 协议
-core/         model/tensor 基础类型
-graph/        类型化 Transformer DAG
-he/           五个真实 HE/MPC stage executor
-include/hera/ 公共接口
-modules/      图构建模块
-runtime/      整体编排、协调、abort/heartbeat
-tests/        单元、协议和端到端测试
-scripts/      依赖准备和复现脚本
+app/                    CLI 入口，不包含可复用协议逻辑
+cmake/                  framework/crypto 构建定义和公共 helper
+configs/                tiny、conversion 和研究配置
+include/hera/           稳定的公共 C++ 接口
+src/framework/          配置、类型化图、模块 contract、recording backend
+src/crypto/conversion/  复数 CKKS↔MPC 协议
+src/crypto/he/          五个融合 HE/MPC stage executor
+src/crypto/runtime/     整体编排、协调、abort/heartbeat
+tests/                  单元、协议和端到端测试
+scripts/                依赖准备、构建和复现入口
+third_party/            可复现的 HERA-SCI 补丁
 ```
+
+`hera_framework` 完全不依赖 SEAL/SCI；真实密码实现只存在于
+`src/crypto`。通常只使用 `framework` 或 `full` 两个 preset。细粒度的
+`HERA_ENABLE_*` 开关仅供单独开发某个 kernel 使用。

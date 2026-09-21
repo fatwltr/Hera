@@ -1,8 +1,8 @@
 #include "hera/conversion.h"
 #include "hera/wide_ring.h"
 
-#include "../conversion/fixed_ckks_transform.h"
-#include "../conversion/random_sampling.h"
+#include "fixed_ckks_transform.h"
+#include "random_sampling.h"
 
 #include <cstdint>
 #include <iostream>

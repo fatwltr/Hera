@@ -98,9 +98,24 @@ cmake -S "$output/SCI" -B "$output/build" \
 cmake --build "$output/build" --parallel "$jobs"
 cmake --install "$output/build"
 
+# SCI installs the emp-ot facade but its exported headers include
+# <emp-tool/emp-tool.h>. Upstream does not install that header-only dependency,
+# which makes an otherwise valid SCI package depend on a machine-global EMP
+# installation. Bundle the exact headers used for this build so consumers are
+# reproducible and need only the exported SCI include directory.
+emp_tool_headers="$output/SCI/deps/emp-tool/emp-tool"
+[[ -f "$emp_tool_headers/emp-tool.h" ]] || {
+  echo "HERA-SCI build is missing emp-tool headers: $emp_tool_headers" >&2
+  exit 1
+}
+mkdir -p "$output/install/include/emp-tool"
+rsync -a --exclude '*.rej' \
+  "$emp_tool_headers/" "$output/install/include/emp-tool/"
+
 test -f "$output/install/lib/libSCI-FloatingPoint.a"
 test -f "$output/install/lib/libSCI-BuildingBlocks.a"
 test -f "$output/install/lib/cmake/SCI/SCIConfig.cmake"
+test -f "$output/install/include/emp-tool/emp-tool.h"
 nm -C "$output/install/lib/libSCI-BuildingBlocks.a" | \
   grep 'AuxProtocols::wrap_computation_prime' >/dev/null
 
