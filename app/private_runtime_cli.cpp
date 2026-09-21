@@ -33,7 +33,8 @@ void Check(const Result<void> &result)
     if (!result.ok()) throw std::runtime_error(result.status().message());
 }
 
-std::uint64_t ConfigFingerprint(const HeraConfig &config)
+std::uint64_t RuntimeFingerprint(const HeraConfig &config,
+                                 const PrivateRuntimeCliOptions &options)
 {
     std::uint64_t hash = 1469598103934665603ULL;
     auto mix = [&](const void *data, std::size_t size) {
@@ -107,6 +108,11 @@ std::uint64_t ConfigFingerprint(const HeraConfig &config)
     scalar(config.gelu.b); scalar(config.gelu.c);
     scalar(config.gelu.d); scalar(config.gelu.e);
     scalar(config.threads);
+    scalar(options.virtual_weights);
+    const auto effective_templates = options.virtual_weights
+        ? options.weight_template_count : std::size_t{0};
+    scalar(effective_templates);
+    scalar(options.threads);
     return hash;
 }
 
@@ -248,13 +254,14 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
             throw std::runtime_error(rotations.status().message());
         for (const auto &entry : rotations.value())
             Check(contexts.CompileRotationKeys(entry.first, entry.second));
-        SendU64(*control, ConfigFingerprint(config));
+        SendU64(*control, RuntimeFingerprint(config, options));
         auto bundle = contexts.ExportSerializedPublicBundle();
         if (!bundle.ok()) throw std::runtime_error(bundle.status().message());
         Check(SendPublicContextBundle(*control, bundle.value()));
     } else {
-        if (ReceiveU64(*control) != ConfigFingerprint(config))
-            throw std::runtime_error("client/server HERA configs differ");
+        if (ReceiveU64(*control) != RuntimeFingerprint(config, options))
+            throw std::runtime_error(
+                "client/server configs or benchmark modes differ");
         auto bundle = ReceivePublicContextBundle(*control);
         if (!bundle.ok()) throw std::runtime_error(bundle.status().message());
         Check(contexts.CreateServerProfiles(config, bundle.value()));
@@ -286,6 +293,8 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
     }
 
     SealPlainParameterStore parameters;
+    Check(parameters.ConfigureVirtualWeightPlaintexts(
+        options.virtual_weights ? options.weight_template_count : 0));
     std::optional<TransformerWeightData> weight_data;
     if (role == PartyRole::kServer)
         weight_data = MakeDeterministicTransformerWeights(
@@ -427,6 +436,16 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
               << preparation.encoded_plaintext_count
               << "\nHERA_PREPARED_BYTES=" << preparation.encoded_bytes
               << "\nHERA_PREPARE_CACHE_HITS=" << preparation.cache_hits
+              << "\nHERA_WEIGHT_MODE="
+              << (options.virtual_weights ? "VIRTUAL" : "MATERIALIZED")
+              << "\nHERA_WEIGHT_TEMPLATE_COUNT="
+              << (options.virtual_weights ? options.weight_template_count : 0)
+              << "\nHERA_VIRTUAL_WEIGHT_REQUESTS="
+              << preparation.virtual_weight_requests
+              << "\nHERA_VIRTUAL_WEIGHT_CACHE_HITS="
+              << preparation.virtual_weight_cache_hits
+              << "\nHERA_MODEL_NUMERICAL_VALIDATION="
+              << (options.virtual_weights ? "DISABLED" : "FINAL_FINITE_ONLY")
               << "\nHERA_ONLINE_MODEL_ENCODES=0"
               << "\nHERA_ONLINE_MS=" << measured_online / denominator
               << "\nHERA_OUTPUT_TRANSFER_MS="
@@ -459,6 +478,9 @@ int RunPrivateRuntimeCli(const PrivateRuntimeCliOptions &options)
             throw std::invalid_argument("runtime port range is invalid");
         if (options.threads == 0 || options.repeat == 0)
             throw std::invalid_argument("threads/repeat must be positive");
+        if (options.weight_template_count == 0)
+            throw std::invalid_argument(
+                "--weight-template-count must be positive");
         auto loaded = LoadHeraConfig(options.config);
         if (!loaded.ok()) throw std::runtime_error(loaded.status().message());
         const auto config = loaded.take_value();

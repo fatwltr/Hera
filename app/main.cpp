@@ -22,6 +22,8 @@ struct CliOptions {
     std::size_t threads{1};
     std::uint64_t input_seed{1};
     std::uint64_t weight_seed{2};
+    bool virtual_weights{};
+    std::size_t weight_template_count{1};
     std::size_t warmup{};
     std::size_t repeat{1};
     bool verify{};
@@ -52,6 +54,15 @@ hera::Result<CliOptions> ParseCli(int argc, char **argv)
             options.input_seed = std::stoull(argument.substr(13));
         else if (argument.rfind("--weight-seed=", 0) == 0)
             options.weight_seed = std::stoull(argument.substr(14));
+        else if (argument == "--weight-mode=materialized")
+            options.virtual_weights = false;
+        else if (argument == "--weight-mode=virtual")
+            options.virtual_weights = true;
+        else if (argument.rfind("--weight-mode=", 0) == 0)
+            return hera::Status::Invalid(
+                "--weight-mode must be materialized or virtual");
+        else if (argument.rfind("--weight-template-count=", 0) == 0)
+            options.weight_template_count = std::stoul(argument.substr(24));
         else if (argument.rfind("--warmup=", 0) == 0)
             options.warmup = std::stoul(argument.substr(9));
         else if (argument.rfind("--repeat=", 0) == 0)
@@ -168,6 +179,9 @@ int main(int argc, char **argv)
         runtime_options.threads = options.value().threads;
         runtime_options.input_seed = options.value().input_seed;
         runtime_options.weight_seed = options.value().weight_seed;
+        runtime_options.virtual_weights = options.value().virtual_weights;
+        runtime_options.weight_template_count =
+            options.value().weight_template_count;
         runtime_options.warmup = options.value().warmup;
         runtime_options.repeat = options.value().repeat;
         runtime_options.verify = options.value().verify;

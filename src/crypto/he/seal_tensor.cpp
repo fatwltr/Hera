@@ -35,6 +35,58 @@ std::string PlaintextKey(const std::vector<Value> &values,
     return stream.str();
 }
 
+bool EndsWith(std::string_view value, std::string_view suffix)
+{
+    return value.size() >= suffix.size() &&
+           value.substr(value.size() - suffix.size()) == suffix;
+}
+
+bool IsVirtualizableWeight(std::string_view tag)
+{
+    return EndsWith(tag, "block2.projection.diagonal") ||
+           EndsWith(tag, "attention.wo.diagonal") ||
+           EndsWith(tag, "ffn.projection.diagonal");
+}
+
+template <typename Value>
+std::string VirtualPlaintextKey(const std::vector<Value> &values,
+                                const seal::parms_id_type &parms_id,
+                                double scale, std::size_t template_count)
+{
+    std::uint64_t content_hash = 1469598103934665603ULL;
+    const auto mix_content = [&](const void *data, std::size_t bytes) {
+        const auto *cursor = static_cast<const unsigned char *>(data);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            content_hash ^= cursor[i];
+            content_hash *= 1099511628211ULL;
+        }
+    };
+    if (!values.empty())
+        mix_content(values.data(), values.size() * sizeof(Value));
+
+    std::uint64_t compatibility = 1469598103934665603ULL;
+    const auto mix_compatibility = [&](const void *data, std::size_t bytes) {
+        const auto *cursor = static_cast<const unsigned char *>(data);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            compatibility ^= cursor[i];
+            compatibility *= 1099511628211ULL;
+        }
+    };
+    mix_compatibility(parms_id.data(),
+                      parms_id.size() * sizeof(parms_id[0]));
+    mix_compatibility(&scale, sizeof(scale));
+    const auto value_count = values.size();
+    mix_compatibility(&value_count, sizeof(value_count));
+    const unsigned char value_kind =
+        std::is_same<Value, double>::value ? 0 : 1;
+    mix_compatibility(&value_kind, sizeof(value_kind));
+
+    std::ostringstream stream;
+    stream << "virtual-projection:" << std::hex << compatibility << ':'
+           << (content_hash % template_count);
+    return stream.str();
+}
+
 Result<std::size_t> CheckedProduct(std::size_t left, std::size_t right,
                                    const char *name)
 {
@@ -520,12 +572,26 @@ Result<DenseVectorParameter> SealPlainParameterStore::GetVector(
     return found->second;
 }
 
+Result<void> SealPlainParameterStore::ConfigureVirtualWeightPlaintexts(
+    std::size_t templates_per_compatibility_group)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (preparing_plaintexts_ || plaintext_cache_frozen_ ||
+        !encoded_plaintexts_.empty())
+        return Status::FailedPrecondition(
+            "virtual weight mode must be configured before Prepare()");
+    virtual_weight_template_count_ = templates_per_compatibility_group;
+    return {};
+}
+
 void SealPlainParameterStore::BeginPlaintextPreparation()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     encoded_plaintexts_.clear();
     encoded_plaintext_bytes_ = 0;
     plaintext_cache_hits_ = 0;
+    virtual_weight_requests_ = 0;
+    virtual_weight_cache_hits_ = 0;
     preparing_plaintexts_ = true;
     plaintext_cache_frozen_ = false;
 }
@@ -561,16 +627,42 @@ std::size_t SealPlainParameterStore::plaintext_cache_hits() const
     return plaintext_cache_hits_;
 }
 
+std::size_t SealPlainParameterStore::virtual_weight_template_count() const
+    noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return virtual_weight_template_count_;
+}
+
+std::size_t SealPlainParameterStore::virtual_weight_requests() const noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return virtual_weight_requests_;
+}
+
+std::size_t SealPlainParameterStore::virtual_weight_cache_hits() const noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return virtual_weight_cache_hits_;
+}
+
 Result<seal::Plaintext> SealPlainParameterStore::EncodeModelPlaintext(
     seal::CKKSEncoder &encoder, const std::vector<double> &values,
     const seal::parms_id_type &parms_id, double scale,
     std::string_view kernel_tag)
 {
-    const auto key = PlaintextKey(values, parms_id, scale, kernel_tag);
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool virtualized = virtual_weight_template_count_ != 0 &&
+                             IsVirtualizableWeight(kernel_tag);
+    const auto key = virtualized
+        ? VirtualPlaintextKey(values, parms_id, scale,
+                              virtual_weight_template_count_)
+        : PlaintextKey(values, parms_id, scale, kernel_tag);
+    if (virtualized) ++virtual_weight_requests_;
     const auto found = encoded_plaintexts_.find(key);
     if (found != encoded_plaintexts_.end()) {
         ++plaintext_cache_hits_;
+        if (virtualized) ++virtual_weight_cache_hits_;
         return found->second;
     }
     if (plaintext_cache_frozen_)
@@ -593,11 +685,18 @@ Result<seal::Plaintext> SealPlainParameterStore::EncodeModelPlaintext(
     const seal::parms_id_type &parms_id, double scale,
     std::string_view kernel_tag)
 {
-    const auto key = PlaintextKey(values, parms_id, scale, kernel_tag);
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool virtualized = virtual_weight_template_count_ != 0 &&
+                             IsVirtualizableWeight(kernel_tag);
+    const auto key = virtualized
+        ? VirtualPlaintextKey(values, parms_id, scale,
+                              virtual_weight_template_count_)
+        : PlaintextKey(values, parms_id, scale, kernel_tag);
+    if (virtualized) ++virtual_weight_requests_;
     const auto found = encoded_plaintexts_.find(key);
     if (found != encoded_plaintexts_.end()) {
         ++plaintext_cache_hits_;
+        if (virtualized) ++virtual_weight_cache_hits_;
         return found->second;
     }
     if (plaintext_cache_frozen_)

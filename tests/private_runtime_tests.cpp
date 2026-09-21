@@ -130,6 +130,52 @@ struct PartyResult {
     std::string error;
 };
 
+void TestVirtualWeightPlaintextPool()
+{
+    const auto config = MakeConfig();
+    hera::HeContextRegistry contexts;
+    Require(contexts.CreateClientProfiles(config).ok(),
+            "virtual-cache contexts cannot be created");
+    const auto &context = contexts.Require("r5", hera::PartyRole::kClient);
+    seal::CKKSEncoder encoder(*context.context);
+    const auto parms_id = LevelId(context, 2);
+    const auto scale = std::ldexp(1.0, 45);
+    std::vector<std::complex<double>> first(context.slot_count(), {0.001, 0.0});
+    std::vector<std::complex<double>> second(context.slot_count(), {-0.002, 0.0});
+
+    hera::SealPlainParameterStore store;
+    Require(store.ConfigureVirtualWeightPlaintexts(1).ok(),
+            "virtual weight cache cannot be configured");
+    store.BeginPlaintextPreparation();
+    auto one = store.EncodeModelPlaintext(
+        encoder, first, parms_id, scale,
+        "layer0/ffn.projection.diagonal");
+    auto two = store.EncodeModelPlaintext(
+        encoder, second, parms_id, scale,
+        "layer1/ffn.projection.diagonal");
+    Require(one.ok() && two.ok(), "virtual weight templates cannot be encoded");
+    Require(store.encoded_plaintext_count() == 1 &&
+                store.virtual_weight_requests() == 2 &&
+                store.virtual_weight_cache_hits() == 1,
+            "compatible diagonals did not share one physical plaintext");
+
+    auto constant_one = store.EncodeModelPlaintext(
+        encoder, first, parms_id, scale, "layer0/ffn.ln2.beta");
+    auto constant_two = store.EncodeModelPlaintext(
+        encoder, second, parms_id, scale, "layer1/ffn.ln2.beta");
+    Require(constant_one.ok() && constant_two.ok() &&
+                store.encoded_plaintext_count() == 3,
+            "non-weight constants were incorrectly virtualized");
+    store.FreezePlaintextCache();
+
+    std::vector<std::complex<double>> third(context.slot_count(), {0.003, 0.0});
+    auto online_hit = store.EncodeModelPlaintext(
+        encoder, third, parms_id, scale,
+        "layer2/attention.wo.diagonal");
+    Require(online_hit.ok() && store.virtual_weight_cache_hits() == 2,
+            "frozen virtual cache did not reuse its prepared template");
+}
+
 PartyResult RunParty(
     hera::PartyRole role, const hera::HeraConfig &config,
     hera::HeContextRegistry &contexts, hera::RuntimeTensorArena &arena,
@@ -296,6 +342,7 @@ void TestRuntime(hera::HeraConfig config, int base)
 int main()
 {
     try {
+        TestVirtualWeightPlaintextPool();
         auto two_layers = MakeConfig();
         auto second_layer = two_layers.layers.front();
         second_layer.id = "layer1";

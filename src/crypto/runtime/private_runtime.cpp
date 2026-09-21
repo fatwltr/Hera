@@ -630,6 +630,10 @@ Result<void> SealSciTransformerRuntime::Prepare(
         if (report) {
             *report = {};
             report->cache_hits = parameters_.encoded_plaintext_count();
+            report->virtual_weight_requests =
+                parameters_.virtual_weight_requests();
+            report->virtual_weight_cache_hits =
+                parameters_.virtual_weight_cache_hits();
             report->milliseconds = std::chrono::duration<double, std::milli>(
                 Clock::now() - started).count();
         }
@@ -858,6 +862,10 @@ Result<void> SealSciTransformerRuntime::Prepare(
             parameters_.encoded_plaintext_count();
         report->encoded_bytes = parameters_.encoded_plaintext_bytes();
         report->cache_hits = parameters_.plaintext_cache_hits();
+        report->virtual_weight_requests =
+            parameters_.virtual_weight_requests();
+        report->virtual_weight_cache_hits =
+            parameters_.virtual_weight_cache_hits();
         report->milliseconds = std::chrono::duration<double, std::milli>(
             Clock::now() - started).count();
     }

@@ -86,6 +86,22 @@ ctest --preset framework
   --party=local --verify --port=23100
 ```
 
+仅测量密码运算开销、且机器无法容纳全部编码权重时，可以启用 benchmark-only
+虚拟权重池：
+
+```bash
+./build/full/hera_private_inference \
+  --config=configs/bert_base_variable_dims_seq128.json \
+  --party=local --port=23100 --threads=8 \
+  --weight-mode=virtual --weight-template-count=1
+```
+
+该模式仍执行原定数量的 rotation、`multiply_plain`、累加、rescale、
+conversion 和 MPC 操作，但兼容的 Wq/Wk/Wv/Wo/Wu/Wd diagonals 会重复使用
+有限数量的物理 plaintext。它用于低内存性能测试，不保持模型数值语义，也不能
+作为模型精度结果。使用更大的 `--weight-template-count` 可以部分恢复真实的缓存/
+内存访问压力。正常模式为 `--weight-mode=materialized`。
+
 等价的一键入口是：
 
 ```bash
@@ -95,6 +111,8 @@ ctest --preset framework
 完整测试包含真实的两方 conversion、MPC 非线性、Block 2、Softmax、Attention×V/LN2、FFN/GeLU、Block 5 和整体运行时。它明显慢于 framework-only 测试。
 
 ## 12 层 BERT-base 可变内部宽度配置
+
+> 仅测试性能
 
 [`configs/bert_base_variable_dims_seq128.json`](configs/bert_base_variable_dims_seq128.json) 提供以下结构：
 
@@ -108,65 +126,6 @@ per-layer [qk_head_width, value_head_width, ffn_width]
 
 这里的 QK/VO 宽度均为单个 head 的宽度。Wq/Wk/Wv/Wo/Wu/Wd 的非方阵尺寸由配置自动推导。
 
-注意：当前真实 HERA runtime 只支持 Pre-LN，因此该文件是“BERT-base 外部形状 + 可变内部宽度”的 Pre-LN 网络，不是原始 BERT 的 Post-LN 拓扑。配置使用 `security_level=none` 的研究参数。
-
-在服务器上只构建完整运行程序、不执行测试或推理：
-
-```bash
-cd Hera
-./scripts/bootstrap_dependencies.sh .deps 8
-source .deps/env.sh
-
-cmake -S . -B build/bert-base-variable \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DHERA_ENABLE_FULL_RUNTIME=ON \
-  -DSEAL_DIR="$SEAL_DIR" \
-  -DSCI_DIR="$SCI_DIR" \
-  -DEigen3_DIR="$Eigen3_DIR"
-
-cmake --build build/bert-base-variable \
-  --target hera_private_inference --parallel 8
-```
-
-两台机器应使用相同 Git commit、配置、线程数和空闲端口区间。先在服务端启动：
-
-```bash
-./build/bert-base-variable/hera_private_inference \
-  --config=configs/bert_base_variable_dims_seq128.json \
-  --party=server --port=23100 --threads=8 \
-  --weight-seed=2 --warmup=0 --repeat=1
-```
-
-然后在客户端启动：
-
-```bash
-./build/bert-base-variable/hera_private_inference \
-  --config=configs/bert_base_variable_dims_seq128.json \
-  --party=client --ip=SERVER_IP --port=23100 --threads=8 \
-  --input-seed=1 --warmup=0 --repeat=1
-```
-
-上述 CLI 仍使用确定性合成权重和合成 `[128,768]` hidden states，用于结构与性能实验。真实 BERT checkpoint、token embedding、真实 padding mask 和分类头尚未接入模型文件加载器。12 层、`N=32768` 的离线 plaintext 准备与在线推理会占用大量内存和时间，正式运行前应先确认服务器资源和完整 `base` 到 `base+800` 端口区间可用。
-
-## 两机运行
-
-两台机器必须使用相同提交、配置和依赖锁。服务端先启动：
-
-```bash
-./build/full/hera_private_inference \
-  --config=configs/runtime_tiny.json \
-  --party=server --port=23100
-```
-
-客户端随后连接：
-
-```bash
-./build/full/hera_private_inference \
-  --config=configs/runtime_tiny.json \
-  --party=client --ip=SERVER_IP --port=23100
-```
-
-端口基址需保证到 `base+800` 的区间可用，并保持在 32768 以下。
 
 ## 仓库结构
 

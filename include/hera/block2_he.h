@@ -116,12 +116,20 @@ public:
     Result<DenseMatrixParameter> GetMatrix(WeightId id) const;
     Result<DenseVectorParameter> GetVector(PlainParameterId id) const;
 
+    // Benchmark-only mode: compatible projection diagonals are mapped to a
+    // bounded pool of encoded plaintext templates. This preserves HE call
+    // counts and levels but intentionally does not preserve model semantics.
+    Result<void> ConfigureVirtualWeightPlaintexts(
+        std::size_t templates_per_compatibility_group);
     void BeginPlaintextPreparation();
     void FreezePlaintextCache();
     bool plaintext_cache_frozen() const noexcept;
     std::size_t encoded_plaintext_count() const;
     std::size_t encoded_plaintext_bytes() const;
     std::size_t plaintext_cache_hits() const;
+    std::size_t virtual_weight_template_count() const noexcept;
+    std::size_t virtual_weight_requests() const noexcept;
+    std::size_t virtual_weight_cache_hits() const noexcept;
 
     Result<seal::Plaintext> EncodeModelPlaintext(
         seal::CKKSEncoder &encoder, const std::vector<double> &values,
@@ -142,6 +150,9 @@ private:
     bool plaintext_cache_frozen_{};
     std::size_t encoded_plaintext_bytes_{};
     std::size_t plaintext_cache_hits_{};
+    std::size_t virtual_weight_template_count_{};
+    std::size_t virtual_weight_requests_{};
+    std::size_t virtual_weight_cache_hits_{};
 };
 
 // Runtime-only lexical binding used by the reusable kernels. Standalone

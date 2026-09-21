@@ -122,6 +122,8 @@ struct PrivateRuntimeCliOptions {
     std::size_t threads{1};
     std::uint64_t input_seed{1};
     std::uint64_t weight_seed{2};
+    bool virtual_weights{};
+    std::size_t weight_template_count{1};
     std::size_t warmup{};
     std::size_t repeat{1};
     bool verify{};

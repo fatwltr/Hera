@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "model": {
+    "layers": [
+      {
+        "id": "layer0",
+        "tokens": 128,
+        "model_width": 768,
+        "q_heads": 12,
+        "kv_heads": 12,
+        "qk_head_width": 64,
+        "value_head_width": 64,
+        "ffn_width": 3072,
+        "norm": "pre",
+        "activation": "gelu",
+        "attention_mask": "public_padding",
+        "qkv_bias": true,
+        "output_bias": true,
+        "ffn_bias": true,
+        "attention_residual": true,
+        "ffn_residual": true,
+        "attention_norm_epsilon": 1e-5,
+        "attention_norm_rsqrt_bits": 20
+      }
+    ]
+  },
+  "numeric": {
+    "mpc_ring_bits": 43,
+    "mpc_scale_bits": 13
+  },
+  "conversion": {
+    "statistical_security_bits": 40,
+    "fft_scale_bits": 20,
+    "allow_internal_mod_switch": true
+  },
+  "softmax": {
+    "clip_threshold": -13.0,
+    "masked_shift": -14.0,
+    "exp_divisor_bits": 6,
+    "exp_squarings": 6,
+    "row_padding": "next_power_of_two"
+  },
+  "gelu": {
+    "threshold": 2.7,
+    "coefficients": {
+      "a": 0.020848611754127593,
+      "b": -0.18352506127082727,
+      "c": 0.5410550166368381,
+      "d": -0.03798164612714154,
+      "e": 0.001620808531841547
+    }
+  },
+  "he_parameter_profiles": {
+    "bert_base_ln_statistics": {
+      "polynomial_degree": 16384,
+      "coefficient_modulus_bits": [60, 60, 60, 60, 60],
+      "default_scale_bits": 38,
+      "input_scale_bits": 38,
+      "output_scale_bits": 38,
+      "declared_depth": 4,
+      "terminal_prime_count": 1,
+      "require_exact_terminal_level": true,
+      "security_level": "none"
+    },
+    "bert_base_attention_shared": {
+      "polynomial_degree": 32768,
+      "coefficient_modulus_bits": [60, 35, 60, 60, 60, 60, 60, 60, 60, 60],
+      "default_scale_bits": 44,
+      "input_scale_bits": 44,
+      "output_scale_bits": 44,
+      "declared_depth": 9,
+      "terminal_prime_count": 1,
+      "require_exact_terminal_level": true,
+      "security_level": "none"
+    },
+    "bert_base_softmax_polynomial": {
+      "polynomial_degree": 32768,
+      "coefficient_modulus_bits": [60, 40, 40, 40, 40, 40, 40, 60],
+      "default_scale_bits": 40,
+      "input_scale_bits": 40,
+      "output_scale_bits": 40,
+      "declared_depth": 7,
+      "terminal_prime_count": 1,
+      "require_exact_terminal_level": true,
+      "security_level": "none"
+    },
+    "bert_base_ffn": {
+      "polynomial_degree": 32768,
+      "coefficient_modulus_bits": [60, 60, 46, 46, 46, 46, 60, 60],
+      "default_scale_bits": 45,
+      "input_scale_bits": 45,
+      "output_scale_bits": 46,
+      "declared_depth": 6,
+      "terminal_prime_count": 1,
+      "require_exact_terminal_level": true,
+      "security_level": "none"
+    }
+  },
+  "layers": [
+    {
+      "id": "layer0",
+      "he_regions": {
+        "region1": {
+          "profile": "bert_base_ln_statistics",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_shared",
+          "input_layout": "spatial",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_shared",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
+      }
+    }
+  ],
+  "placement": {
+    "ln_statistics": "region1",
+    "attention_main": "region2",
+    "softmax_polynomial": "region3",
+    "attention_output_ln2": "region4",
+    "ffn_activation": "region5"
+  },
+  "execution": {
+    "threads": 8
+  }
+}

@@ -47,6 +47,8 @@ struct PreparationReport {
     std::size_t encoded_plaintext_count{};
     std::size_t encoded_bytes{};
     std::size_t cache_hits{};
+    std::size_t virtual_weight_requests{};
+    std::size_t virtual_weight_cache_hits{};
 };
 
 // High-level concrete runtimes may execute fused cryptographic stages while
