@@ -1,14 +1,12 @@
 # HERA
 
-HERA 是研究用途的 CKKS/MPC 私有 Transformer 推理原型，支持多层 Pre-LN +
-GeLU、MHA/GQA/MQA 和可变的 QK、V、FFN 宽度。输入和输出都是 CKKS 密文。
-当前配置允许 `security_level=none`，**不能用于生产安全部署**。
+HERA 是 CKKS/MPC 私有 Transformer 推理原型，支持多层 Pre-LN + GeLU、
+MHA/GQA/MQA 和可变宽度。输入、输出均为 CKKS 密文。当前配置允许
+`security_level=none`，**仅供研究，不能用于生产安全部署**。
 
 ## 在 Ubuntu 服务器上构建并验证
 
-推荐 Ubuntu 22.04/24.04、x86-64。首次构建需要访问 GitHub 和 GitLab；
-若 HERA 仓库是私有的，先为服务器配置 GitHub SSH 访问权限，或改用已认证的
-HTTPS 克隆。以下命令不依赖预先设置的 SEAL/SCI 环境变量或开发机路径：
+Ubuntu 22.04/24.04、x86-64；需访问 GitHub/GitLab，并具备仓库克隆权限：
 
 ```bash
 sudo apt-get update
@@ -27,18 +25,11 @@ cd Hera
   --party=local --verify --port=23100
 ```
 
-`bootstrap_dependencies.sh` 在仓库内下载并构建固定版本的 SEAL 4.4.5 和
-HERA-SCI，自动生成 `.deps/env.sh`；`build_and_test.sh` 读取该文件、构建程序
-并运行全部 CTest。无需手工设置 `SEAL_DIR`、`SCI_DIR` 或 `Eigen3_DIR`。
-两个 `2` 是并行编译任务数，可按内存增加。成功时应看到
-`HERA_BUILD_STATUS=PASS` 和 `HERA_PRIVATE_INFERENCE_STATUS=PASS`。
-`--party=local` 在本机启动客户端和服务端；请确保端口 23100 起的协议端口空闲。
+依赖安装在 `.deps/`，无需预设 SEAL/SCI 路径。`2` 为并行编译任务数。
+成功标志：`HERA_BUILD_STATUS=PASS`、`HERA_PRIVATE_INFERENCE_STATUS=PASS`。
+本机双进程运行需保证端口 23100 起的协议端口空闲。
 
-先用 `runtime_tiny.json` 验证安装。128-token 或 12 层配置需要显著更多内存和
-时间，不适合作为首次运行测试。服务器只能获取已经提交并推送的代码；本机
-未提交的改动不会随 `git clone` 出现。
-
-若只需要不依赖 SEAL/SCI 的图框架检查：
+仅检查图框架（无需 SEAL/SCI）：
 
 ```bash
 ./scripts/build_and_test.sh framework 2
@@ -48,8 +39,7 @@ HERA-SCI，自动生成 `.deps/env.sh`；`build_and_test.sh` 读取该文件、�
 
 ## 单算子 benchmark
 
-完成上述 full 构建后，下列程序均已编译。若只想构建 benchmark、跳过完整
-运行时的 CTest，在依赖准备完成后执行：
+只构建和测试 benchmark：
 
 ```bash
 cmake --preset full
@@ -60,10 +50,7 @@ cmake --build build/full --target \
 ctest --test-dir build/full -R 'hera_bench_.*_smoke' --output-on-failure
 ```
 
-`full` preset 使用仓库内的 `.deps/`，不包含固定的用户主目录路径。若依赖
-放在别处，请使用 `./scripts/build_and_test.sh full 2 <依赖目录>`。
-
-QK、Attention×V 从已按内核要求打包的密文开始计时：
+QK、Attention×V（计时不含密钥生成和输入加密）：
 
 ```bash
 ./build/full/hera_bench_qk \
@@ -74,7 +61,7 @@ QK、Attention×V 从已按内核要求打包的密文开始计时：
   --warmup=1 --iterations=10 --he-threads=2
 ```
 
-其余 HE 投影、多项式及真实双进程 MPC/转换测试：
+其他 HE、双进程 MPC 和转换测试：
 
 ```bash
 ./build/full/hera_bench_he_functions --kernel=qkv --warmup=1 --iterations=10
@@ -97,23 +84,39 @@ QK、Attention×V 从已按内核要求打包的密文开始计时：
   --warmup=1 --iterations=10
 ```
 
-`--warmup` 为不计时的预热次数，`--iterations` 为计时次数；`--degree` 为
-CKKS 多项式次数，`--he-threads` 为 HE 线程数，转换程序的 `--threads` 为
-协议 worker 数。所有 benchmark 都在计时区间外准备输入并检查最终结果。
-具体边界和 BLB 可比性见 [QK/Attention×V 说明](docs/benchmarks/he_qk_attention_v.md)
-及 [其他模块说明](docs/benchmarks/functional_kernels.md)。
+自定义维度示例：
+
+```bash
+./build/full/hera_bench_he_functions \
+  --kernel=qkv --tokens=4 --hidden=8 --heads=2 --kv-heads=1 \
+  --qk-width=4 --value-width=4 --ffn-width=12 --degree=8192 \
+  --he-threads=2 --warmup=1 --iterations=10
+./build/full/hera_bench_he_functions --kernel=gelu-poly \
+  --tokens=4 --ffn-width=12 --degree=8192 --warmup=1 --iterations=10
+./build/full/hera_bench_mpc_functions --kernel=softmax-max \
+  --tokens=8 --heads=2 --warmup=1 --iterations=10 --port=24940
+```
+
+`--tokens`：序列长度；`--heads`：query head 数；`--width`：QK 的 Q/K
+每头宽度、Attention×V 的 V 每头宽度，或 MPC GeLU 宽度；`--degree`：CKKS
+多项式次数；`--warmup`：不计时次数；`--iterations`：计时次数；
+`--he-threads`：HE 线程数；转换的 `--threads`：协议 worker 数。
+HE 投影还支持 `--hidden`、`--kv-heads`、`--qk-width`、`--value-width`、
+`--ffn-width`。转换 benchmark 固定为每轮 8 个逻辑复数值，不支持批量维度扫描。
+计时边界见 [QK/Attention×V](docs/benchmarks/he_qk_attention_v.md)和
+[其他模块](docs/benchmarks/functional_kernels.md)。
 
 ## 配置与其他说明
 
-- [单层 BERT-base 配置](configs/bert_base_single_layer_seq128.json) 和
-  [12 层可变宽度配置](configs/bert_base_variable_dims_seq128.json) 仅用于
-  资源允许的研究测试；先用 `--dry-run` 检查配置。
+- [单层 BERT-base 配置](configs/bert_base_single_layer_seq128.json)；
+  [12 层可变宽度配置](configs/bert_base_variable_dims_seq128.json)。运行前先用
+  `--dry-run` 检查资源。
 - 仅测时间且内存不足时，可使用 `--weight-mode=virtual` 和
   `--weight-template-count=1` 复用合成 plaintext。该模式不保持模型数值语义，
   不能用于精度评估。
-- 模型 plaintext 在 `Prepare()` 阶段编码；正常 online 计时不含权重编译。
-  `--he-threads`、`--conversion-workers` 和 `--he-memory-mib` 分别控制 HE
-  并行、转换 worker 与 HE 临时任务内存预算。
+- online 计时不含 `Prepare()` 权重编码。`--he-threads`、
+  `--conversion-workers`、`--he-memory-mib` 分别控制 HE 并行、转换 worker
+  和 HE 临时任务内存预算。
 
 协议、level/packing 与运行限制见 [实现说明](docs/IMPLEMENTATION.md)和
 [复现说明](docs/REPRODUCIBILITY.md)；第三方来源及许可证注意事项见
