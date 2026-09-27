@@ -83,7 +83,21 @@ if(HERA_ENABLE_CONVERSION)
         ${PROJECT_SOURCE_DIR}/app/conversion_main.cpp)
     target_link_libraries(hera_complex_conversion PRIVATE hera_conversion)
     hera_configure_target(hera_complex_conversion WIDE_INTEGER)
+    add_executable(hera_bench_conversion
+        ${PROJECT_SOURCE_DIR}/app/conversion_main.cpp)
+    target_link_libraries(hera_bench_conversion PRIVATE hera_conversion)
+    hera_configure_target(hera_bench_conversion WIDE_INTEGER)
+    target_compile_definitions(hera_bench_conversion PRIVATE
+        HERA_CONVERSION_BENCHMARK=1)
     if(BUILD_TESTING)
+        add_test(NAME hera_bench_conversion_smoke
+            COMMAND hera_bench_conversion --party=local
+                --config=${PROJECT_SOURCE_DIR}/configs/conversion_smoke.json
+                --profile=conversion_test --port=24920 --threads=1
+                --warmup=1 --iterations=1)
+        set_tests_properties(hera_bench_conversion_smoke PROPERTIES
+            TIMEOUT 240 RESOURCE_LOCK hera_bench_conversion_ports
+            PASS_REGULAR_EXPRESSION "HERA_BENCHMARK_STATUS=PASS")
         add_test(NAME hera_complex_conversion_smoke
             COMMAND hera_complex_conversion --party=local
                 --config=${PROJECT_SOURCE_DIR}/configs/conversion_smoke.json
@@ -99,7 +113,19 @@ if(HERA_ENABLE_HE)
     hera_configure_target(hera_he)
     target_link_libraries(hera_he PUBLIC
         hera_framework hera_seal_runtime SEAL::seal Threads::Threads)
+    add_executable(hera_bench_qk
+        ${PROJECT_SOURCE_DIR}/tests/he_kernel_benchmark.cpp)
+    hera_configure_target(hera_bench_qk)
+    target_compile_definitions(hera_bench_qk PRIVATE HERA_BENCHMARK_QK=1)
+    target_link_libraries(hera_bench_qk PRIVATE hera_he)
     if(BUILD_TESTING)
+        add_test(NAME hera_bench_qk_smoke
+            COMMAND hera_bench_qk
+                --tokens=4 --heads=2 --width=2 --degree=4096
+                --warmup=0 --iterations=1 --he-threads=1)
+        set_tests_properties(hera_bench_qk_smoke PROPERTIES
+            TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "HERA_BENCHMARK_STATUS=PASS")
         hera_add_test_executable(hera_block2_he_tests
             ${PROJECT_SOURCE_DIR}/tests/block2_he_tests.cpp
             LIBRARIES hera_he
@@ -142,7 +168,21 @@ if(HERA_ENABLE_ATTENTION_LN2)
     target_link_libraries(hera_attention_ln2 PUBLIC
         hera_softmax hera_conversion SCI::SCI-FloatingPoint SEAL::seal
         Threads::Threads)
+    # Standalone HE-only timing boundaries. Setup, input packing/encryption,
+    # output decryption, and correctness checks are outside the timed region.
+    add_executable(hera_bench_attention_v
+        ${PROJECT_SOURCE_DIR}/tests/he_kernel_benchmark.cpp)
+    hera_configure_target(hera_bench_attention_v)
+    target_link_libraries(hera_bench_attention_v PRIVATE
+        hera_attention_ln2 hera_he)
     if(BUILD_TESTING)
+        add_test(NAME hera_bench_attention_v_smoke
+            COMMAND hera_bench_attention_v
+                --tokens=4 --heads=2 --width=2 --degree=4096
+                --warmup=0 --iterations=1 --he-threads=1)
+        set_tests_properties(hera_bench_attention_v_smoke PROPERTIES
+            TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "HERA_BENCHMARK_STATUS=PASS")
         hera_add_test_executable(hera_attention_ln2_tests
             ${PROJECT_SOURCE_DIR}/tests/attention_ln2_tests.cpp
             WIDE_INTEGER LIBRARIES hera_attention_ln2
@@ -159,7 +199,33 @@ if(HERA_ENABLE_FFN_GELU)
     target_link_libraries(hera_ffn_gelu PUBLIC
         hera_he hera_conversion SCI::SCI-FloatingPoint SEAL::seal
         Threads::Threads)
+    add_executable(hera_bench_he_functions
+        ${PROJECT_SOURCE_DIR}/tests/functional_he_benchmark.cpp)
+    hera_configure_target(hera_bench_he_functions WIDE_INTEGER)
+    target_link_libraries(hera_bench_he_functions PRIVATE
+        hera_ffn_gelu hera_attention_ln2 hera_softmax)
+    add_executable(hera_bench_mpc_functions
+        ${PROJECT_SOURCE_DIR}/tests/nonlinear_mpc_benchmark.cpp)
+    hera_configure_target(hera_bench_mpc_functions WIDE_INTEGER)
+    target_link_libraries(hera_bench_mpc_functions PRIVATE
+        hera_ffn_gelu hera_softmax)
     if(BUILD_TESTING)
+        foreach(kernel qkv wo wu wd softmax-exp gelu-poly)
+            add_test(NAME hera_bench_he_${kernel}_smoke
+                COMMAND hera_bench_he_functions --kernel=${kernel}
+                    --warmup=0 --iterations=1 --he-threads=1)
+            set_tests_properties(hera_bench_he_${kernel}_smoke PROPERTIES
+                TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "HERA_BENCHMARK_STATUS=PASS")
+        endforeach()
+        foreach(kernel softmax-max softmax-normalize gelu-select)
+            add_test(NAME hera_bench_mpc_${kernel}_smoke
+                COMMAND hera_bench_mpc_functions --kernel=${kernel}
+                    --warmup=1 --iterations=1 --port=24900)
+            set_tests_properties(hera_bench_mpc_${kernel}_smoke PROPERTIES
+                TIMEOUT 240 RESOURCE_LOCK hera_bench_mpc_ports
+                PASS_REGULAR_EXPRESSION "HERA_BENCHMARK_STATUS=PASS")
+        endforeach()
         hera_add_test_executable(hera_ffn_gelu_tests
             ${PROJECT_SOURCE_DIR}/tests/ffn_gelu_tests.cpp
             WIDE_INTEGER LIBRARIES hera_ffn_gelu
@@ -179,6 +245,7 @@ if(HERA_ENABLE_BLOCK5_BRIDGE)
         SCI::SCI-FloatingPoint SEAL::seal Threads::Threads)
 
     add_library(hera_private_runtime STATIC
+        ${HERA_CRYPTO_ROOT}/runtime/execution_plan.cpp
         ${HERA_CRYPTO_ROOT}/runtime/private_runtime.cpp
         ${HERA_CRYPTO_ROOT}/runtime/runtime_coordinator.cpp)
     hera_configure_target(hera_private_runtime WIDE_INTEGER)

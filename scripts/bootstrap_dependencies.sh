@@ -50,8 +50,13 @@ checkout_pinned() {
     echo "Dependency checkout has local changes: $destination" >&2
     exit 2
   fi
-  git -C "$destination" fetch --depth 1 origin "$commit"
-  git -C "$destination" checkout --detach "$commit"
+  # A repeat build with the pinned source already present must not require
+  # GitHub access. This is also useful when dependencies were staged on a
+  # server before its compute node was disconnected from the network.
+  if [[ "$(git -C "$destination" rev-parse HEAD)" != "$commit" ]]; then
+    git -C "$destination" fetch --depth 1 origin "$commit"
+    git -C "$destination" checkout --detach "$commit"
+  fi
   [[ "$(git -C "$destination" rev-parse HEAD)" == "$commit" ]] || {
     echo "Failed to select pinned revision for $name" >&2
     exit 1
@@ -65,6 +70,7 @@ checkout_pinned bolt "$BOLT_REPOSITORY" "$BOLT_COMMIT"
 git -C "$src_root/bolt" submodule update --init --depth 1 SCI/extern/eigen
 
 seal_output="$build_root/seal-$SEAL_VERSION"
+seal_compression=${HERA_SEAL_COMPRESSION:-none}
 seal_dir="$seal_output/install/lib/cmake/SEAL-4.4"
 if [[ ! -f "$seal_dir/SEALConfig.cmake" ]]; then
   [[ ! -e "$seal_output" ]] || {
@@ -72,12 +78,20 @@ if [[ ! -f "$seal_dir/SEALConfig.cmake" ]]; then
     echo "Move it aside and rerun; the script never overwrites dependency builds." >&2
     exit 2
   }
-  "$script_dir/prepare_seal.sh" "$src_root/seal" "$seal_output" "$jobs"
+  "$script_dir/prepare_seal.sh" "$src_root/seal" "$seal_output" \
+    "$jobs" "$seal_compression"
 fi
 
 seal_manifest="$seal_output/install/share/hera-seal/manifest.txt"
 grep -qx "SEAL_VERSION=$SEAL_VERSION" "$seal_manifest"
 grep -qx "SEAL_COMMIT=$SEAL_COMMIT" "$seal_manifest"
+if ! grep -qx "SEAL_COMPRESSION=$seal_compression" "$seal_manifest"; then
+  if [[ "$seal_compression" != none ]] ||
+     grep -q '^SEAL_COMPRESSION=' "$seal_manifest"; then
+    echo "Existing SEAL build has a different compression mode" >&2
+    exit 2
+  fi
+fi
 
 sci_output="$build_root/hera-sci-abi-$HERA_SCI_ABI"
 sci_dir="$sci_output/install/lib/cmake/SCI"
@@ -93,16 +107,26 @@ if [[ ! -f "$sci_dir/SCIConfig.cmake" ]]; then
 fi
 
 sci_manifest="$sci_output/install/share/hera-sci/manifest.txt"
-test -f "$sci_output/install/include/emp-tool/emp-tool.h" || {
-  echo "Incomplete HERA-SCI package: emp-tool headers are absent" >&2
-  echo "Move $sci_output aside and rerun dependency bootstrap." >&2
-  exit 2
-}
 grep -qx "HERA_SCI_ABI=$HERA_SCI_ABI" "$sci_manifest"
 grep -qx "SEAL_VERSION=$SEAL_VERSION" "$sci_manifest"
 grep -qx "OT_BACKEND=VOLE_SILENT_OT" "$sci_manifest"
 grep -qx "BLB_COMMIT=$BLB_COMMIT" "$sci_manifest"
 grep -qx "BOLT_COMMIT=$BOLT_COMMIT" "$sci_manifest"
+
+# Older installations with the same ABI/commit manifest omitted this
+# header-only transitive dependency. Repair that exact packaging omission
+# without rebuilding SCI or touching its pinned source checkout.
+emp_header="$sci_output/install/include/emp-tool/emp-tool.h"
+if [[ ! -f "$emp_header" ]]; then
+  emp_source="$sci_output/SCI/deps/emp-tool/emp-tool"
+  [[ -f "$emp_source/emp-tool.h" ]] || {
+    echo "Incomplete HERA-SCI package: emp-tool headers are absent" >&2
+    echo "Move $sci_output aside and rerun dependency bootstrap." >&2
+    exit 2
+  }
+  mkdir -p "$(dirname "$emp_header")"
+  rsync -a --exclude '*.rej' "$emp_source/" "$(dirname "$emp_header")/"
+fi
 
 env_file="$deps_root/env.sh"
 cat > "$env_file" <<EOF

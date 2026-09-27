@@ -100,7 +100,8 @@ public:
         const std::optional<DenseVectorParameter> &bias,
         const TransformerLayerConfig &layer,
         const HeContext &context,
-        FfnGeluExecutionReport *report = nullptr);
+        FfnGeluExecutionReport *report = nullptr,
+        std::size_t he_workers = 1);
 };
 
 // Generic rectangular column-first ciphertext/plaintext projection used by
@@ -116,7 +117,8 @@ public:
         HeRegionId output_region,
         int output_scale_bits,
         const HeContext &context,
-        HeKernelOperationCounts *counts = nullptr);
+        HeKernelOperationCounts *counts = nullptr,
+        std::size_t he_workers = 1);
 
     static Result<std::vector<int>> RequiredRotationSteps(
         const HePackingPlan &input_packing,
@@ -148,7 +150,8 @@ public:
         const SealCipherTensor &input,
         const GeluConfig &config,
         const HeContext &context,
-        FfnGeluExecutionReport *report = nullptr);
+        FfnGeluExecutionReport *report = nullptr,
+        std::size_t he_workers = 1);
 };
 
 class MpcGeluRuntime {

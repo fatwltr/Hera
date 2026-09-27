@@ -1,8 +1,10 @@
 #include "hera/private_transformer.h"
+#include "hera/detail/parallel_ranges.h"
 
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <atomic>
 #include <stdexcept>
 
 #ifndef HERA_TEST_CONFIG_PATH
@@ -260,6 +262,25 @@ void TestLayerNormRsqrtWidthValidation(hera::HeraConfig config)
             "full-width rsqrt working ring was rejected");
 }
 
+void TestHeWorkerBudgetAndReuse()
+{
+    auto &pool = hera::detail::HeWorkerPool::Instance();
+    pool.SetMemoryBudget(128);
+    std::atomic<int> visited{0};
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        auto done = hera::detail::ParallelRanges(
+            4, 4, 1,
+            [&](std::size_t begin, std::size_t end) -> hera::Result<void> {
+                visited += static_cast<int>(end - begin);
+                return {};
+            }, 64);
+        Require(done.ok(), done.status().message());
+        Require(pool.WorkerThreadCount() == 1,
+                "HE memory budget did not limit reusable worker count");
+    }
+    Require(visited == 8, "HE worker pool skipped an output range");
+}
+
 } // namespace
 
 int main()
@@ -276,6 +297,7 @@ int main()
         TestUnavailableBackend(config.value());
         TestConversionWorkspaceValidation(config.value());
         TestLayerNormRsqrtWidthValidation(config.value());
+        TestHeWorkerBudgetAndReuse();
         std::cout << "HERA_FRAMEWORK_STATUS=PASS\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

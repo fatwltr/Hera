@@ -1,5 +1,6 @@
 #include "hera/block2_he.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -80,7 +81,7 @@ hera::HePackingPlan MakeInterleavedSpatial(
 
 hera::SealCipherTensor Encrypt(
     const std::vector<double> &values, const hera::HePackingPlan &packing,
-    const hera::HeContext &context)
+    const hera::HeContext &context, std::size_t level = 0)
 {
     std::vector<std::vector<std::complex<double>>> slots(
         packing.ciphertext_count,
@@ -101,6 +102,14 @@ hera::SealCipherTensor Encrypt(
         seal::Plaintext plain;
         encoder.encode(slots[i], scale, plain);
         encryptor.encrypt_symmetric(plain, ciphertexts[i]);
+        if (level != 0) {
+            auto data = context.context->first_context_data();
+            for (std::size_t step = 0; step < level && data; ++step)
+                data = data->next_context_data();
+            Require(static_cast<bool>(data), "invalid requested encryption level");
+            seal::Evaluator evaluator(*context.context);
+            evaluator.mod_switch_to_inplace(ciphertexts[i], data->parms_id());
+        }
     }
     hera::TensorSpec spec;
     spec.shape = packing.logical_shape;
@@ -109,9 +118,73 @@ hera::SealCipherTensor Encrypt(
     spec.numeric = {43, 13};
     spec.he_region = hera::HeRegionId::kRegion2;
     spec.he_parameter_profile = context.profile;
-    spec.planned_level = 0;
+    spec.planned_level = level;
     spec.planned_scale_bits = context.parameters.input_scale_bits;
     return {context.profile, std::move(ciphertexts), spec, packing};
+}
+
+std::vector<double> Decrypt(
+    const hera::SealCipherTensor &tensor, const hera::HeContext &context);
+double MaxError(const std::vector<double> &a,
+                const std::vector<double> &b);
+
+void TestParallelQkGroups()
+{
+    auto config = MakeConfig();
+    auto &layer = config.layers.front();
+    layer.tokens = 32;
+    layer.q_heads = 8;
+    layer.kv_heads = 8;
+    layer.qk_head_width = 2;
+    layer.qkv_bias = false;
+    const auto &profile = config.he_parameter_profiles.at("block2");
+    const auto slots = profile.polynomial_degree / 2;
+    auto q_plan = hera::MultiHeadPackingPlan::ProjectionOutput(
+        layer, hera::Layout::kMultiHeadQ, slots);
+    auto k_plan = hera::MultiHeadPackingPlan::ProjectionOutput(
+        layer, hera::Layout::kMultiHeadK, slots);
+    Require(q_plan.ok() && k_plan.ok(), "parallel QK packing failed");
+    auto projection_input = MakeInterleavedSpatial(
+        {{layer.tokens, layer.model_width}}, slots);
+    auto steps = hera::SealBlock2Executor::RequiredRotationSteps(
+        layer, profile, projection_input);
+    Require(steps.ok(), steps.status().message());
+    hera::HeContextRegistry client;
+    Require(client.CreateClientProfiles(config).ok(), "QK client setup failed");
+    Require(client.CompileRotationKeys("block2", steps.value()).ok(),
+            "QK rotation keys failed");
+    auto bundle = client.ExportPublicBundle();
+    Require(bundle.ok(), bundle.status().message());
+    hera::HeContextRegistry server;
+    Require(server.CreateServerProfiles(config, bundle.value()).ok(),
+            "QK server setup failed");
+    const auto &client_context = client.Require("block2", hera::PartyRole::kClient);
+    const auto &server_context = server.Require("block2", hera::PartyRole::kServer);
+    std::vector<double> q(layer.tokens * hera::QueryWidth(layer));
+    std::vector<double> k(layer.tokens * hera::KeyWidth(layer));
+    for (std::size_t i = 0; i < q.size(); ++i) {
+        q[i] = (static_cast<int>(i % 11) - 5) * 0.003;
+        k[i] = (static_cast<int>(i % 13) - 6) * 0.002;
+    }
+    constexpr std::size_t kQkStartLevel = 4;
+    auto q_cipher = Encrypt(q, q_plan.value(), client_context, kQkStartLevel);
+    auto k_cipher = Encrypt(k, k_plan.value(), client_context, kQkStartLevel);
+    hera::Block2ExecutionReport serial_report, parallel_report;
+    auto serial = hera::MultiHeadQkKernel::Evaluate(
+        q_cipher, k_cipher, layer, server_context, &serial_report, 1);
+    auto parallel = hera::MultiHeadQkKernel::Evaluate(
+        q_cipher, k_cipher, layer, server_context, &parallel_report, 2);
+    Require(serial.ok() && parallel.ok(),
+            serial.ok() ? parallel.status().message() : serial.status().message());
+    auto serial_values = Decrypt(serial.value(), client_context);
+    auto parallel_values = Decrypt(parallel.value(), client_context);
+    Require(MaxError(serial_values, parallel_values) < 1e-4,
+            "parallel QK differs from serial QK");
+    Require(serial_report.rotations == parallel_report.rotations &&
+                serial_report.ciphertext_multiplications ==
+                    parallel_report.ciphertext_multiplications &&
+                serial_report.rescales == parallel_report.rescales,
+            "parallel QK changed operation counts");
 }
 
 std::vector<double> Decrypt(
@@ -279,9 +352,14 @@ void TestBlock2()
     hera::HeContextRegistry client;
     Require(client.CreateClientProfiles(config).ok(),
             "cannot create client HE context");
-    auto steps = hera::SealBlock2Executor::RequiredRotationSteps(layer,
-                                                                  profile);
+    const auto packing = MakeInterleavedSpatial(
+        {{layer.tokens, layer.model_width}}, profile.polynomial_degree / 2);
+    auto steps = hera::SealBlock2Executor::RequiredRotationSteps(
+        layer, profile, packing);
     Require(steps.ok(), steps.status().message());
+    Require(std::find(steps.value().begin(), steps.value().end(), -3) !=
+                steps.value().end(),
+            "exact non-power-of-two projection rotation key is absent");
     Require(client.CompileRotationKeys("block2", steps.value()).ok(),
             "cannot compile Block 2 Galois keys");
     auto bundle = client.ExportPublicBundle();
@@ -294,8 +372,6 @@ void TestBlock2()
 
     const auto &client_context =
         client.Require("block2", hera::PartyRole::kClient);
-    const auto packing = MakeInterleavedSpatial(
-        {{layer.tokens, layer.model_width}}, client_context.slot_count());
     const std::vector<double> centered{-0.35, 0.20, 0.10, -0.15,
                                         0.30, -0.25, 0.05, 0.40};
     const std::vector<double> inverse{1.20, 1.20, 1.20, 1.20,
@@ -395,6 +471,95 @@ void TestBlock2()
             report.ciphertext_plain_multiplications != 0 &&
             report.relinearizations != 0 && report.rescales != 0,
             "Block 2 operation report is incomplete");
+
+    // Compile from metadata-only ciphertexts: Prepare must not encrypt zeros
+    // or execute QK, rotations, or any other HE arithmetic.
+    parameters.BeginPlaintextPreparation();
+    {
+        hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
+        auto meta_centered = tensors.Get(centered_handle.value().id);
+        auto meta_inverse = tensors.Get(inverse_handle.value().id);
+        Require(meta_centered.ok() && meta_inverse.ok(),
+                "Block 2 metadata inputs are absent");
+        for (auto *tensor : {&meta_centered.value(), &meta_inverse.value()})
+            for (auto &ct : tensor->ciphertexts) {
+                const auto id = ct.parms_id();
+                const auto scale = ct.scale();
+                ct = seal::Ciphertext();
+                ct.parms_id() = id;
+                ct.scale() = scale;
+            }
+        const auto get_vector = [&](const std::string &name) {
+            for (const auto &handle : weights.plain_parameters)
+                if (handle.spec.name == name)
+                    return parameters.GetVector(handle.id).value();
+            throw std::runtime_error("missing Block 2 test vector: " + name);
+        };
+        auto normalized_meta = hera::LayerNormTailKernel::Evaluate(
+            meta_centered.value(), meta_inverse.value(),
+            get_vector("ln1.gamma"), get_vector("ln1.beta"),
+            layer, server_context);
+        Require(normalized_meta.ok(), normalized_meta.status().message());
+        auto qk_meta = normalized_meta.value();
+        const auto terminal = profile.coefficient_modulus_bits.size() -
+                              profile.terminal_prime_count;
+        const auto qk_input_level = terminal - 5 - 1;
+        auto qk_context_data = server_context.context->first_context_data();
+        for (std::size_t level = 0; level < qk_input_level; ++level)
+            qk_context_data = qk_context_data->next_context_data();
+        Require(static_cast<bool>(qk_context_data),
+                "Block 2 test QK level is absent");
+        for (auto &ct : qk_meta.ciphertexts)
+            ct.parms_id() = qk_context_data->parms_id();
+        qk_meta.logical_spec.planned_level = qk_input_level;
+        hera::ComplexDiagonalProjectionKernel qk_projection(
+            layer, server_context);
+        hera::ComplexDiagonalProjectionKernel value_projection(
+            layer, server_context);
+        auto q = qk_projection.Evaluate(
+            qk_meta, parameters.GetMatrix(weights.wq.id).value(),
+            get_vector("bq"), hera::Layout::kMultiHeadQ);
+        auto k = qk_projection.Evaluate(
+            qk_meta, parameters.GetMatrix(weights.wk.id).value(),
+            get_vector("bk"), hera::Layout::kMultiHeadK);
+        auto v = value_projection.Evaluate(
+            normalized_meta.value(),
+            parameters.GetMatrix(weights.wv.id).value(),
+            get_vector("bv"), hera::Layout::kMultiHeadV);
+        Require(q.ok() && k.ok() && v.ok(),
+                q.ok() ? (k.ok() ? v.status().message()
+                                 : k.status().message())
+                       : q.status().message());
+    }
+    parameters.FreezePlaintextCache();
+    Require(parameters.prepared_projection_count() == 3,
+            "Prepare did not compile Wq, Wk and Wv projection plans");
+    hera::Block2ExecutionReport cached_report;
+    hera::Result<hera::Block2HeOutputs> cached =
+        hera::Status::Internal("cached Block 2 was not evaluated");
+    {
+        hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
+        cached = executor.Evaluate(
+            {centered_handle.value(), inverse_handle.value()}, weights,
+            &cached_report);
+    }
+    Require(cached.ok(), cached.status().message());
+    Require(parameters.prepared_projection_hits() == 3,
+            "online Block 2 did not use all prepared projection plans");
+    auto cached_value = tensors.Get(cached.value().value.id);
+    auto cached_scores = tensors.Get(cached.value().scaled_attention_scores.id);
+    Require(cached_value.ok() && cached_scores.ok(),
+            "cached Block 2 outputs are absent");
+    Require(MaxError(Decrypt(cached_value.value(), client_context), actual_v) <
+                1e-4 &&
+            MaxError(Decrypt(cached_scores.value(), client_context),
+                     actual_scores) < 1e-4,
+            "prepared Block 2 differs from the direct HE path");
+    Require(cached_report.rotations == report.rotations &&
+                cached_report.ciphertext_plain_multiplications ==
+                    report.ciphertext_plain_multiplications &&
+                cached_report.rescales == report.rescales,
+            "prepared Block 2 changed HE operation counts");
 }
 
 } // namespace
@@ -403,6 +568,7 @@ int main()
 {
     try {
         TestBlock2();
+        TestParallelQkGroups();
         std::cout << "HERA_BLOCK2_HE_STATUS=PASS\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {

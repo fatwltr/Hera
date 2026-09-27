@@ -4,6 +4,9 @@
 #include <sstream>
 #include <algorithm>
 #include <set>
+#include <streambuf>
+#include <cstring>
+#include <limits>
 
 namespace hera {
 namespace {
@@ -30,21 +33,74 @@ std::shared_ptr<seal::SEALContext> BuildContext(
 
 } // namespace
 
+class FixedVectorOutputBuffer final : public std::streambuf {
+public:
+    explicit FixedVectorOutputBuffer(std::vector<std::uint8_t> &bytes)
+        : bytes_(bytes)
+    {
+        auto *begin = reinterpret_cast<char *>(bytes_.data());
+        setp(begin, begin + bytes_.size());
+    }
+
+    std::size_t Written() const noexcept { return pptr() - pbase(); }
+
+protected:
+    std::streamsize xsputn(const char *source,
+                           std::streamsize size) override
+    {
+        if (size < 0 || size > epptr() - pptr() ||
+            size > std::numeric_limits<int>::max()) return 0;
+        std::memcpy(pptr(), source, static_cast<std::size_t>(size));
+        pbump(static_cast<int>(size));
+        return size;
+    }
+
+    int_type overflow(int_type value) override
+    {
+        if (pptr() == epptr()) return traits_type::eof();
+        *pptr() = traits_type::to_char_type(value);
+        pbump(1);
+        return value;
+    }
+
+private:
+    std::vector<std::uint8_t> &bytes_;
+};
+
+class VectorInputBuffer final : public std::streambuf {
+public:
+    explicit VectorInputBuffer(const std::vector<std::uint8_t> &bytes)
+    {
+        auto *begin = reinterpret_cast<char *>(
+            const_cast<std::uint8_t *>(bytes.data()));
+        setg(begin, begin, begin + bytes.size());
+    }
+};
+
 template <typename SealObject>
-std::vector<std::uint8_t> Serialize(const SealObject &object)
+std::vector<std::uint8_t> Serialize(
+    const SealObject &object, seal::compr_mode_type compression)
 {
-    std::stringstream stream;
-    object.save(stream, seal::compr_mode_type::none);
-    const auto text = stream.str();
-    return {text.begin(), text.end()};
+    const auto upper_bound = object.save_size(compression);
+    if (upper_bound <= 0 || static_cast<std::uint64_t>(upper_bound) >
+                                (std::uint64_t{1} << 34))
+        throw std::runtime_error("public HE key serialization is too large");
+    std::vector<std::uint8_t> bytes(
+        static_cast<std::size_t>(upper_bound));
+    FixedVectorOutputBuffer buffer(bytes);
+    std::ostream stream(&buffer);
+    stream.exceptions(std::ios::badbit | std::ios::failbit);
+    object.save(stream, compression);
+    bytes.resize(buffer.Written());
+    return bytes;
 }
 
 template <typename SealObject>
 SealObject Deserialize(const std::vector<std::uint8_t> &bytes,
                        const seal::SEALContext &context)
 {
-    std::string text(bytes.begin(), bytes.end());
-    std::stringstream stream(text);
+    VectorInputBuffer buffer(bytes);
+    std::istream stream(&buffer);
     SealObject object;
     object.load(context, stream);
     return object;
@@ -103,7 +159,8 @@ Result<PublicContextBundle> HeContextRegistry::ExportPublicBundle() const
 }
 
 Result<SerializedPublicContextBundle>
-HeContextRegistry::ExportSerializedPublicBundle() const
+HeContextRegistry::ExportSerializedPublicBundle(
+    seal::compr_mode_type compression) const
 {
     if (!initialized_ || role_ != PartyRole::kClient)
         return Status::FailedPrecondition(
@@ -113,13 +170,15 @@ HeContextRegistry::ExportSerializedPublicBundle() const
         for (const auto &entry : contexts_) {
             SerializedProfilePublicMaterial material;
             material.profile = entry.first;
-            material.public_key = Serialize(entry.second.public_key);
+            material.public_key = Serialize(entry.second.public_key,
+                                            compression);
             material.relinearization_keys =
-                Serialize(entry.second.relinearization_keys);
+                Serialize(entry.second.relinearization_keys, compression);
             // An empty GaloisKeys object is valid for the conversion-only
             // build; a later HE kernel may populate it before export.
             if (entry.second.galois_keys.size() != 0)
-                material.galois_keys = Serialize(entry.second.galois_keys);
+                material.galois_keys = Serialize(entry.second.galois_keys,
+                                                 compression);
             result.profiles.push_back(std::move(material));
         }
         return result;
@@ -182,7 +241,7 @@ Result<void> HeContextRegistry::CreateServerProfiles(
 Result<void> HeContextRegistry::CreateServerProfiles(
     const HeraConfig &config, const SerializedPublicContextBundle &bundle)
 {
-    if (bundle.protocol_version != 1)
+    if (bundle.protocol_version != 2)
         return Status::FailedPrecondition(
             "public HE bundle protocol version mismatch");
     if (initialized_)

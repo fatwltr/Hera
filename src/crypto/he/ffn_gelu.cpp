@@ -1,5 +1,6 @@
 #include "hera/ffn_gelu.h"
 #include "hera/detail/mpc_session_internal.h"
+#include "hera/detail/parallel_ranges.h"
 
 #include <FloatingPoint/fixed-point.h>
 #include <FloatingPoint/fp-math.h>
@@ -411,6 +412,69 @@ Result<SealCipherTensor> FfnLayerNormTailKernel::Evaluate(
         return Status::FailedPrecondition(
             "FFN inverse-stddev must begin at the same suffix level");
 
+    const auto cache = ModelPlaintextCacheScope::Current();
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        const auto input_id = centered.ciphertexts.front().parms_id();
+        const auto next = context.context->get_context_data(input_id)
+                              ->next_context_data();
+        if (!next)
+            return Status::FailedPrecondition(
+                "FFN LayerNorm preparation has no next level");
+        seal::CKKSEncoder encoder(*context.context);
+        const int affine_bits = context.parameters.default_scale_bits + 15;
+        const double target = std::ldexp(1.0, affine_bits);
+        const double plain_scale = target * DroppedPrime(context, input_id) /
+            (input_scale * input_scale);
+        if (!std::isfinite(plain_scale) || plain_scale < 2.0)
+            return Status::FailedPrecondition(
+                "LayerNorm gamma plaintext scale is too small");
+        const auto columns = plan.value().columns_per_component;
+        for (std::size_t group = 0;
+             group < centered.ciphertexts.size(); ++group) {
+            std::vector<double> plus(context.slot_count());
+            std::vector<double> minus(context.slot_count());
+            std::vector<Complex> bias_slots(context.slot_count());
+            for (std::size_t token = 0; token < layer.tokens; ++token)
+                for (std::size_t local = 0; local < columns; ++local) {
+                    const auto slot = local * plan.value().token_stride + token;
+                    const auto real_feature = group * 2 * columns + local;
+                    const auto imag_feature = real_feature + columns;
+                    const double gr = real_feature < layer.model_width
+                        ? gamma.values[real_feature] : 0.0;
+                    const double gi = imag_feature < layer.model_width
+                        ? gamma.values[imag_feature] : 0.0;
+                    plus[slot] = 0.5 * (gr + gi);
+                    minus[slot] = 0.5 * (gr - gi);
+                    if (real_feature < layer.model_width)
+                        bias_slots[slot].real(beta.values[real_feature]);
+                    if (imag_feature < layer.model_width)
+                        bias_slots[slot].imag(beta.values[imag_feature]);
+                }
+            auto plus_plain = EncodeModelPlaintext(
+                encoder, plus, input_id, plain_scale,
+                "ffn.ln2.gamma.plus");
+            if (!plus_plain.ok()) return plus_plain.status();
+            auto minus_plain = EncodeModelPlaintext(
+                encoder, minus, input_id, plain_scale,
+                "ffn.ln2.gamma.minus");
+            if (!minus_plain.ok()) return minus_plain.status();
+            auto bias_plain = EncodeModelPlaintext(
+                encoder, bias_slots, next->parms_id(), target,
+                "ffn.ln2.beta");
+            if (!bias_plain.ok()) return bias_plain.status();
+        }
+        auto result = centered;
+        for (auto &ct : result.ciphertexts) {
+            ct.parms_id() = next->parms_id();
+            ct.scale() = target;
+        }
+        result.logical_spec.he_region = HeRegionId::kRegion5;
+        result.logical_spec.he_parameter_profile = context.profile;
+        result.logical_spec.planned_level = input_level + 1;
+        result.logical_spec.planned_scale_bits = affine_bits;
+        return result;
+    }
+
     seal::Evaluator evaluator(*context.context);
     seal::CKKSEncoder encoder(*context.context);
     // A 45+45 ciphertext product followed by one 60-bit rescale would leave
@@ -528,7 +592,8 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
     HeRegionId output_region,
     int output_scale_bits,
     const HeContext &context,
-    HeKernelOperationCounts *counts)
+    HeKernelOperationCounts *counts,
+    std::size_t he_workers)
 {
     auto valid = input.Validate(context);
     if (!valid.ok()) return valid.status();
@@ -555,6 +620,44 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
     for (const auto &locations : output_packing.logical_locations)
         if (locations.size() != 1)
             return Status::Invalid("projection output must have one physical lane");
+    const auto cache = ModelPlaintextCacheScope::Current();
+    const auto prepared_key = cache.second + "/ffn/" + weights.spec.name;
+    if (cache.first && !cache.first->preparing_plaintexts()) {
+        auto prepared = cache.first->GetPreparedProjection(prepared_key);
+        if (!prepared.ok()) return prepared.status();
+        if (!SamePreparedPacking(prepared.value()->output_packing,
+                                 output_packing) ||
+            prepared.value()->output_scale_bits != output_scale_bits)
+            return Status::FailedPrecondition(
+                "prepared column projection output contract mismatch");
+        PreparedProjectionCounts prepared_counts;
+        auto ciphertexts = EvaluatePreparedProjection(
+            *prepared.value(), input, context, &prepared_counts);
+        if (!ciphertexts.ok()) return ciphertexts.status();
+        if (counts) {
+            counts->rotations += prepared_counts.rotations;
+            counts->conjugations += prepared_counts.conjugations;
+            counts->ciphertext_plain_multiplications +=
+                prepared_counts.ciphertext_plain_multiplications;
+            counts->rescales += prepared_counts.rescales;
+        }
+        SealCipherTensor result;
+        result.parameter_profile = context.profile;
+        result.ciphertexts = ciphertexts.take_value();
+        result.logical_spec.shape = output_packing.logical_shape;
+        result.logical_spec.domain = Domain::kHeCiphertext;
+        result.logical_spec.layout = output_packing.layout;
+        result.logical_spec.numeric = input.logical_spec.numeric;
+        result.logical_spec.he_region = output_region;
+        result.logical_spec.he_parameter_profile = context.profile;
+        auto input_level = LevelOf(
+            context, input.ciphertexts.front().parms_id());
+        if (!input_level.ok()) return input_level.status();
+        result.logical_spec.planned_level = input_level.value() + 1;
+        result.logical_spec.planned_scale_bits = output_scale_bits;
+        result.physical_packing = prepared.value()->output_packing;
+        return result;
+    }
     std::map<ProjectionKey, std::vector<Complex>> masks;
     for (std::size_t token = 0; token < tokens; ++token) {
         for (std::size_t output = 0; output < output_width; ++output) {
@@ -573,8 +676,8 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
                     context.slot_count());
                 ProjectionKey key{source.ciphertext, destination.ciphertext,
                                   source.component, rotation};
-                auto inserted = masks.emplace(
-                    key, std::vector<Complex>(context.slot_count()));
+                auto inserted = masks.try_emplace(
+                    key, context.slot_count(), Complex{});
                 inserted.first->second[destination.slot] +=
                     coefficient *
                     ExtractionFactor(source.component) *
@@ -582,60 +685,47 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
             }
         }
     }
-    seal::Evaluator evaluator(*context.context);
-    seal::CKKSEncoder encoder(*context.context);
-    std::vector<seal::Ciphertext> output(
-        output_packing.ciphertext_count);
-    std::vector<bool> initialized(output.size(), false);
-    std::map<std::pair<std::size_t, ComplexLane>, seal::Ciphertext> extracted;
-    const double target = std::ldexp(1.0, output_scale_bits);
-    for (const auto &entry : masks) {
-        const auto base_key = std::make_pair(entry.first.source_ct,
-                                             entry.first.source_component);
-        auto base = extracted.find(base_key);
-        if (base == extracted.end()) {
-            const auto &source = input.ciphertexts[entry.first.source_ct];
-            seal::Ciphertext conjugated;
-            evaluator.complex_conjugate(source, context.galois_keys,
-                                        conjugated);
-            seal::Ciphertext component;
-            if (entry.first.source_component == ComplexLane::kReal)
-                evaluator.add(source, conjugated, component);
-            else
-                evaluator.sub(source, conjugated, component);
-            base = extracted.emplace(base_key, std::move(component)).first;
-            if (counts) ++counts->conjugations;
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        const auto input_id = input.ciphertexts.front().parms_id();
+        const auto next = context.context->get_context_data(input_id)
+                              ->next_context_data();
+        if (!next)
+            return Status::FailedPrecondition(
+                "column projection preparation has no next level");
+        const double target = std::ldexp(1.0, output_scale_bits);
+        const double plain_scale = target * DroppedPrime(context, input_id) /
+            input.ciphertexts.front().scale();
+        seal::CKKSEncoder encoder(*context.context);
+        auto prepared = std::make_shared<PreparedProjectionPlan>();
+        prepared->profile = context.profile;
+        prepared->input_parms_id = input_id;
+        prepared->input_scale = input.ciphertexts.front().scale();
+        prepared->input_packing = input.physical_packing;
+        prepared->output_packing = output_packing;
+        prepared->bias_plaintexts.resize(output_packing.ciphertext_count);
+        prepared->output_scale_bits = output_scale_bits;
+        prepared->scale_tolerance = 1e-5;
+        std::vector<bool> initialized(output_packing.ciphertext_count);
+        for (const auto &entry : masks) {
+            auto encoded = CompileModelPlaintext(
+                encoder, entry.second, input_id, plain_scale,
+                "ffn.projection.diagonal");
+            if (!encoded.ok()) return encoded.status();
+            const auto &key = entry.first;
+            prepared->groups.push_back({
+                key.target_ct, 0,
+                {{key.source_ct, key.source_component, key.rotation,
+                  encoded.take_value()}}});
+            initialized[key.target_ct] = true;
         }
-        auto rotated = base->second;
-        if (entry.first.rotation != 0) {
-            evaluator.rotate_vector_inplace(rotated, entry.first.rotation,
-                                            context.galois_keys);
-            if (counts) ++counts->rotations;
-        }
-        const double plain_scale = target * DroppedPrime(
-            context, rotated.parms_id()) / rotated.scale();
-        auto encoded = EncodeModelPlaintext(
-            encoder, entry.second, rotated.parms_id(), plain_scale,
-            "ffn.projection.diagonal");
-        if (!encoded.ok()) return encoded.status();
-        auto plain = encoded.take_value();
-        evaluator.multiply_plain_inplace(rotated, plain);
-        if (counts) ++counts->ciphertext_plain_multiplications;
-        if (!initialized[entry.first.target_ct]) {
-            output[entry.first.target_ct] = std::move(rotated);
-            initialized[entry.first.target_ct] = true;
-        } else {
-            evaluator.add_inplace(output[entry.first.target_ct], rotated);
-        }
-    }
-    for (std::size_t ct = 0; ct < output.size(); ++ct) {
-        if (!initialized[ct])
-            return Status::Internal("projection produced an empty ciphertext group");
-        if (bias) {
+        for (std::size_t ct = 0; ct < initialized.size(); ++ct) {
+            if (!initialized[ct])
+                return Status::Internal(
+                    "projection produced an empty ciphertext group");
+            if (!bias) continue;
             std::vector<Complex> slots(context.slot_count());
             for (std::size_t logical = 0;
-                 logical < output_packing.logical_locations.size();
-                 ++logical) {
+                 logical < output_packing.logical_locations.size(); ++logical) {
                 const auto &location =
                     output_packing.Locations(logical).front();
                 if (location.ciphertext != ct) continue;
@@ -645,17 +735,167 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
                 else
                     slots[location.slot].imag(value);
             }
-            auto encoded_bias = EncodeModelPlaintext(
-                encoder, slots, output[ct].parms_id(), output[ct].scale(),
+            auto encoded = CompileModelPlaintext(
+                encoder, slots, input_id,
+                input.ciphertexts.front().scale() * plain_scale,
                 "ffn.projection.bias");
-            if (!encoded_bias.ok()) return encoded_bias.status();
-            auto plain = encoded_bias.take_value();
-            evaluator.add_plain_inplace(output[ct], plain);
+            if (!encoded.ok()) return encoded.status();
+            prepared->bias_plaintexts[ct] = encoded.take_value();
         }
-        evaluator.rescale_to_next_inplace(output[ct]);
-        auto normalized = NormalizeScale(output[ct], target);
-        if (!normalized.ok()) return normalized.status();
-        if (counts) ++counts->rescales;
+        auto stored = cache.first->PutPreparedProjection(
+            prepared_key, std::move(prepared));
+        if (!stored.ok()) return stored.status();
+        SealCipherTensor result;
+        result.parameter_profile = context.profile;
+        result.ciphertexts.resize(output_packing.ciphertext_count);
+        for (auto &ct : result.ciphertexts) {
+            ct.parms_id() = next->parms_id();
+            ct.scale() = target;
+        }
+        result.logical_spec.shape = output_packing.logical_shape;
+        result.logical_spec.domain = Domain::kHeCiphertext;
+        result.logical_spec.layout = output_packing.layout;
+        result.logical_spec.numeric = input.logical_spec.numeric;
+        result.logical_spec.he_region = output_region;
+        result.logical_spec.he_parameter_profile = context.profile;
+        auto input_level = LevelOf(context, input_id);
+        if (!input_level.ok()) return input_level.status();
+        result.logical_spec.planned_level = input_level.value() + 1;
+        result.logical_spec.planned_scale_bits = output_scale_bits;
+        result.physical_packing = output_packing;
+        return result;
+    }
+    std::vector<seal::Ciphertext> output(
+        output_packing.ciphertext_count);
+    std::map<std::pair<std::size_t, ComplexLane>, seal::Ciphertext> extracted;
+    const double target = std::ldexp(1.0, output_scale_bits);
+    seal::Evaluator extraction_evaluator(*context.context);
+    for (const auto &entry : masks) {
+        const auto base_key = std::make_pair(entry.first.source_ct,
+                                             entry.first.source_component);
+        auto base = extracted.find(base_key);
+        if (base == extracted.end()) {
+            const auto &source = input.ciphertexts[entry.first.source_ct];
+            seal::Ciphertext conjugated;
+            extraction_evaluator.complex_conjugate(
+                source, context.galois_keys, conjugated);
+            seal::Ciphertext component;
+            if (entry.first.source_component == ComplexLane::kReal)
+                extraction_evaluator.add(source, conjugated, component);
+            else
+                extraction_evaluator.sub(source, conjugated, component);
+            base = extracted.emplace(base_key, std::move(component)).first;
+            if (counts) ++counts->conjugations;
+        }
+    }
+    using MaskIterator = decltype(masks)::const_iterator;
+    std::vector<std::vector<MaskIterator>> entries(output.size());
+    for (auto entry = masks.cbegin(); entry != masks.cend(); ++entry)
+        entries[entry->first.target_ct].push_back(entry);
+    std::vector<HeKernelOperationCounts> per_output(output.size());
+    std::shared_ptr<PreparedProjectionPlan> prepared;
+    std::vector<std::vector<PreparedProjectionGroup>> per_output_plan;
+    if (cache.first) {
+        prepared = std::make_shared<PreparedProjectionPlan>();
+        prepared->profile = context.profile;
+        prepared->input_parms_id = input.ciphertexts.front().parms_id();
+        prepared->input_scale = input.ciphertexts.front().scale();
+        prepared->input_packing = input.physical_packing;
+        prepared->output_packing = output_packing;
+        prepared->bias_plaintexts.resize(output.size());
+        prepared->output_scale_bits = output_scale_bits;
+        prepared->scale_tolerance = 1e-5;
+        per_output_plan.resize(output.size());
+    }
+    auto projected = detail::ParallelRanges(
+        output.size(), std::min<std::size_t>(he_workers, 2), 1,
+        [&](std::size_t begin, std::size_t end) -> Result<void> {
+            std::optional<ModelPlaintextCacheScope> cache_scope;
+            if (cache.first) cache_scope.emplace(cache.first, cache.second);
+            seal::Evaluator evaluator(*context.context);
+            seal::CKKSEncoder encoder(*context.context);
+            for (std::size_t ct = begin; ct < end; ++ct) {
+                auto &local_counts = per_output[ct];
+                bool initialized = false;
+                for (const auto &entry : entries[ct]) {
+                    const auto base_key = std::make_pair(
+                        entry->first.source_ct, entry->first.source_component);
+                    auto rotated = extracted.at(base_key);
+                    if (entry->first.rotation != 0) {
+                        evaluator.rotate_vector_inplace(
+                            rotated, entry->first.rotation, context.galois_keys);
+                        ++local_counts.rotations;
+                    }
+                    const double plain_scale = target * DroppedPrime(
+                        context, rotated.parms_id()) / rotated.scale();
+                    auto encoded = CompileModelPlaintext(
+                        encoder, entry->second, rotated.parms_id(), plain_scale,
+                        "ffn.projection.diagonal");
+                    if (!encoded.ok()) return encoded.status();
+                    auto plain = encoded.take_value();
+                    if (prepared)
+                        per_output_plan[ct].push_back({
+                            ct, 0, {{entry->first.source_ct,
+                                     entry->first.source_component,
+                                     entry->first.rotation, plain}}});
+                    evaluator.multiply_plain_inplace(rotated, *plain);
+                    ++local_counts.ciphertext_plain_multiplications;
+                    if (!initialized) {
+                        output[ct] = std::move(rotated);
+                        initialized = true;
+                    } else {
+                        evaluator.add_inplace(output[ct], rotated);
+                    }
+                }
+                if (!initialized)
+                    return Status::Internal(
+                        "projection produced an empty ciphertext group");
+                if (bias) {
+                    std::vector<Complex> slots(context.slot_count());
+                    for (std::size_t logical = 0;
+                         logical < output_packing.logical_locations.size();
+                         ++logical) {
+                        const auto &location =
+                            output_packing.Locations(logical).front();
+                        if (location.ciphertext != ct) continue;
+                        const double value = bias->values[logical % output_width];
+                        if (location.component == ComplexLane::kReal)
+                            slots[location.slot].real(value);
+                        else
+                            slots[location.slot].imag(value);
+                    }
+                    auto encoded_bias = CompileModelPlaintext(
+                        encoder, slots, output[ct].parms_id(), output[ct].scale(),
+                        "ffn.projection.bias");
+                    if (!encoded_bias.ok()) return encoded_bias.status();
+                    auto plain = encoded_bias.take_value();
+                    if (prepared) prepared->bias_plaintexts[ct] = plain;
+                    evaluator.add_plain_inplace(output[ct], *plain);
+                }
+                evaluator.rescale_to_next_inplace(output[ct]);
+                auto normalized = NormalizeScale(output[ct], target);
+                if (!normalized.ok()) return normalized.status();
+                ++local_counts.rescales;
+            }
+            return {};
+        }, detail::EstimatedHeWorkerBytes(
+            context.parameters.polynomial_degree,
+            context.parameters.coefficient_modulus_bits.size(), 12));
+    if (!projected.ok()) return projected.status();
+    if (counts)
+        for (const auto &local : per_output) {
+            counts->rotations += local.rotations;
+            counts->ciphertext_plain_multiplications +=
+                local.ciphertext_plain_multiplications;
+            counts->rescales += local.rescales;
+        }
+    if (prepared) {
+        for (auto &groups : per_output_plan)
+            for (auto &group : groups)
+                prepared->groups.push_back(std::move(group));
+        auto stored = cache.first->PutPreparedProjection(
+            prepared_key, std::move(prepared));
+        if (!stored.ok()) return stored.status();
     }
     SealCipherTensor result;
     result.parameter_profile = context.profile;
@@ -691,20 +931,34 @@ Result<std::vector<int>> ComplexColumnProjectionKernel::RequiredRotationSteps(
     const auto tokens = input_packing.logical_shape.dimensions[0];
     const auto in_width = input_packing.logical_shape.dimensions[1];
     const auto out_width = output_packing.logical_shape.dimensions[1];
+    const auto slots = input_packing.slot_count;
+    std::vector<unsigned char> required(slots, 0);
+    for (std::size_t token = 0; token < tokens; ++token) {
+        std::vector<std::size_t> sources, destinations;
+        sources.reserve(in_width);
+        destinations.reserve(out_width);
+        for (std::size_t input = 0; input < in_width; ++input)
+            sources.push_back(input_packing.Locations(
+                token * in_width + input).front().slot);
+        for (std::size_t output = 0; output < out_width; ++output)
+            destinations.push_back(output_packing.Locations(
+                token * out_width + output).front().slot);
+        std::sort(sources.begin(), sources.end());
+        sources.erase(std::unique(sources.begin(), sources.end()),
+                      sources.end());
+        std::sort(destinations.begin(), destinations.end());
+        destinations.erase(
+            std::unique(destinations.begin(), destinations.end()),
+            destinations.end());
+        for (const auto source : sources)
+            for (const auto destination : destinations)
+                required[(source + slots - destination) % slots] = 1;
+    }
     std::set<int> steps{0};
-    for (std::size_t token = 0; token < tokens; ++token)
-        for (std::size_t output = 0; output < out_width; ++output) {
-            const auto &destination = output_packing.Locations(
-                token * out_width + output).front();
-            for (std::size_t input = 0; input < in_width; ++input) {
-                const auto &source = input_packing.Locations(
-                    token * in_width + input).front();
-                steps.insert(CanonicalRotation(
-                    static_cast<long long>(source.slot) -
-                    static_cast<long long>(destination.slot),
-                    input_packing.slot_count));
-            }
-        }
+    for (std::size_t residue = 1; residue < slots; ++residue)
+        if (required[residue])
+            steps.insert(CanonicalRotation(
+                static_cast<long long>(residue), slots));
     return std::vector<int>(steps.begin(), steps.end());
 }
 
@@ -714,7 +968,8 @@ Result<SealCipherTensor> FfnUpProjectionKernel::Evaluate(
     const std::optional<DenseVectorParameter> &bias,
     const TransformerLayerConfig &layer,
     const HeContext &context,
-    FfnGeluExecutionReport *report)
+    FfnGeluExecutionReport *report,
+    std::size_t he_workers)
 {
     if (input.logical_spec.shape !=
             TensorShape{{layer.tokens, layer.model_width}} ||
@@ -726,7 +981,7 @@ Result<SealCipherTensor> FfnUpProjectionKernel::Evaluate(
     auto result = ComplexColumnProjectionKernel::Evaluate(
         input, weights, bias, plans.value().projected,
         HeRegionId::kRegion5, context.parameters.default_scale_bits,
-        context, &counts);
+        context, &counts, he_workers);
     if (report) {
         report->rotations += counts.rotations;
         report->conjugations += counts.conjugations;
@@ -854,7 +1109,8 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
     const SealCipherTensor &input,
     const GeluConfig &config,
     const HeContext &context,
-    FfnGeluExecutionReport *report)
+    FfnGeluExecutionReport *report,
+    std::size_t he_workers)
 {
     auto valid = input.Validate(context);
     if (!valid.ok()) return valid.status();
@@ -876,14 +1132,21 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
             return Status::FailedPrecondition(
                 "GeLU polynomial input is not at its suffix start");
     }
-    seal::Evaluator evaluator(*context.context);
-    seal::CKKSEncoder encoder(*context.context);
     SealCipherTensor negative = input;
     SealCipherTensor positive = input;
+    SealCipherTensor terminal_input = input;
     const auto terminal_id = LevelId(context, terminal_level);
     if (!terminal_id.ok()) return terminal_id.status();
 
-    for (std::size_t i = 0; i < input.ciphertexts.size(); ++i) {
+    std::vector<FfnGeluExecutionReport> per_ciphertext(
+        input.ciphertexts.size());
+    auto parallel = detail::ParallelRanges(
+        input.ciphertexts.size(), std::min<std::size_t>(he_workers, 2), 1,
+        [&](std::size_t begin, std::size_t end) -> Result<void> {
+    seal::Evaluator evaluator(*context.context);
+    seal::CKKSEncoder encoder(*context.context);
+    for (std::size_t i = begin; i < end; ++i) {
+        auto *counts = report ? &per_ciphertext[i] : nullptr;
         const auto &x = input.ciphertexts[i];
         seal::Ciphertext x2;
         evaluator.square(x, x2);
@@ -891,10 +1154,10 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
         evaluator.rescale_to_next_inplace(x2);
         auto scale_status = NormalizeScale(x2, target);
         if (!scale_status.ok()) return scale_status.status();
-        if (report) {
-            ++report->ciphertext_multiplications;
-            ++report->relinearizations;
-            ++report->rescales;
+        if (counts) {
+            ++counts->ciphertext_multiplications;
+            ++counts->relinearizations;
+            ++counts->rescales;
         }
 
         seal::Ciphertext x_at3 = x;
@@ -911,18 +1174,18 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
         evaluator.rescale_to_next_inplace(x4);
         scale_status = NormalizeScale(x4, target);
         if (!scale_status.ok()) return scale_status.status();
-        if (report) {
-            report->ciphertext_multiplications += 2;
-            report->relinearizations += 2;
-            report->rescales += 2;
-            ++report->modulus_switches;
+        if (counts) {
+            counts->ciphertext_multiplications += 2;
+            counts->relinearizations += 2;
+            counts->rescales += 2;
+            ++counts->modulus_switches;
         }
 
         seal::Ciphertext x_at4 = x_at3;
         seal::Ciphertext x2_at4 = x2;
         evaluator.mod_switch_to_inplace(x_at4, x3.parms_id());
         evaluator.mod_switch_to_inplace(x2_at4, x3.parms_id());
-        if (report) report->modulus_switches += 2;
+        if (counts) counts->modulus_switches += 2;
 
         auto coefficient_term = [&](seal::Ciphertext value,
                                     double coefficient)
@@ -935,9 +1198,9 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
             evaluator.rescale_to_next_inplace(value);
             auto normalized = NormalizeScale(value, target);
             if (!normalized.ok()) return normalized.status();
-            if (report) {
-                ++report->ciphertext_plain_multiplications;
-                ++report->rescales;
+            if (counts) {
+                ++counts->ciphertext_plain_multiplications;
+                ++counts->rescales;
             }
             return value;
         };
@@ -970,15 +1233,29 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
         if (f0.parms_id() != terminal_id.value()) {
             evaluator.mod_switch_to_inplace(f0, terminal_id.value());
             evaluator.mod_switch_to_inplace(f1, terminal_id.value());
-            if (report) report->modulus_switches += 2;
+            if (counts) counts->modulus_switches += 2;
         }
         negative.ciphertexts[i] = std::move(f0);
         positive.ciphertexts[i] = std::move(f1);
+        evaluator.mod_switch_to_inplace(
+            terminal_input.ciphertexts[i], terminal_id.value());
+        if (counts) ++counts->modulus_switches;
     }
-    SealCipherTensor terminal_input = input;
-    for (auto &ct : terminal_input.ciphertexts) {
-        evaluator.mod_switch_to_inplace(ct, terminal_id.value());
-        if (report) ++report->modulus_switches;
+    return {};
+    }, detail::EstimatedHeWorkerBytes(
+        context.parameters.polynomial_degree,
+        context.parameters.coefficient_modulus_bits.size(), 16));
+    if (!parallel.ok()) return parallel.status();
+    if (report) {
+        for (const auto &counts : per_ciphertext) {
+            report->ciphertext_plain_multiplications +=
+                counts.ciphertext_plain_multiplications;
+            report->ciphertext_multiplications +=
+                counts.ciphertext_multiplications;
+            report->relinearizations += counts.relinearizations;
+            report->rescales += counts.rescales;
+            report->modulus_switches += counts.modulus_switches;
+        }
     }
     for (auto *tensor : {&terminal_input, &negative, &positive}) {
         tensor->logical_spec.planned_level = terminal_level;
@@ -1156,25 +1433,8 @@ Result<std::vector<int>> SealSciFfnGeluExecutor::RequiredRotationSteps(
     const auto slots = parameters.polynomial_degree / 2;
     auto packing = FfnGeluPackingPlanner::Build(layer, slots);
     if (!packing.ok()) return packing.status();
-    std::set<int> steps{0};
-    // Wu performs direct source-slot to destination-slot rotations. SEAL
-    // needs a key for every direct step; a power-of-two superset is not
-    // sufficient because Evaluator::rotate_vector does not compose keys.
-    for (std::size_t token = 0; token < layer.tokens; ++token) {
-        for (std::size_t output = 0; output < layer.ffn_width; ++output) {
-            const auto &destination = packing.value().projected.Locations(
-                token * layer.ffn_width + output).front();
-            for (std::size_t feature = 0; feature < layer.model_width;
-                 ++feature) {
-                const auto &source = packing.value().centered.Locations(
-                    token * layer.model_width + feature).front();
-                steps.insert(CanonicalRotation(
-                    static_cast<long long>(source.slot) -
-                    static_cast<long long>(destination.slot), slots));
-            }
-        }
-    }
-    return std::vector<int>(steps.begin(), steps.end());
+    return ComplexColumnProjectionKernel::RequiredRotationSteps(
+        packing.value().centered, packing.value().projected);
 }
 
 namespace {
@@ -1341,11 +1601,11 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
                 gamma_handle->spec.length != layer_.model_width ||
                 beta_handle->spec.length != layer_.model_width)
                 return Status::Invalid("LN2 gamma/beta handles are invalid");
-            auto gamma = parameters_.GetVector(gamma_handle->id);
+            auto gamma = parameters_.GetVectorShared(gamma_handle->id);
             if (!gamma.ok()) return gamma.status();
-            auto beta = parameters_.GetVector(beta_handle->id);
+            auto beta = parameters_.GetVectorShared(beta_handle->id);
             if (!beta.ok()) return beta.status();
-            auto wu = parameters_.GetMatrix(weights.wu.id);
+            auto wu = parameters_.GetMatrixShared(weights.wu.id);
             if (!wu.ok()) return wu.status();
             std::optional<DenseVectorParameter> bu;
             if (layer_.ffn_bias) {
@@ -1384,17 +1644,19 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
             inverse_tensor.physical_packing = plans.value().inverse_broadcast;
 
             auto normalized = FfnLayerNormTailKernel::Evaluate(
-                centered_tensor, inverse_tensor, gamma.value(), beta.value(),
+                centered_tensor, inverse_tensor, *gamma.value(), *beta.value(),
                 layer_, context, report);
             if (!normalized.ok()) return normalized.status();
             auto projected = FfnUpProjectionKernel::Evaluate(
-                normalized.value(), wu.value(), bu, layer_, context, report);
+                normalized.value(), *wu.value(), bu, layer_, context, report,
+                config_.threads);
             if (!projected.ok()) return projected.status();
             auto real = FfnRealifyKernel::Evaluate(
                 projected.value(), layer_, context, report);
             if (!real.ok()) return real.status();
             auto polynomial = GeluPolynomialKernel::Evaluate(
-                real.value(), config_.gelu, context, report);
+                real.value(), config_.gelu, context, report,
+                config_.threads);
             if (!polynomial.ok()) return polynomial.status();
             polynomials = polynomial.take_value();
         }

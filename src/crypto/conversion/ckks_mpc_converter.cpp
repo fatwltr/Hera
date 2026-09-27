@@ -1,4 +1,5 @@
 #include "hera/conversion.h"
+#include "hera/seal_wire.h"
 
 #include "fixed_ckks_transform.h"
 #include "random_sampling.h"
@@ -25,12 +26,16 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <deque>
+#include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 
 namespace hera {
 namespace {
@@ -42,7 +47,7 @@ using conversion_internal::SampleUniformRing;
 using conversion_internal::SlotSharePair;
 
 constexpr std::uint64_t kFrameMagic = 0x48455241434f4e56ULL;
-constexpr std::uint32_t kProtocolVersion = 1;
+constexpr std::uint32_t kProtocolVersion = 2;
 constexpr std::uint32_t kCkksToMpcDirection = 1;
 constexpr std::uint32_t kMpcToCkksDirection = 2;
 
@@ -219,33 +224,6 @@ std::string ReceiveString(IProtocolTransport &transport, std::size_t bytes)
     return result;
 }
 
-template <typename SealObject>
-void SendSealObject(IProtocolTransport &transport, const SealObject &object)
-{
-    std::stringstream stream;
-    object.save(stream, seal::compr_mode_type::none);
-    const std::string bytes = stream.str();
-    const std::uint64_t size = bytes.size();
-    transport.Send(&size, sizeof(size));
-    if (size != 0) transport.Send(bytes.data(), bytes.size());
-}
-
-template <typename SealObject>
-SealObject ReceiveSealObject(IProtocolTransport &transport,
-                             const seal::SEALContext &context)
-{
-    std::uint64_t size = 0;
-    transport.Receive(&size, sizeof(size));
-    if (size == 0 || size > (std::uint64_t{1} << 34))
-        throw std::runtime_error("invalid serialized SEAL payload size");
-    std::string bytes(static_cast<std::size_t>(size), '\0');
-    transport.Receive(bytes.data(), bytes.size());
-    std::stringstream stream(bytes);
-    SealObject result;
-    result.load(context, stream);
-    return result;
-}
-
 seal::parms_id_type ResolveTargetParmsId(const HeContext &profile,
                                          std::optional<std::size_t> level)
 {
@@ -271,12 +249,37 @@ public:
         std::unique_ptr<FixOp> fix;
     };
 
+    using TransformKey = std::tuple<std::size_t, int, int, bool>;
+
+    Result<std::shared_ptr<const FixedCkksTransform>> GetTransform(
+        std::size_t degree, int root_scale_bits, int working_bits)
+    {
+        const TransformKey key{degree, root_scale_bits, working_bits,
+                               role_ == PartyRole::kClient};
+        const auto found = transforms_.find(key);
+        if (found != transforms_.end()) {
+            ++stats_.transform_cache_hits;
+            return found->second;
+        }
+        auto created = FixedCkksTransform::Create(
+            degree, root_scale_bits, working_bits,
+            role_ == PartyRole::kClient);
+        if (!created.ok()) return created.status();
+        auto shared = std::make_shared<const FixedCkksTransform>(
+            created.take_value());
+        transforms_.emplace(key, shared);
+        ++stats_.transform_cache_misses;
+        return shared;
+    }
+
     Impl(PartyRole role, ConversionConfig config, HeContextRegistry &contexts,
          std::shared_ptr<IProtocolTransport> transport,
          std::shared_ptr<IRandomSource> randomness,
-         std::string peer_address, int worker_port, std::size_t threads)
+         std::string peer_address, int worker_port, std::size_t threads,
+         seal::compr_mode_type wire_compression)
         : role_(role), config_(config), contexts_(contexts),
-          transport_(std::move(transport)), randomness_(std::move(randomness))
+          transport_(std::move(transport)), randomness_(std::move(randomness)),
+          wire_compression_(wire_compression)
     {
         if (!transport_ || !randomness_)
             throw std::invalid_argument("converter transport/random source is null");
@@ -650,14 +653,36 @@ public:
                     "CkksToMpc field/FFT workspace exceeds 127 bits");
             const int guard_bits = std::min(
                 20, 127 - wide_bits - config_.fft_scale_bits - 2);
-            auto transform_result = FixedCkksTransform::Create(
-                degree, config_.fft_scale_bits, wide_bits + guard_bits,
-                role_ == PartyRole::kClient);
+            auto transform_result = GetTransform(
+                degree, config_.fft_scale_bits, wide_bits + guard_bits);
             if (!transform_result.ok()) return transform_result.status();
-            auto transform = transform_result.take_value();
+            const auto transform = transform_result.take_value();
 
             std::vector<std::uint64_t> provisional_real(count * slots);
             std::vector<std::uint64_t> provisional_imag(count * slots);
+            struct LocalDecoded {
+                std::vector<std::uint64_t> real;
+                std::vector<std::uint64_t> imag;
+            };
+            std::deque<std::pair<std::size_t,
+                                 std::future<Result<LocalDecoded>>>> pending;
+            const std::size_t max_inflight =
+                count > 1 && workers_.size() > 1 ? std::size_t{2}
+                                                  : std::size_t{1};
+            const auto collect_decoded = [&]() -> Result<void> {
+                auto item = std::move(pending.front());
+                pending.pop_front();
+                auto decoded = item.second.get();
+                if (!decoded.ok()) return decoded.status();
+                const std::size_t offset = item.first * slots;
+                std::copy(decoded.value().real.begin(),
+                          decoded.value().real.end(),
+                          provisional_real.begin() + offset);
+                std::copy(decoded.value().imag.begin(),
+                          decoded.value().imag.end(),
+                          provisional_imag.begin() + offset);
+                return {};
+            };
             seal::Evaluator evaluator(*profile->context);
             std::unique_ptr<seal::Decryptor> decryptor;
             if (role_ == PartyRole::kClient)
@@ -683,7 +708,7 @@ public:
                     mask_plain.scale() = ciphertexts[ct_index].scale();
                     seal::Ciphertext masked = ciphertexts[ct_index];
                     evaluator.add_plain_inplace(masked, mask_plain);
-                    SendSealObject(*transport_, masked);
+                    SendSealObject(*transport_, masked, wire_compression_);
                     for (std::size_t i = 0; i < degree; ++i)
                         field_share[i] = mask[i] == 0 ? 0 : modulus - mask[i];
                 } else {
@@ -709,26 +734,49 @@ public:
                 if (scale_shift < 0)
                     return Status::FailedPrecondition(
                         "CkksToMpc cannot increase the target share scale");
-                for (auto &value : wide)
-                    value = WideShiftLeft(value, guard_bits,
-                                          wide_bits + guard_bits);
-                auto decoded_result = transform.Decode(wide);
-                if (!decoded_result.ok()) return decoded_result.status();
-                auto decoded = decoded_result.take_value();
-                for (std::size_t slot = 0; slot < slots; ++slot) {
-                    provisional_real[ct_index * slots + slot] =
-                        WideLocalTruncate(
-                            decoded.real[slot], scale_shift + guard_bits,
-                            wide_bits + guard_bits,
-                            role_ == PartyRole::kClient).low &
-                        LowMask(config_.ring_bits);
-                    provisional_imag[ct_index * slots + slot] =
-                        WideLocalTruncate(
-                            decoded.imag[slot], scale_shift + guard_bits,
-                            wide_bits + guard_bits,
-                            role_ == PartyRole::kClient).low &
-                        LowMask(config_.ring_bits);
+                const auto local_work =
+                    [transform, wide = std::move(wide), slots,
+                     guard_bits, wide_bits, scale_shift,
+                     ring_bits = config_.ring_bits,
+                     negative = role_ == PartyRole::kClient]() mutable
+                    -> Result<LocalDecoded> {
+                        for (auto &value : wide)
+                            value = WideShiftLeft(
+                                value, guard_bits, wide_bits + guard_bits);
+                        auto decoded = transform->Decode(wide);
+                        if (!decoded.ok()) return decoded.status();
+                        LocalDecoded result;
+                        result.real.resize(slots);
+                        result.imag.resize(slots);
+                        const auto mask = LowMask(ring_bits);
+                        for (std::size_t slot = 0; slot < slots; ++slot) {
+                            result.real[slot] = WideLocalTruncate(
+                                decoded.value().real[slot],
+                                scale_shift + guard_bits,
+                                wide_bits + guard_bits, negative).low & mask;
+                            result.imag[slot] = WideLocalTruncate(
+                                decoded.value().imag[slot],
+                                scale_shift + guard_bits,
+                                wide_bits + guard_bits, negative).low & mask;
+                        }
+                        return result;
+                    };
+                pending.emplace_back(
+                    ct_index,
+                    std::async(max_inflight > 1 ? std::launch::async
+                                                : std::launch::deferred,
+                               std::move(local_work)));
+                ++stats_.local_transform_tasks;
+                stats_.local_transform_peak_inflight = std::max(
+                    stats_.local_transform_peak_inflight, pending.size());
+                if (pending.size() >= max_inflight) {
+                    auto collected = collect_decoded();
+                    if (!collected.ok()) return collected.status();
                 }
+            }
+            while (!pending.empty()) {
+                auto collected = collect_decoded();
+                if (!collected.ok()) return collected.status();
             }
 
             std::vector<std::uint64_t> output_real(count * slots);
@@ -898,11 +946,10 @@ public:
 
             const int guard_bits = std::min(
                 20, 127 - base_bits - config_.fft_scale_bits - 2);
-            auto transform_result = FixedCkksTransform::Create(
-                degree, config_.fft_scale_bits, base_bits + guard_bits,
-                role_ == PartyRole::kClient);
+            auto transform_result = GetTransform(
+                degree, config_.fft_scale_bits, base_bits + guard_bits);
             if (!transform_result.ok()) return transform_result.status();
-            auto transform = transform_result.take_value();
+            const auto transform = transform_result.take_value();
             seal::Evaluator evaluator(*profile.context);
             std::unique_ptr<seal::Encryptor> encryptor;
             if (role_ == PartyRole::kClient)
@@ -910,6 +957,32 @@ public:
                     *profile.context, profile.secret_key.value());
             std::vector<seal::Ciphertext> outputs;
             if (role_ == PartyRole::kServer) outputs.reserve(count);
+            std::deque<std::pair<std::size_t,
+                                 std::future<seal::Plaintext>>> pending_rns;
+            const std::size_t max_inflight =
+                count > 1 && workers_.size() > 1 ? std::size_t{2}
+                                                  : std::size_t{1};
+            const auto consume_rns = [&]() -> Result<void> {
+                auto item = std::move(pending_rns.front());
+                pending_rns.pop_front();
+                auto plaintext = item.second.get();
+                plaintext.parms_id() = target_id;
+                plaintext.scale() = std::ldexp(1.0, target.scale_bits);
+                if (role_ == PartyRole::kClient) {
+                    seal::Ciphertext encrypted;
+                    encryptor->encrypt_symmetric(plaintext, encrypted);
+                    SendSealObject(*transport_, encrypted, wire_compression_);
+                } else {
+                    auto encrypted = ReceiveSealObject<seal::Ciphertext>(
+                        *transport_, *profile.context);
+                    if (encrypted.parms_id() != target_id)
+                        return Status::FailedPrecondition(
+                            "MpcToCkks client ciphertext level mismatch");
+                    evaluator.add_plain_inplace(encrypted, plaintext);
+                    outputs.push_back(std::move(encrypted));
+                }
+                return {};
+            };
 
             for (std::size_t ct = 0; ct < count; ++ct) {
                 const std::size_t offset = ct * slots;
@@ -932,7 +1005,7 @@ public:
                     pair.imag[slot] = WideShiftLeft(
                         wide_imag[slot], guard_bits, base_bits + guard_bits);
                 }
-                auto coefficients_result = transform.Encode(pair);
+                auto coefficients_result = transform->Encode(pair);
                 if (!coefficients_result.ok()) return coefficients_result.status();
                 auto coefficients = coefficients_result.take_value();
                 std::vector<std::uint64_t> coefficient_ring(degree);
@@ -951,24 +1024,26 @@ public:
                                             config_.ring_bits, base_bits);
                 for (auto &coefficient : coefficients)
                     coefficient = WideShiftLeft(coefficient, shift, work_bits);
-
-                auto plaintext = BuildBlbRnsPlaintextShare(
-                    coefficients, work_bits, *context_data);
-                plaintext.parms_id() = target_id;
-                plaintext.scale() = std::ldexp(1.0, target.scale_bits);
-                if (role_ == PartyRole::kClient) {
-                    seal::Ciphertext encrypted;
-                    encryptor->encrypt_symmetric(plaintext, encrypted);
-                    SendSealObject(*transport_, encrypted);
-                } else {
-                    auto encrypted = ReceiveSealObject<seal::Ciphertext>(
-                        *transport_, *profile.context);
-                    if (encrypted.parms_id() != target_id)
-                        return Status::FailedPrecondition(
-                            "MpcToCkks client ciphertext level mismatch");
-                    evaluator.add_plain_inplace(encrypted, plaintext);
-                    outputs.push_back(std::move(encrypted));
+                pending_rns.emplace_back(
+                    ct,
+                    std::async(max_inflight > 1 ? std::launch::async
+                                                : std::launch::deferred,
+                               [this, coefficients = std::move(coefficients),
+                                work_bits, context_data]() {
+                                   return BuildBlbRnsPlaintextShare(
+                                       coefficients, work_bits, *context_data);
+                               }));
+                ++stats_.local_transform_tasks;
+                stats_.local_transform_peak_inflight = std::max(
+                    stats_.local_transform_peak_inflight, pending_rns.size());
+                if (pending_rns.size() >= max_inflight) {
+                    auto consumed = consume_rns();
+                    if (!consumed.ok()) return consumed.status();
                 }
+            }
+            while (!pending_rns.empty()) {
+                auto consumed = consume_rns();
+                if (!consumed.ok()) return consumed.status();
             }
 
             stats_.milliseconds += std::chrono::duration<double, std::milli>(
@@ -990,7 +1065,10 @@ private:
     HeContextRegistry &contexts_;
     std::shared_ptr<IProtocolTransport> transport_;
     std::shared_ptr<IRandomSource> randomness_;
+    seal::compr_mode_type wire_compression_;
     std::vector<std::unique_ptr<Worker>> workers_;
+    std::map<TransformKey, std::shared_ptr<const FixedCkksTransform>>
+        transforms_;
     std::uint64_t call_sequence_{};
     ConversionStats stats_;
 };
@@ -999,10 +1077,11 @@ CkksMpcConverter::CkksMpcConverter(
     PartyRole role, ConversionConfig config, HeContextRegistry &contexts,
     std::shared_ptr<IProtocolTransport> transport,
     std::shared_ptr<IRandomSource> randomness, std::string peer_address,
-    int worker_port, std::size_t threads)
+    int worker_port, std::size_t threads,
+    seal::compr_mode_type wire_compression)
     : impl_(std::make_unique<Impl>(
           role, config, contexts, std::move(transport), std::move(randomness),
-          std::move(peer_address), worker_port, threads))
+          std::move(peer_address), worker_port, threads, wire_compression))
 {}
 
 CkksMpcConverter::~CkksMpcConverter() = default;

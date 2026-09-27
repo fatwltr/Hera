@@ -1,5 +1,6 @@
 #include "hera/conversion.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -8,13 +9,18 @@ namespace {
 
 constexpr std::uint64_t kBundleMagic = 0x484552414b455953ULL;
 constexpr std::uint64_t kMaximumBlobBytes = std::uint64_t{1} << 34;
+constexpr std::size_t kBundleChunkBytes = 256 * 1024;
 
 void SendBytes(IProtocolTransport &transport,
                const std::vector<std::uint8_t> &bytes)
 {
     const std::uint64_t size = bytes.size();
     transport.Send(&size, sizeof(size));
-    if (size != 0) transport.Send(bytes.data(), bytes.size());
+    for (std::size_t offset = 0; offset < bytes.size();) {
+        const auto part = std::min(kBundleChunkBytes, bytes.size() - offset);
+        transport.Send(bytes.data() + offset, part);
+        offset += part;
+    }
 }
 
 Result<std::vector<std::uint8_t>> ReceiveBytes(IProtocolTransport &transport)
@@ -24,7 +30,11 @@ Result<std::vector<std::uint8_t>> ReceiveBytes(IProtocolTransport &transport)
     if (size > kMaximumBlobBytes)
         return Status::Invalid("public-key bundle blob is too large");
     std::vector<std::uint8_t> result(static_cast<std::size_t>(size));
-    if (size != 0) transport.Receive(result.data(), result.size());
+    for (std::size_t offset = 0; offset < result.size();) {
+        const auto part = std::min(kBundleChunkBytes, result.size() - offset);
+        transport.Receive(result.data() + offset, part);
+        offset += part;
+    }
     return result;
 }
 
@@ -69,7 +79,7 @@ Result<SerializedPublicContextBundle> ReceivePublicContextBundle(
         transport.Receive(&magic, sizeof(magic));
         transport.Receive(&version, sizeof(version));
         transport.Receive(&count, sizeof(count));
-        if (magic != kBundleMagic || version != 1 || count > 1024)
+        if (magic != kBundleMagic || version != 2 || count > 1024)
             return Status::FailedPrecondition(
                 "invalid public HE bundle frame");
         SerializedPublicContextBundle result;

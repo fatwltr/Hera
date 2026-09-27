@@ -1,5 +1,6 @@
 #include "hera/softmax.h"
 #include "hera/detail/mpc_session_internal.h"
+#include "hera/detail/parallel_ranges.h"
 
 #include "OT/split-kkot.h"
 #include "FloatingPoint/fixed-point.h"
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -320,7 +322,8 @@ Result<PhysicalSlotMap> SoftmaxPackingPlanner::RealRows(
 
 Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
     const SealCipherBatch &shifted_scores, const HeContext &context,
-    const SoftmaxConfig &config, SoftmaxExecutionReport *report)
+    const SoftmaxConfig &config, SoftmaxExecutionReport *report,
+    std::size_t he_workers)
 {
     const auto started = Clock::now();
     try {
@@ -340,61 +343,70 @@ Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
                 return Status::Invalid(
                     "Block-3 exponent requires real-only CKKS packing");
 
-        seal::Evaluator evaluator(*context.context);
-        seal::CKKSEncoder encoder(*context.context);
         SealCipherBatch output = shifted_scores;
         const double target = std::ldexp(
             1.0, context.parameters.default_scale_bits);
-        for (auto &ciphertext : output.ciphertexts) {
-            auto level = LevelOf(context, ciphertext.parms_id());
-            if (!level.ok()) return level.status();
-            if (level.value() != 0 ||
-                !CloseScale(ciphertext.scale(), std::ldexp(
-                    1.0, context.parameters.input_scale_bits)))
-                return Status::FailedPrecondition(
-                    "Block-3 exponent input must be fresh at input scale");
+        auto parallel = detail::ParallelRanges(
+            output.ciphertexts.size(), std::min<std::size_t>(he_workers, 4),
+            1, [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator evaluator(*context.context);
+                seal::CKKSEncoder encoder(*context.context);
+                for (std::size_t index = begin; index < end; ++index) {
+                    auto &ciphertext = output.ciphertexts[index];
+                    auto level = LevelOf(context, ciphertext.parms_id());
+                    if (!level.ok()) return level.status();
+                    if (level.value() != 0 ||
+                        !CloseScale(ciphertext.scale(), std::ldexp(
+                            1.0, context.parameters.input_scale_bits)))
+                        return Status::FailedPrecondition(
+                            "Block-3 exponent input must be fresh at input scale");
 
-            const double plain_scale =
-                target * DroppedPrime(context, ciphertext.parms_id()) /
-                ciphertext.scale();
-            seal::Plaintext divisor;
-            encoder.encode(std::ldexp(1.0, -config.exp_divisor_bits),
-                           ciphertext.parms_id(), plain_scale, divisor);
-            evaluator.multiply_plain_inplace(ciphertext, divisor);
-            evaluator.rescale_to_next_inplace(ciphertext);
-            auto normalized = NormalizeScale(ciphertext, target);
-            if (!normalized.ok()) return normalized.status();
-            if (report) {
-                ++report->ciphertext_plain_multiplications;
-                ++report->rescales;
-            }
+                    const double plain_scale = target * DroppedPrime(
+                        context, ciphertext.parms_id()) / ciphertext.scale();
+                    seal::Plaintext divisor;
+                    encoder.encode(std::ldexp(1.0, -config.exp_divisor_bits),
+                                   ciphertext.parms_id(), plain_scale, divisor);
+                    evaluator.multiply_plain_inplace(ciphertext, divisor);
+                    evaluator.rescale_to_next_inplace(ciphertext);
+                    auto normalized = NormalizeScale(ciphertext, target);
+                    if (!normalized.ok()) return normalized.status();
 
-            seal::Plaintext one;
-            encoder.encode(1.0, ciphertext.parms_id(), target, one);
-            evaluator.add_plain_inplace(ciphertext, one);
-            for (std::size_t i = 0; i < config.exp_squarings; ++i) {
-                evaluator.square_inplace(ciphertext);
-                evaluator.relinearize_inplace(
-                    ciphertext, context.relinearization_keys);
-                evaluator.rescale_to_next_inplace(ciphertext);
-                normalized = NormalizeScale(ciphertext, target);
-                if (!normalized.ok()) return normalized.status();
-                if (report) {
-                    ++report->ciphertext_multiplications;
-                    ++report->relinearizations;
-                    ++report->rescales;
+                    seal::Plaintext one;
+                    encoder.encode(1.0, ciphertext.parms_id(), target, one);
+                    evaluator.add_plain_inplace(ciphertext, one);
+                    for (std::size_t i = 0; i < config.exp_squarings; ++i) {
+                        evaluator.square_inplace(ciphertext);
+                        evaluator.relinearize_inplace(
+                            ciphertext, context.relinearization_keys);
+                        evaluator.rescale_to_next_inplace(ciphertext);
+                        normalized = NormalizeScale(ciphertext, target);
+                        if (!normalized.ok()) return normalized.status();
+                    }
+                    level = LevelOf(context, ciphertext.parms_id());
+                    if (!level.ok()) return level.status();
+                    if (level.value() != 1 + config.exp_squarings ||
+                        ciphertext.parms_id() !=
+                            context.context->last_parms_id())
+                        return Status::FailedPrecondition(
+                            "Block-3 exponent did not finish at terminal level");
                 }
-            }
-            level = LevelOf(context, ciphertext.parms_id());
-            if (!level.ok()) return level.status();
-            if (level.value() != 1 + config.exp_squarings ||
-                ciphertext.parms_id() != context.context->last_parms_id())
-                return Status::FailedPrecondition(
-                    "Block-3 exponent did not finish at terminal level");
-        }
-        if (report)
+                return {};
+            }, detail::EstimatedHeWorkerBytes(
+                context.parameters.polynomial_degree,
+                context.parameters.coefficient_modulus_bits.size(), 12));
+        if (!parallel.ok()) return parallel.status();
+        if (report) {
+            report->ciphertext_plain_multiplications +=
+                output.ciphertexts.size();
+            report->ciphertext_multiplications +=
+                output.ciphertexts.size() * config.exp_squarings;
+            report->relinearizations +=
+                output.ciphertexts.size() * config.exp_squarings;
+            report->rescales += output.ciphertexts.size() *
+                (1 + config.exp_squarings);
             report->he_milliseconds += std::chrono::duration<double,
                 std::milli>(Clock::now() - started).count();
+        }
         return output;
     } catch (const std::exception &error) {
         return Status::Internal(std::string("Block-3 exponent: ") +
@@ -586,6 +598,12 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::CenterAndMask(
         const auto rows = layer.tokens * layer.q_heads;
         std::vector<std::uint64_t> maxima(rows);
         std::size_t comparisons = 0;
+        // SCI FixOp::max treats each input FixArray as one row and batches
+        // comparisons across rows. Group by public valid-column count so
+        // padding never enters the maximum, yet rows with the same shape
+        // share the same compare/mux rounds.
+        std::map<std::size_t, std::vector<FixArray>> grouped_rows;
+        std::map<std::size_t, std::vector<std::size_t>> grouped_indices;
         for (std::size_t row = 0; row < layer.tokens; ++row) {
             for (std::size_t head = 0; head < layer.q_heads; ++head) {
                 std::vector<std::uint64_t> candidates;
@@ -593,13 +611,19 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::CenterAndMask(
                     if (validity.value()[row * layer.tokens + column])
                         candidates.push_back(scores.local_share[
                             RowMajorIndex(row, head, column, layer)]);
-                auto secret = impl_->Secret(candidates, scores.numeric);
-                std::vector<FixArray> one_row;
-                one_row.push_back(std::move(secret));
-                auto maximum = impl_->fix().max(one_row);
-                maxima[row * layer.q_heads + head] = maximum.data[0];
+                const auto width = candidates.size();
+                grouped_rows[width].push_back(
+                    impl_->Secret(candidates, scores.numeric));
+                grouped_indices[width].push_back(
+                    row * layer.q_heads + head);
                 comparisons += candidates.size() - 1;
             }
+        }
+        for (auto &group : grouped_rows) {
+            auto maximum = impl_->fix().max(group.second);
+            const auto &indices = grouped_indices.at(group.first);
+            for (std::size_t i = 0; i < indices.size(); ++i)
+                maxima[indices[i]] = maximum.data[i];
         }
 
         const auto masked_value = EncodeFixed(config.masked_shift,
@@ -894,7 +918,8 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
                 return Status::Internal(
                     "server did not receive Block-3 ciphertexts");
             auto evaluated = SoftmaxExponentKernel::Evaluate(
-                *shifted_he.value(), block3_context, config_.softmax, report);
+                *shifted_he.value(), block3_context, config_.softmax, report,
+                config_.threads);
             if (!evaluated.ok()) return evaluated.status();
             exp_batch = evaluated.take_value();
         }

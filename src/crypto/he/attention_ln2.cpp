@@ -1,4 +1,5 @@
 #include "hera/attention_ln2.h"
+#include "hera/detail/parallel_ranges.h"
 #include "hera/detail/mpc_session_internal.h"
 
 #include "OT/split-kkot.h"
@@ -103,21 +104,12 @@ seal::Ciphertext Rotate(const seal::Ciphertext &input, int rotation,
                         AttentionLn2ExecutionReport *report)
 {
     seal::Ciphertext result = input;
-    int remaining = CanonicalRotation(rotation, context.slot_count());
-    if (remaining == 0) return result;
-    const int sign = remaining < 0 ? -1 : 1;
-    auto magnitude = static_cast<std::uint64_t>(
-        remaining < 0 ? -static_cast<long long>(remaining) : remaining);
-    std::uint64_t bit = 1;
-    while (magnitude != 0) {
-        if (magnitude & 1U) {
-            evaluator.rotate_vector_inplace(
-                result, sign * static_cast<int>(bit), context.galois_keys);
-            if (report) ++report->rotations;
-        }
-        magnitude >>= 1U;
-        bit <<= 1U;
-    }
+    const int step = CanonicalRotation(rotation, context.slot_count());
+    if (step == 0) return result;
+    // RequiredRotationSteps pre-generates this exact offset. Keeping a
+    // single evaluator call here guarantees one key-switch per rotation.
+    evaluator.rotate_vector_inplace(result, step, context.galois_keys);
+    if (report) ++report->rotations;
     return result;
 }
 
@@ -351,7 +343,7 @@ HePackingPlan AttentionOutputPacking(
 Result<SealCipherTensor> ComputeAttentionValue(
     const SealCipherTensor &probabilities, const SealCipherTensor &value,
     const TransformerLayerConfig &layer, const HeContext &context,
-    AttentionLn2ExecutionReport *report)
+    AttentionLn2ExecutionReport *report, std::size_t he_workers)
 {
     auto probability_valid = probabilities.Validate(context);
     if (!probability_valid.ok()) return probability_valid.status();
@@ -377,9 +369,17 @@ Result<SealCipherTensor> ComputeAttentionValue(
         context, value.ciphertexts.front().parms_id());
     if (!probability_level.ok()) return probability_level.status();
     if (!value_level.ok()) return value_level.status();
-    if (probability_level.value() != 2 || value_level.value() != 2)
+    if (probability_level.value() != value_level.value())
         return Status::FailedPrecondition(
-            "A*V inputs must share the exact level-2 suffix");
+            "A*V inputs must share the same CKKS level");
+    auto remaining = context.context->get_context_data(
+        probabilities.ciphertexts.front().parms_id());
+    for (std::size_t step = 0; step < 3; ++step) {
+        if (!remaining || !remaining->next_context_data())
+            return Status::FailedPrecondition(
+                "A*V requires three remaining CKKS data levels");
+        remaining = remaining->next_context_data();
+    }
     for (const auto &ct : probabilities.ciphertexts)
         if (ct.parms_id() != value.ciphertexts.front().parms_id())
             return Status::FailedPrecondition(
@@ -537,8 +537,16 @@ Result<SealCipherTensor> ComputeAttentionValue(
             }
         }
 
-        for (std::size_t value_group = 0;
-             value_group < tile.value_groups; ++value_group) {
+        std::vector<AttentionLn2ExecutionReport> group_reports(
+            tile.value_groups);
+        auto group_status = detail::ParallelRanges(
+            tile.value_groups, std::min<std::size_t>(he_workers, 2), 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+            seal::Evaluator evaluator(*context.context);
+            seal::CKKSEncoder encoder(*context.context);
+            for (std::size_t value_group = begin;
+                 value_group < end; ++value_group) {
+            auto *report = &group_reports[value_group];
             const auto &v_source = value.ciphertexts[
                 tile.value_begin + value_group];
 
@@ -680,6 +688,25 @@ Result<SealCipherTensor> ComputeAttentionValue(
                 return Status::Internal("A*V Step 3 produced no output");
             output[tile.value_begin + value_group] =
                 std::move(*accumulated);
+            }
+            return {};
+        }, detail::EstimatedHeWorkerBytes(
+            context.parameters.polynomial_degree,
+            context.parameters.coefficient_modulus_bits.size(),
+            baby_steps + giant_steps + 8));
+        if (!group_status.ok()) return group_status.status();
+        if (report) {
+            for (const auto &counts : group_reports) {
+                report->rotations += counts.rotations;
+                report->conjugations += counts.conjugations;
+                report->ciphertext_plain_multiplications +=
+                    counts.ciphertext_plain_multiplications;
+                report->ciphertext_multiplications +=
+                    counts.ciphertext_multiplications;
+                report->relinearizations += counts.relinearizations;
+                report->rescales += counts.rescales;
+                report->modulus_switches += counts.modulus_switches;
+            }
         }
     }
 
@@ -693,7 +720,7 @@ Result<SealCipherTensor> ComputeAttentionValue(
     result.logical_spec.numeric = value.logical_spec.numeric;
     result.logical_spec.he_region = HeRegionId::kRegion2;
     result.logical_spec.he_parameter_profile = context.profile;
-    result.logical_spec.planned_level = 5;
+    result.logical_spec.planned_level = value_level.value() + 3;
     result.logical_spec.planned_scale_bits =
         context.parameters.default_scale_bits;
     result.physical_packing = plan_result.take_value().output_packing;
@@ -729,7 +756,7 @@ Result<SealCipherTensor> ProjectOutput(
     const SealCipherTensor &input, const DenseMatrixParameter &weights,
     const std::optional<DenseVectorParameter> &bias,
     const TransformerLayerConfig &layer, const HeContext &context,
-    AttentionLn2ExecutionReport *report)
+    AttentionLn2ExecutionReport *report, std::size_t he_workers)
 {
     auto valid = input.Validate(context);
     if (!valid.ok()) return valid.status();
@@ -740,6 +767,46 @@ Result<SealCipherTensor> ProjectOutput(
         return Status::Invalid("Wo payload has the wrong rectangular shape");
     if (bias && bias->values.size() != layer.model_width)
         return Status::Invalid("bo payload has the wrong size");
+    const auto cache = ModelPlaintextCacheScope::Current();
+    const auto prepared_key = cache.second + "/attention/" +
+                              weights.spec.name;
+    if (cache.first && !cache.first->preparing_plaintexts()) {
+        auto prepared = cache.first->GetPreparedProjection(prepared_key);
+        if (!prepared.ok()) return prepared.status();
+        const auto &packing = prepared.value()->output_packing;
+        if (packing.layout != Layout::kComplexStrictColumn ||
+            packing.logical_shape !=
+                TensorShape{{layer.tokens, layer.model_width}} ||
+            packing.slot_count != context.slot_count())
+            return Status::FailedPrecondition(
+                "prepared Wo output packing mismatch");
+        PreparedProjectionCounts prepared_counts;
+        auto ciphertexts = EvaluatePreparedProjection(
+            *prepared.value(), input, context, &prepared_counts);
+        if (!ciphertexts.ok()) return ciphertexts.status();
+        if (report) {
+            report->rotations += prepared_counts.rotations;
+            report->conjugations += prepared_counts.conjugations;
+            report->ciphertext_plain_multiplications +=
+                prepared_counts.ciphertext_plain_multiplications;
+            report->rescales += prepared_counts.rescales;
+        }
+        SealCipherTensor result;
+        result.parameter_profile = context.profile;
+        result.ciphertexts = ciphertexts.take_value();
+        result.logical_spec.shape = {{layer.tokens, layer.model_width}};
+        result.logical_spec.domain = Domain::kHeCiphertext;
+        result.logical_spec.layout = Layout::kComplexStrictColumn;
+        result.logical_spec.numeric = input.logical_spec.numeric;
+        result.logical_spec.he_region = HeRegionId::kRegion4;
+        result.logical_spec.he_parameter_profile = context.profile;
+        result.logical_spec.planned_level = 6;
+        result.logical_spec.planned_scale_bits =
+            context.parameters.default_scale_bits;
+        result.physical_packing = prepared.value()->output_packing;
+        return result;
+    }
+
     auto target_plan = AttentionLn2PackingPlanner::ComplexStrictColumns(
         {{layer.tokens, layer.model_width}}, context.slot_count());
     if (!target_plan.ok()) return target_plan.status();
@@ -767,8 +834,8 @@ Result<SealCipherTensor> ProjectOutput(
                     ProjectionKey key{source.ciphertext,
                                       destination.ciphertext,
                                       source.component, rotation};
-                    auto inserted = masks.emplace(
-                        key, std::vector<Complex>(context.slot_count()));
+                    auto inserted = masks.try_emplace(
+                        key, context.slot_count(), Complex{});
                     inserted.first->second[destination.slot] +=
                         weights.row_major[input_column * layer.model_width +
                                           output_feature] *
@@ -779,60 +846,47 @@ Result<SealCipherTensor> ProjectOutput(
         }
     }
 
-    seal::Evaluator evaluator(*context.context);
-    seal::CKKSEncoder encoder(*context.context);
-    std::vector<seal::Ciphertext> output(
-        target_plan.value().ciphertext_count);
-    std::vector<bool> initialized(output.size(), false);
-    std::map<std::pair<std::size_t, ComplexLane>, seal::Ciphertext> extracted;
-    const double target = std::ldexp(
-        1.0, context.parameters.default_scale_bits);
-    for (const auto &entry : masks) {
-        if (std::none_of(entry.second.begin(), entry.second.end(),
-                         [](Complex value) { return std::abs(value) != 0.0; }))
-            continue;
-        const auto base_key = std::make_pair(entry.first.source_ct,
-                                             entry.first.component);
-        auto base = extracted.find(base_key);
-        if (base == extracted.end()) {
-            const auto &source = input.ciphertexts[entry.first.source_ct];
-            seal::Ciphertext conjugated;
-            evaluator.complex_conjugate(source, context.galois_keys,
-                                        conjugated);
-            seal::Ciphertext component;
-            if (entry.first.component == ComplexLane::kReal)
-                evaluator.add(source, conjugated, component);
-            else
-                evaluator.sub(source, conjugated, component);
-            base = extracted.emplace(base_key, std::move(component)).first;
-            if (report) ++report->conjugations;
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        const auto input_id = input.ciphertexts.front().parms_id();
+        const auto next = context.context->get_context_data(input_id)
+                              ->next_context_data();
+        if (!next)
+            return Status::FailedPrecondition(
+                "Wo preparation has no next CKKS level");
+        const double target = std::ldexp(
+            1.0, context.parameters.default_scale_bits);
+        const double plain_scale = target * DroppedPrime(context, input_id) /
+            input.ciphertexts.front().scale();
+        seal::CKKSEncoder encoder(*context.context);
+        auto prepared = std::make_shared<PreparedProjectionPlan>();
+        prepared->profile = context.profile;
+        prepared->input_parms_id = input_id;
+        prepared->input_scale = input.ciphertexts.front().scale();
+        prepared->input_packing = input.physical_packing;
+        prepared->output_packing = target_plan.value();
+        prepared->bias_plaintexts.resize(target_plan.value().ciphertext_count);
+        prepared->bias_after_rescale = true;
+        prepared->output_scale_bits = context.parameters.default_scale_bits;
+        std::vector<bool> initialized(target_plan.value().ciphertext_count);
+        for (const auto &entry : masks) {
+            if (std::none_of(entry.second.begin(), entry.second.end(),
+                             [](Complex value) { return std::abs(value) != 0.0; }))
+                continue;
+            auto encoded = CompileModelPlaintext(
+                encoder, entry.second, input_id, plain_scale,
+                "attention.wo.diagonal");
+            if (!encoded.ok()) return encoded.status();
+            const auto &key = entry.first;
+            prepared->groups.push_back({
+                key.target_ct, 0,
+                {{key.source_ct, key.component, key.rotation,
+                  encoded.take_value()}}});
+            initialized[key.target_ct] = true;
         }
-        auto rotated = Rotate(base->second, entry.first.rotation, context,
-                              evaluator, report);
-        const double plain_scale = target *
-            DroppedPrime(context, rotated.parms_id()) / rotated.scale();
-        auto encoded = EncodeModelPlaintext(
-            encoder, entry.second, rotated.parms_id(), plain_scale,
-            "attention.wo.diagonal");
-        if (!encoded.ok()) return encoded.status();
-        auto plain = encoded.take_value();
-        evaluator.multiply_plain_inplace(rotated, plain);
-        if (report) ++report->ciphertext_plain_multiplications;
-        if (!initialized[entry.first.target_ct]) {
-            output[entry.first.target_ct] = std::move(rotated);
-            initialized[entry.first.target_ct] = true;
-        } else {
-            evaluator.add_inplace(output[entry.first.target_ct], rotated);
-        }
-    }
-    for (std::size_t ct = 0; ct < output.size(); ++ct) {
-        if (!initialized[ct])
-            return Status::Internal("Wo generated an empty output group");
-        evaluator.rescale_to_next_inplace(output[ct]);
-        auto normalized = NormalizeScale(output[ct], target);
-        if (!normalized.ok()) return normalized.status();
-        if (report) ++report->rescales;
-        if (bias) {
+        for (std::size_t ct = 0; ct < initialized.size(); ++ct) {
+            if (!initialized[ct])
+                return Status::Internal("Wo generated an empty output group");
+            if (!bias) continue;
             std::vector<Complex> slots(context.slot_count());
             for (std::size_t logical = 0;
                  logical < target_plan.value().logical_locations.size();
@@ -846,13 +900,171 @@ Result<SealCipherTensor> ProjectOutput(
                 else
                     slots[location.slot].imag(bias->values[feature]);
             }
-            auto encoded = EncodeModelPlaintext(
-                encoder, slots, output[ct].parms_id(), target,
+            auto encoded = CompileModelPlaintext(
+                encoder, slots, next->parms_id(), target,
                 "attention.wo.bias");
             if (!encoded.ok()) return encoded.status();
-            auto plain = encoded.take_value();
-            evaluator.add_plain_inplace(output[ct], plain);
+            prepared->bias_plaintexts[ct] = encoded.take_value();
         }
+        auto stored = cache.first->PutPreparedProjection(
+            prepared_key, std::move(prepared));
+        if (!stored.ok()) return stored.status();
+        SealCipherTensor result;
+        result.parameter_profile = context.profile;
+        result.ciphertexts.resize(target_plan.value().ciphertext_count);
+        for (auto &ct : result.ciphertexts) {
+            ct.parms_id() = next->parms_id();
+            ct.scale() = target;
+        }
+        result.logical_spec.shape = {{layer.tokens, layer.model_width}};
+        result.logical_spec.domain = Domain::kHeCiphertext;
+        result.logical_spec.layout = Layout::kComplexStrictColumn;
+        result.logical_spec.numeric = input.logical_spec.numeric;
+        result.logical_spec.he_region = HeRegionId::kRegion4;
+        result.logical_spec.he_parameter_profile = context.profile;
+        result.logical_spec.planned_level = 6;
+        result.logical_spec.planned_scale_bits =
+            context.parameters.default_scale_bits;
+        result.physical_packing = target_plan.take_value();
+        return result;
+    }
+
+    std::vector<seal::Ciphertext> output(
+        target_plan.value().ciphertext_count);
+    std::map<std::pair<std::size_t, ComplexLane>, seal::Ciphertext> extracted;
+    const double target = std::ldexp(
+        1.0, context.parameters.default_scale_bits);
+    seal::Evaluator extraction_evaluator(*context.context);
+    for (const auto &entry : masks) {
+        if (std::none_of(entry.second.begin(), entry.second.end(),
+                         [](Complex value) { return std::abs(value) != 0.0; }))
+            continue;
+        const auto base_key = std::make_pair(entry.first.source_ct,
+                                             entry.first.component);
+        auto base = extracted.find(base_key);
+        if (base == extracted.end()) {
+            const auto &source = input.ciphertexts[entry.first.source_ct];
+            seal::Ciphertext conjugated;
+            extraction_evaluator.complex_conjugate(
+                source, context.galois_keys, conjugated);
+            seal::Ciphertext component;
+            if (entry.first.component == ComplexLane::kReal)
+                extraction_evaluator.add(source, conjugated, component);
+            else
+                extraction_evaluator.sub(source, conjugated, component);
+            base = extracted.emplace(base_key, std::move(component)).first;
+            if (report) ++report->conjugations;
+        }
+    }
+    using MaskIterator = decltype(masks)::const_iterator;
+    std::vector<std::vector<MaskIterator>> entries(output.size());
+    for (auto entry = masks.cbegin(); entry != masks.cend(); ++entry) {
+        if (std::none_of(entry->second.begin(), entry->second.end(),
+                         [](Complex value) { return std::abs(value) != 0.0; }))
+            continue;
+        entries[entry->first.target_ct].push_back(entry);
+    }
+    std::vector<AttentionLn2ExecutionReport> per_output(output.size());
+    std::shared_ptr<PreparedProjectionPlan> prepared;
+    std::vector<std::vector<PreparedProjectionGroup>> per_output_plan;
+    if (cache.first) {
+        prepared = std::make_shared<PreparedProjectionPlan>();
+        prepared->profile = context.profile;
+        prepared->input_parms_id = input.ciphertexts.front().parms_id();
+        prepared->input_scale = input.ciphertexts.front().scale();
+        prepared->input_packing = input.physical_packing;
+        prepared->output_packing = target_plan.value();
+        prepared->bias_plaintexts.resize(output.size());
+        prepared->bias_after_rescale = true;
+        prepared->output_scale_bits = context.parameters.default_scale_bits;
+        per_output_plan.resize(output.size());
+    }
+    auto projected = detail::ParallelRanges(
+        output.size(), std::min<std::size_t>(he_workers, 2), 1,
+        [&](std::size_t begin, std::size_t end) -> Result<void> {
+            std::optional<ModelPlaintextCacheScope> cache_scope;
+            if (cache.first) cache_scope.emplace(cache.first, cache.second);
+            seal::Evaluator evaluator(*context.context);
+            seal::CKKSEncoder encoder(*context.context);
+            for (std::size_t ct = begin; ct < end; ++ct) {
+                auto *local_report = &per_output[ct];
+                bool initialized = false;
+                for (const auto &entry : entries[ct]) {
+                    const auto base_key = std::make_pair(
+                        entry->first.source_ct, entry->first.component);
+                    auto rotated = Rotate(
+                        extracted.at(base_key), entry->first.rotation,
+                        context, evaluator, local_report);
+                    const double plain_scale = target *
+                        DroppedPrime(context, rotated.parms_id()) /
+                        rotated.scale();
+                    auto encoded = CompileModelPlaintext(
+                        encoder, entry->second, rotated.parms_id(), plain_scale,
+                        "attention.wo.diagonal");
+                    if (!encoded.ok()) return encoded.status();
+                    auto plain = encoded.take_value();
+                    if (prepared)
+                        per_output_plan[ct].push_back({
+                            ct, 0, {{entry->first.source_ct,
+                                     entry->first.component,
+                                     entry->first.rotation, plain}}});
+                    evaluator.multiply_plain_inplace(rotated, *plain);
+                    ++local_report->ciphertext_plain_multiplications;
+                    if (!initialized) {
+                        output[ct] = std::move(rotated);
+                        initialized = true;
+                    } else {
+                        evaluator.add_inplace(output[ct], rotated);
+                    }
+                }
+                if (!initialized)
+                    return Status::Internal("Wo generated an empty output group");
+                evaluator.rescale_to_next_inplace(output[ct]);
+                auto normalized = NormalizeScale(output[ct], target);
+                if (!normalized.ok()) return normalized.status();
+                ++local_report->rescales;
+                if (bias) {
+                    std::vector<Complex> slots(context.slot_count());
+                    for (std::size_t logical = 0;
+                         logical < target_plan.value().logical_locations.size();
+                         ++logical) {
+                        const auto feature = logical % layer.model_width;
+                        const auto &location =
+                            target_plan.value().Locations(logical).front();
+                        if (location.ciphertext != ct) continue;
+                        if (location.component == ComplexLane::kReal)
+                            slots[location.slot].real(bias->values[feature]);
+                        else
+                            slots[location.slot].imag(bias->values[feature]);
+                    }
+                    auto encoded = CompileModelPlaintext(
+                        encoder, slots, output[ct].parms_id(), target,
+                        "attention.wo.bias");
+                    if (!encoded.ok()) return encoded.status();
+                    auto plain = encoded.take_value();
+                    if (prepared) prepared->bias_plaintexts[ct] = plain;
+                    evaluator.add_plain_inplace(output[ct], *plain);
+                }
+            }
+            return {};
+        }, detail::EstimatedHeWorkerBytes(
+            context.parameters.polynomial_degree,
+            context.parameters.coefficient_modulus_bits.size(), 12));
+    if (!projected.ok()) return projected.status();
+    if (report)
+        for (const auto &local : per_output) {
+            report->rotations += local.rotations;
+            report->ciphertext_plain_multiplications +=
+                local.ciphertext_plain_multiplications;
+            report->rescales += local.rescales;
+        }
+    if (prepared) {
+        for (auto &groups : per_output_plan)
+            for (auto &group : groups)
+                prepared->groups.push_back(std::move(group));
+        auto stored = cache.first->PutPreparedProjection(
+            prepared_key, std::move(prepared));
+        if (!stored.ok()) return stored.status();
     }
     SealCipherTensor result;
     result.parameter_profile = context.profile;
@@ -1152,15 +1364,72 @@ Result<AttentionValuePlan> AttentionLn2PackingPlanner::AttentionValue(
                 }
             }
         }
-        for (std::size_t lane = 1; lane < tile.lanes; ++lane)
+        const auto baby_steps = std::min(layer.tokens, tile.lanes);
+        const auto giant_steps =
+            (layer.tokens + baby_steps - 1) / baby_steps;
+
+        // Step 1: exact A preprocessing rotations. Keep this in lockstep with
+        // ComputeAttentionValue; no signed-binary decomposition is permitted.
+        if (tile.lanes > layer.tokens) {
+            for (std::size_t giant = 0; giant < giant_steps; ++giant) {
+                const auto diagonal_begin = giant * baby_steps;
+                const auto valid_babies = std::min(
+                    baby_steps, layer.tokens - diagonal_begin);
+                for (std::size_t baby = 0; baby < valid_babies; ++baby) {
+                    rotations.insert(CanonicalRotation(
+                        static_cast<long long>(baby * block), slot_count));
+                }
+            }
+            std::size_t populated = 1;
+            while (2 * populated <= tile.lanes) {
+                rotations.insert(CanonicalRotation(
+                    -static_cast<long long>(populated * block), slot_count));
+                populated *= 2;
+            }
+            for (std::size_t lane = populated; lane < tile.lanes; ++lane)
+                rotations.insert(CanonicalRotation(
+                    -static_cast<long long>(lane * block), slot_count));
+        } else {
+            for (std::size_t giant = 0; giant < giant_steps; ++giant) {
+                const auto diagonal_begin = giant * baby_steps;
+                const auto valid_babies = std::min(
+                    baby_steps, layer.tokens - diagonal_begin);
+                for (std::size_t baby = 0; baby < valid_babies; ++baby)
+                    for (std::size_t lane = 0; lane < tile.lanes; ++lane)
+                        for (std::size_t row = 0; row < layer.tokens; ++row) {
+                            const auto source_row =
+                                (row + layer.tokens - diagonal_begin) %
+                                layer.tokens;
+                            const auto origin = baby * block +
+                                source_row * tile.head_count;
+                            const auto destination = lane * block +
+                                row * tile.head_count;
+                            rotations.insert(CanonicalRotation(
+                                static_cast<long long>(origin) -
+                                    static_cast<long long>(destination),
+                                slot_count));
+                        }
+            }
+        }
+
+        // Step 2 V preprocessing and Step 3 giant recovery.
+        for (std::size_t baby = 0; baby < baby_steps; ++baby) {
+            const auto shift = baby * tile.head_count;
             rotations.insert(CanonicalRotation(
-                static_cast<long long>(lane * block), slot_count));
-        for (std::size_t diagonal = 1; diagonal < layer.tokens; ++diagonal) {
+                static_cast<long long>(shift), slot_count));
+            if (baby != 0)
+                rotations.insert(CanonicalRotation(
+                    static_cast<long long>(shift) -
+                        static_cast<long long>(block), slot_count));
+        }
+        for (std::size_t giant = 0; giant < giant_steps; ++giant) {
+            const auto shift = giant * baby_steps * tile.head_count;
             rotations.insert(CanonicalRotation(
-                static_cast<long long>(diagonal * tile.head_count), slot_count));
-            rotations.insert(CanonicalRotation(
-                static_cast<long long>(diagonal * tile.head_count) -
-                    static_cast<long long>(block), slot_count));
+                static_cast<long long>(shift), slot_count));
+            if (shift != 0)
+                rotations.insert(CanonicalRotation(
+                    static_cast<long long>(shift) -
+                        static_cast<long long>(block), slot_count));
         }
     }
     auto valid = probabilities.Validate();
@@ -1257,18 +1526,20 @@ Result<void> AttentionLn2LevelPlanner::Validate(
 Result<SealCipherTensor> MultiHeadAttentionValueKernel::Evaluate(
     const SealCipherTensor &probabilities, const SealCipherTensor &value,
     const TransformerLayerConfig &layer, const HeContext &context,
-    AttentionLn2ExecutionReport *report)
+    AttentionLn2ExecutionReport *report, std::size_t he_workers)
 {
-    return ComputeAttentionValue(probabilities, value, layer, context, report);
+    return ComputeAttentionValue(probabilities, value, layer, context, report,
+                                 he_workers);
 }
 
 Result<SealCipherTensor> AttentionOutputProjectionKernel::Evaluate(
     const SealCipherTensor &attention, const DenseMatrixParameter &weights,
     const std::optional<DenseVectorParameter> &bias,
     const TransformerLayerConfig &layer, const HeContext &context,
-    AttentionLn2ExecutionReport *report)
+    AttentionLn2ExecutionReport *report, std::size_t he_workers)
 {
-    return ProjectOutput(attention, weights, bias, layer, context, report);
+    return ProjectOutput(attention, weights, bias, layer, context, report,
+                         he_workers);
 }
 
 Result<SealCipherTensor> AttentionResidualKernel::Add(
@@ -1477,16 +1748,59 @@ Result<std::vector<int>> SealSciAttentionLn2Executor::RequiredRotationSteps(
     if (!valid.ok()) return valid.status();
     std::set<int> steps{0};
     const auto slots = parameters.polynomial_degree / 2;
-    // Composite rotations use a minimal signed binary key basis.
-    for (std::size_t power = 1; power <= slots / 2; power <<= 1U) {
-        steps.insert(static_cast<int>(power));
-        if (power != slots / 2) steps.insert(-static_cast<int>(power));
-        if (power > slots / 4) break;
-    }
     auto av = AttentionLn2PackingPlanner::AttentionValue(layer, slots);
     if (!av.ok()) return av.status();
     steps.insert(av.value().required_rotation_steps.begin(),
                  av.value().required_rotation_steps.end());
+
+    // Wo uses a direct source-slot to destination-slot rotation for each
+    // complex diagonal. Include those exact offsets, not a binary key basis.
+    auto columns = AttentionLn2PackingPlanner::ComplexStrictColumns(
+        {{layer.tokens, layer.model_width}}, slots);
+    if (!columns.ok()) return columns.status();
+    std::vector<unsigned char> required(slots, 0);
+    for (std::size_t token = 0; token < layer.tokens; ++token) {
+        std::vector<std::size_t> sources;
+        std::vector<std::size_t> destinations;
+        sources.reserve(layer.q_heads * layer.value_head_width);
+        destinations.reserve(layer.model_width);
+        for (std::size_t output = 0; output < layer.model_width; ++output)
+            destinations.push_back(columns.value().Locations(
+                token * layer.model_width + output).front().slot);
+        for (std::size_t head = 0; head < layer.q_heads; ++head)
+            for (std::size_t dimension = 0;
+                 dimension < layer.value_head_width; ++dimension) {
+                const auto logical = AttentionOutputIndex(
+                    token, head, dimension, layer);
+                sources.push_back(av.value().output_packing.Locations(
+                    logical).front().slot);
+            }
+        std::sort(sources.begin(), sources.end());
+        sources.erase(std::unique(sources.begin(), sources.end()),
+                      sources.end());
+        std::sort(destinations.begin(), destinations.end());
+        destinations.erase(
+            std::unique(destinations.begin(), destinations.end()),
+            destinations.end());
+        for (const auto source : sources)
+            for (const auto destination : destinations)
+                required[(source + slots - destination) % slots] = 1;
+    }
+    for (std::size_t residue = 1; residue < slots; ++residue)
+        if (required[residue])
+            steps.insert(CanonicalRotation(
+                static_cast<long long>(residue), slots));
+
+    // LayerNorm reductions rotate whole strict columns. Realification and Wo
+    // component extraction need the conjugation key represented by step 0.
+    const auto stride = NextPowerOfTwo(layer.tokens);
+    const auto features_per_ciphertext = slots / stride;
+    for (std::size_t step = 1; step < features_per_ciphertext;
+         step <<= 1U)
+        steps.insert(CanonicalRotation(
+            static_cast<long long>(step * stride), slots));
+    steps.erase(0);
+    steps.insert(0);
     return std::vector<int>(steps.begin(), steps.end());
 }
 
@@ -1596,14 +1910,14 @@ Result<AttentionLn2Outputs> SealSciAttentionLn2Executor::Evaluate(
                 context.parameters.default_scale_bits;
             a.physical_packing = av_plan.value().probability_packing;
             auto attention = MultiHeadAttentionValueKernel::Evaluate(
-                a, value.value(), layer_, context, report);
+                a, value.value(), layer_, context, report, config_.threads);
             if (!attention.ok()) return attention.status();
 
             if (weights.layer_id != layer_.id || !weights.wo.valid() ||
                 weights.wo.spec.rows != AttentionWidth(layer_) ||
                 weights.wo.spec.columns != layer_.model_width)
                 return Status::Invalid("Wo handle has the wrong shape");
-            auto wo = parameters_.GetMatrix(weights.wo.id);
+            auto wo = parameters_.GetMatrixShared(weights.wo.id);
             if (!wo.ok()) return wo.status();
             std::optional<DenseVectorParameter> bo;
             if (layer_.output_bias) {
@@ -1615,7 +1929,8 @@ Result<AttentionLn2Outputs> SealSciAttentionLn2Executor::Evaluate(
                 bo = value_bo.take_value();
             }
             auto projected = AttentionOutputProjectionKernel::Evaluate(
-                attention.value(), wo.value(), bo, layer_, context, report);
+                attention.value(), *wo.value(), bo, layer_, context, report,
+                config_.threads);
             if (!projected.ok()) return projected.status();
             if (layer_.attention_residual) {
                 auto added = AttentionResidualKernel::Add(

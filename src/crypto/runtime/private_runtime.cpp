@@ -244,7 +244,9 @@ Result<seal::parms_id_type> ParmsAtLevel(const HeContext &context,
     return data->parms_id();
 }
 
-Result<SealCipherTensor> EncryptedZeroTensor(
+// A Prepare-only contract carrier: no encryption, ciphertext coefficient
+// allocation, or evaluator work is needed to compile model plaintexts.
+Result<SealCipherTensor> PreparationTensor(
     const HeContext &context, const HePackingPlan &packing,
     TensorSpec spec, std::size_t level, int scale_bits)
 {
@@ -252,10 +254,9 @@ Result<SealCipherTensor> EncryptedZeroTensor(
     if (!valid.ok()) return valid.status();
     auto parms = ParmsAtLevel(context, level);
     if (!parms.ok()) return parms.status();
-    seal::Encryptor encryptor(*context.context, context.public_key);
     std::vector<seal::Ciphertext> ciphertexts(packing.ciphertext_count);
     for (auto &ciphertext : ciphertexts) {
-        encryptor.encrypt_zero(parms.value(), ciphertext);
+        ciphertext.parms_id() = parms.value();
         ciphertext.scale() = std::ldexp(1.0, scale_bits);
     }
     spec.domain = Domain::kHeCiphertext;
@@ -290,16 +291,41 @@ std::uint64_t WeightManifest(const TransformerWeightHandles &weights)
     return hash;
 }
 
+class PlaintextPreparationGuard {
+public:
+    explicit PlaintextPreparationGuard(SealPlainParameterStore &store)
+        : store_(store)
+    {
+        store_.BeginPlaintextPreparation();
+    }
+
+    ~PlaintextPreparationGuard()
+    {
+        if (!committed_) store_.AbortPlaintextPreparation();
+    }
+
+    void Commit()
+    {
+        store_.FreezePlaintextCache();
+        committed_ = true;
+    }
+
+private:
+    SealPlainParameterStore &store_;
+    bool committed_{};
+};
+
 } // namespace
 
 SealSciPreLnEntryExecutor::SealSciPreLnEntryExecutor(
     const HeraConfig &config, std::size_t layer_index,
     HeContextRegistry &contexts, RuntimeTensorArena &arena,
     SealPlainParameterStore &parameters, CkksMpcConverter &converter,
-    MpcLayerNormRuntime &mpc_layer_norm)
+    MpcLayerNormRuntime &mpc_layer_norm,
+    const CompiledLayerExecutionPlan *plan)
     : config_(config), layer_index_(layer_index), contexts_(contexts),
       arena_(arena), parameters_(parameters), converter_(converter),
-      mpc_layer_norm_(mpc_layer_norm)
+      mpc_layer_norm_(mpc_layer_norm), plan_(plan)
 {}
 
 Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
@@ -350,6 +376,12 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
                 "Region-1 profile has no three-level statistics suffix");
         const auto region1_start =
             region1_terminal - kRegion1StatisticsDepth;
+        if (plan_ && (plan_->layer_id != layer.id ||
+                      plan_->statistics_profile != region1.profile ||
+                      plan_->attention_profile != shared.profile ||
+                      plan_->statistics_input_level != region1_start))
+            return Status::FailedPrecondition(
+                "Pre-LN compiled plan does not match its HE contexts");
 
         auto source_plan = AttentionLn2PackingPlanner::RealStrictColumns(
             hidden_shape, source.slot_count());
@@ -382,6 +414,9 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
         const auto shared_terminal =
             shared.parameters.coefficient_modulus_bits.size() -
             shared.parameters.terminal_prime_count;
+        if (plan_ && plan_->attention_scores_level != shared_terminal)
+            return Status::FailedPrecondition(
+                "Pre-LN compiled attention terminal level mismatch");
         constexpr std::size_t kLayerNormStatisticsDepth = 3;
         if (shared_terminal < kLayerNormStatisticsDepth)
             return Status::FailedPrecondition(
@@ -569,11 +604,14 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
             shared.parameters.output_scale_bits, config_.mpc_numeric);
         TensorSpec value_spec = HeSpec(
             {{layer.tokens, layer.kv_heads, layer.value_head_width}},
-            Layout::kMultiHeadV, HeRegionId::kRegion2, shared, 2,
+            Layout::kMultiHeadV, HeRegionId::kRegion2, shared,
+            plan_ ? plan_->retained_value_level : std::size_t{2},
             shared.parameters.default_scale_bits, config_.mpc_numeric);
         if (contexts_.role() == PartyRole::kServer) {
             SealBlock2Executor block2(config_, layer, contexts_, arena_.he,
-                                      parameters_);
+                                      parameters_,
+                                      plan_ ? &plan_->block2_rotation_steps
+                                            : nullptr);
             auto evaluated = block2.Evaluate(
                 {{centered_id, block_spec}, {inverse_id, block_spec}},
                 weights, report ? &report->block2 : nullptr);
@@ -610,11 +648,13 @@ SealSciTransformerRuntime::SealSciTransformerRuntime(
     RuntimeTensorArena &arena, SealPlainParameterStore &parameters,
     CkksMpcConverter &converter, MpcSoftmaxRuntime &softmax_mpc,
     MpcLayerNormRuntime &layer_norm_mpc, MpcGeluRuntime &gelu_mpc,
-    RuntimeCoordinator *coordinator)
+    RuntimeCoordinator *coordinator,
+    std::shared_ptr<const CompiledTransformerExecutionPlan> plan)
     : config_(config), contexts_(contexts), arena_(arena),
       parameters_(parameters), converter_(converter),
       softmax_mpc_(softmax_mpc), layer_norm_mpc_(layer_norm_mpc),
-      gelu_mpc_(gelu_mpc), coordinator_(coordinator)
+      gelu_mpc_(gelu_mpc), coordinator_(coordinator),
+      plan_(std::move(plan))
 {}
 
 Result<void> SealSciTransformerRuntime::Prepare(
@@ -623,6 +663,17 @@ Result<void> SealSciTransformerRuntime::Prepare(
     const auto started = Clock::now();
     auto supported = ValidateRuntimeConfig(config_);
     if (!supported.ok()) return supported.status();
+    if (!plan_) {
+        auto compiled = CompiledTransformerExecutionPlan::Compile(config_);
+        if (!compiled.ok()) return compiled.status();
+        plan_ = std::make_shared<CompiledTransformerExecutionPlan>(
+            compiled.take_value());
+    }
+    if (plan_->layers.size() != config_.layers.size())
+        return Status::Invalid("compiled runtime layer count mismatch");
+    for (std::size_t i = 0; i < plan_->layers.size(); ++i)
+        if (plan_->layers[i].layer_id != config_.layers[i].id)
+            return Status::Invalid("compiled runtime layer ID mismatch");
     if (weights.layers.size() != config_.layers.size())
         return Status::Invalid("preparation weight layer count mismatch");
     const auto manifest = WeightManifest(weights);
@@ -639,7 +690,9 @@ Result<void> SealSciTransformerRuntime::Prepare(
         }
         return {};
     }
-    parameters_.BeginPlaintextPreparation();
+    // Build into a staging cache. An early return leaves the previous
+    // prepared model intact and never enables online model encoding.
+    PlaintextPreparationGuard preparation(parameters_);
     if (contexts_.role() == PartyRole::kServer) {
         for (std::size_t i = 0; i < config_.layers.size(); ++i) {
             const auto &layer = config_.layers[i];
@@ -658,7 +711,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 return Status::Invalid(std::string(name) + " handle absent");
             };
             const auto matrix = [&](const WeightHandle &handle) {
-                return parameters_.GetMatrix(handle.id);
+                return parameters_.GetMatrixShared(handle.id);
             };
             const auto region_context = [&](HeRegionId id)
                 -> const HeContext & {
@@ -677,11 +730,11 @@ Result<void> SealSciTransformerRuntime::Prepare(
             dense_spec.shape = {{layer.tokens, layer.model_width}};
             dense_spec.numeric = config_.mpc_numeric;
             dense_spec.he_region = HeRegionId::kRegion2;
-            auto centered = EncryptedZeroTensor(
+            auto centered = PreparationTensor(
                 block2_context, dense.value(), dense_spec, 0,
                 block2_context.parameters.input_scale_bits);
             if (!centered.ok()) return centered.status();
-            auto inverse = EncryptedZeroTensor(
+            auto inverse = PreparationTensor(
                 block2_context, dense.value(), dense_spec, 0,
                 block2_context.parameters.input_scale_bits);
             if (!inverse.ok()) return inverse.status();
@@ -704,11 +757,9 @@ Result<void> SealSciTransformerRuntime::Prepare(
             auto qk_normalized = normalized.value();
             auto qk_target = LevelId(block2_context, qk_projection_input);
             if (!qk_target.ok()) return qk_target.status();
-            seal::Evaluator block2_evaluator(*block2_context.context);
             for (auto &ct : qk_normalized.ciphertexts)
                 if (ct.parms_id() != qk_target.value())
-                    block2_evaluator.mod_switch_to_inplace(
-                        ct, qk_target.value());
+                    ct.parms_id() = qk_target.value();
             qk_normalized.logical_spec.planned_level = qk_projection_input;
             ComplexDiagonalProjectionKernel qk_projection(
                 layer, block2_context);
@@ -730,10 +781,10 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 const auto layout = std::get<2>(entry);
                 auto compiled = layout == Layout::kMultiHeadV
                     ? value_projection.Evaluate(
-                        normalized.value(), weights_value.value(), bias,
+                        normalized.value(), *weights_value.value(), bias,
                         layout)
                     : qk_projection.Evaluate(
-                        qk_normalized, weights_value.value(), bias, layout);
+                        qk_normalized, *weights_value.value(), bias, layout);
                 if (!compiled.ok()) return compiled.status();
             }
 
@@ -747,7 +798,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
             attention_spec.shape = av.value().output_packing.logical_shape;
             attention_spec.numeric = config_.mpc_numeric;
             attention_spec.he_region = HeRegionId::kRegion4;
-            auto attention = EncryptedZeroTensor(
+            auto attention = PreparationTensor(
                 shared, av.value().output_packing, attention_spec, 5,
                 shared.parameters.default_scale_bits);
             if (!attention.ok()) return attention.status();
@@ -760,7 +811,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 bo = loaded.take_value();
             }
             auto wo_compiled = AttentionOutputProjectionKernel::Evaluate(
-                attention.value(), wo.value(), bo, layer, shared);
+                attention.value(), *wo.value(), bo, layer, shared);
             if (!wo_compiled.ok()) return wo_compiled.status();
 
             // Region 5 LN2 affine and Wu/bu.
@@ -780,7 +831,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 return Status::FailedPrecondition(
                     "FFN preparation profile has no six-level suffix");
             const auto ffn_start = ffn_terminal - kFfnGeluDepth;
-            auto ffn_centered = EncryptedZeroTensor(
+            auto ffn_centered = PreparationTensor(
                 ffn_context, ffn_plan.value().centered,
                 ffn_centered_spec, ffn_start,
                 ffn_context.parameters.input_scale_bits);
@@ -789,7 +840,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
             inverse_spec.shape = {{layer.tokens, 1}};
             inverse_spec.numeric = config_.mpc_numeric;
             inverse_spec.he_region = HeRegionId::kRegion5;
-            auto ffn_inverse = EncryptedZeroTensor(
+            auto ffn_inverse = PreparationTensor(
                 ffn_context, ffn_plan.value().inverse_broadcast,
                 inverse_spec, ffn_start,
                 ffn_context.parameters.input_scale_bits);
@@ -811,7 +862,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 bu = loaded.take_value();
             }
             auto wu_compiled = FfnUpProjectionKernel::Evaluate(
-                ffn_normalized.value(), wu.value(), bu, layer, ffn_context);
+                ffn_normalized.value(), *wu.value(), bu, layer, ffn_context);
             if (!wu_compiled.ok()) return wu_compiled.status();
 
             // Wd/bd use the terminal suffix for cross-layer conversion; the
@@ -833,7 +884,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 shared.parameters.terminal_prime_count;
             const auto wd_input_level = i + 1 < config_.layers.size()
                 ? shared_terminal - 2 : std::size_t{5};
-            auto activation = EncryptedZeroTensor(
+            auto activation = PreparationTensor(
                 shared, activation_plan.value(), activation_spec,
                 wd_input_level,
                 shared.parameters.default_scale_bits);
@@ -847,13 +898,13 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 bd = loaded.take_value();
             }
             auto wd_compiled = ComplexColumnProjectionKernel::Evaluate(
-                activation.value(), wd.value(), bd, output_plan.value(),
+                activation.value(), *wd.value(), bd, output_plan.value(),
                 HeRegionId::kRegion4,
                 shared.parameters.default_scale_bits, shared);
             if (!wd_compiled.ok()) return wd_compiled.status();
         }
     }
-    parameters_.FreezePlaintextCache();
+    preparation.Commit();
     prepared_manifest_ = manifest;
     prepared_ = true;
     if (report) {
@@ -917,7 +968,7 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
         PreLnEntryExecutionReport entry_report;
         SealSciPreLnEntryExecutor entry(
             config_, index, contexts_, arena_, parameters_, converter_,
-            layer_norm_mpc_);
+            layer_norm_mpc_, &plan_->layers[index]);
         auto block2 = entry.Evaluate(hidden, *layer_weights, &entry_report);
         if (!block2.ok()) {
             AppendStage(report, index, "pre_ln_block2", started,
@@ -1060,62 +1111,9 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
 Result<std::map<std::string, std::vector<int>>>
 SealSciTransformerRuntime::RequiredRotationSteps(const HeraConfig &config)
 {
-    auto supported = ValidateRuntimeConfig(config);
-    if (!supported.ok()) return supported.status();
-    std::map<std::string, std::set<int>> collected;
-    for (std::size_t index = 0; index < config.layers.size(); ++index) {
-        const auto &layer = config.layers[index];
-        const auto *execution = FindLayerExecution(config, layer.id);
-        if (!execution) return Status::Invalid("layer placement is absent");
-        const auto collect = [&](HeRegionId region,
-                                 const std::vector<int> &steps) {
-            const auto it = execution->regions.find(region);
-            if (it != execution->regions.end())
-                collected[it->second.parameter_profile].insert(
-                    steps.begin(), steps.end());
-        };
-        const auto r1 = execution->regions.find(HeRegionId::kRegion1);
-        const auto r2 = execution->regions.find(HeRegionId::kRegion2);
-        const auto r5 = execution->regions.find(HeRegionId::kRegion5);
-        if (r1 == execution->regions.end() || r2 == execution->regions.end() ||
-            r5 == execution->regions.end())
-            return Status::Invalid("runtime Region 1/2/5 placement is absent");
-        const auto &p1 = config.he_parameter_profiles.at(
-            r1->second.parameter_profile);
-        std::vector<int> reduction{0};
-        for (std::size_t step = 1;
-             step <= p1.polynomial_degree / 4; step <<= 1U) {
-            reduction.push_back(static_cast<int>(step));
-            reduction.push_back(-static_cast<int>(step));
-        }
-        collect(HeRegionId::kRegion1, reduction);
-        const auto &p2 = config.he_parameter_profiles.at(
-            r2->second.parameter_profile);
-        auto block2 = SealBlock2Executor::RequiredRotationSteps(layer, p2);
-        if (!block2.ok()) return block2.status();
-        collect(HeRegionId::kRegion2, block2.value());
-        auto attention = SealSciAttentionLn2Executor::RequiredRotationSteps(
-            layer, p2);
-        if (!attention.ok()) return attention.status();
-        collect(HeRegionId::kRegion2, attention.value());
-        const auto &p5 = config.he_parameter_profiles.at(
-            r5->second.parameter_profile);
-        auto ffn = SealSciFfnGeluExecutor::RequiredRotationSteps(layer, p5);
-        if (!ffn.ok()) return ffn.status();
-        collect(HeRegionId::kRegion5, ffn.value());
-        auto bridge = SealSciBlock5BridgeExecutor::RequiredRotationSteps(
-            config, index);
-        if (!bridge.ok()) return bridge.status();
-        for (const auto &entry : bridge.value())
-            collected[entry.first].insert(entry.second.begin(),
-                                          entry.second.end());
-    }
-    std::map<std::string, std::vector<int>> result;
-    for (auto &entry : collected)
-        result.emplace(entry.first,
-                       std::vector<int>(entry.second.begin(),
-                                        entry.second.end()));
-    return result;
+    auto plan = CompiledTransformerExecutionPlan::Compile(config);
+    if (!plan.ok()) return plan.status();
+    return plan.take_value().rotation_steps_by_profile;
 }
 
 Result<TransformerWeightHandles> RegisterTransformerWeights(

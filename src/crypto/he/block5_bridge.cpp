@@ -191,7 +191,8 @@ SealSciBlock5BridgeExecutor::SealSciBlock5BridgeExecutor(
 
 Result<std::map<std::string, std::vector<int>>>
 SealSciBlock5BridgeExecutor::RequiredRotationSteps(
-    const HeraConfig &config, std::size_t current_layer_index)
+    const HeraConfig &config, std::size_t current_layer_index,
+    bool include_next_layer)
 {
     if (current_layer_index >= config.layers.size())
         return Status::Invalid("Block-5 layer index is out of range");
@@ -227,7 +228,7 @@ SealSciBlock5BridgeExecutor::RequiredRotationSteps(
         profile_it->second.polynomial_degree / 2);
     if (!added.ok()) return added.status();
 
-    if (current_layer_index + 1 < config.layers.size()) {
+    if (include_next_layer && current_layer_index + 1 < config.layers.size()) {
         const auto &next = config.layers[current_layer_index + 1];
         if (next.norm != NormPlacement::kPreNorm)
             return Status::KernelUnavailable(
@@ -431,7 +432,7 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
                 current_weights.wd.spec.rows != layer.ffn_width ||
                 current_weights.wd.spec.columns != layer.model_width)
                 return Status::Invalid("Wd handle has the wrong shape");
-            auto wd = parameters_.GetMatrix(current_weights.wd.id);
+            auto wd = parameters_.GetMatrixShared(current_weights.wd.id);
             if (!wd.ok()) return wd.status();
             std::optional<DenseVectorParameter> bd;
             if (layer.ffn_bias) {
@@ -443,10 +444,10 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
                 bd = loaded.take_value();
             }
             auto down = ComplexColumnProjectionKernel::Evaluate(
-                encoded, wd.value(), bd, output_plan.value(),
+                encoded, *wd.value(), bd, output_plan.value(),
                 HeRegionId::kRegion4,
                 shared.parameters.default_scale_bits, shared,
-                report ? &report->he : nullptr);
+                report ? &report->he : nullptr, config_.threads);
             if (!down.ok()) return down.status();
             if (layer.ffn_residual) {
                 auto packing = down.value().physical_packing.Validate();

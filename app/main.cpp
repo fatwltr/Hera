@@ -20,6 +20,10 @@ struct CliOptions {
     std::string ip{"127.0.0.1"};
     int port{20500};
     std::size_t threads{1};
+    std::size_t he_threads{1};
+    std::size_t conversion_workers{1};
+    std::size_t he_memory_mib{512};
+    std::string seal_compression{"none"};
     std::uint64_t input_seed{1};
     std::uint64_t weight_seed{2};
     bool virtual_weights{};
@@ -49,7 +53,16 @@ hera::Result<CliOptions> ParseCli(int argc, char **argv)
         else if (argument.rfind("--port=", 0) == 0)
             options.port = std::stoi(argument.substr(7));
         else if (argument.rfind("--threads=", 0) == 0)
-            options.threads = std::stoul(argument.substr(10));
+            options.threads = options.he_threads =
+                options.conversion_workers = std::stoul(argument.substr(10));
+        else if (argument.rfind("--he-threads=", 0) == 0)
+            options.he_threads = std::stoul(argument.substr(13));
+        else if (argument.rfind("--conversion-workers=", 0) == 0)
+            options.conversion_workers = std::stoul(argument.substr(21));
+        else if (argument.rfind("--he-memory-mib=", 0) == 0)
+            options.he_memory_mib = std::stoul(argument.substr(16));
+        else if (argument.rfind("--seal-compression=", 0) == 0)
+            options.seal_compression = argument.substr(19);
         else if (argument.rfind("--input-seed=", 0) == 0)
             options.input_seed = std::stoull(argument.substr(13));
         else if (argument.rfind("--weight-seed=", 0) == 0)
@@ -176,7 +189,11 @@ int main(int argc, char **argv)
         runtime_options.party = options.value().party;
         runtime_options.ip = options.value().ip;
         runtime_options.port = options.value().port;
-        runtime_options.threads = options.value().threads;
+        runtime_options.he_threads = options.value().he_threads;
+        runtime_options.conversion_workers =
+            options.value().conversion_workers;
+        runtime_options.he_memory_mib = options.value().he_memory_mib;
+        runtime_options.seal_compression = options.value().seal_compression;
         runtime_options.input_seed = options.value().input_seed;
         runtime_options.weight_seed = options.value().weight_seed;
         runtime_options.virtual_weights = options.value().virtual_weights;

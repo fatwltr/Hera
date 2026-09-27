@@ -72,7 +72,8 @@ public:
         const SealCipherTensor &value,
         const TransformerLayerConfig &layer,
         const HeContext &context,
-        AttentionLn2ExecutionReport *report = nullptr);
+        AttentionLn2ExecutionReport *report = nullptr,
+        std::size_t he_workers = 1);
 };
 
 class AttentionOutputProjectionKernel {
@@ -83,7 +84,8 @@ public:
         const std::optional<DenseVectorParameter> &bias,
         const TransformerLayerConfig &layer,
         const HeContext &context,
-        AttentionLn2ExecutionReport *report = nullptr);
+        AttentionLn2ExecutionReport *report = nullptr,
+        std::size_t he_workers = 1);
 };
 
 class AttentionResidualKernel {

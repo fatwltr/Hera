@@ -414,6 +414,45 @@ void TestHePath()
                 complex_report.relinearizations == 2,
             "A*V did not lazily accumulate/relinearize once per giant group");
 
+    auto parallel_layer = complex_layer;
+    parallel_layer.value_head_width = 8;
+    auto parallel_v_plan = hera::MultiHeadPackingPlan::ProjectionOutput(
+        parallel_layer, hera::Layout::kMultiHeadV,
+        client_context.slot_count());
+    Require(parallel_v_plan.ok(), "cannot build multi-group V packing");
+    std::vector<double> parallel_values(
+        parallel_layer.tokens * parallel_layer.value_head_width);
+    const std::vector<double> basis{1.0, 0.1, -1.0, -0.1,
+                                    2.0, 0.2, -2.0, -0.2};
+    for (std::size_t token = 0; token < parallel_layer.tokens; ++token)
+        for (std::size_t feature = 0;
+             feature < parallel_layer.value_head_width; ++feature)
+            parallel_values[token * parallel_layer.value_head_width + feature] =
+                basis[feature] * (2.0 * token + 1.0);
+    auto parallel_v = Encrypt(
+        parallel_values, parallel_v_plan.value(), client_context, 2,
+        hera::HeRegionId::kRegion2);
+    hera::AttentionLn2ExecutionReport parallel_report;
+    auto parallel_attention = hera::MultiHeadAttentionValueKernel::Evaluate(
+        complex_a, parallel_v, parallel_layer, server_context,
+        &parallel_report, 2);
+    Require(parallel_attention.ok(),
+            parallel_attention.status().message());
+    std::vector<double> parallel_expected(
+        parallel_layer.tokens * parallel_layer.q_heads *
+        parallel_layer.value_head_width);
+    for (std::size_t row = 0; row < parallel_layer.tokens; ++row)
+        for (std::size_t head = 0; head < parallel_layer.q_heads; ++head)
+            for (std::size_t feature = 0;
+                 feature < parallel_layer.value_head_width; ++feature)
+                parallel_expected[
+                    (row * parallel_layer.q_heads + head) *
+                        parallel_layer.value_head_width + feature] =
+                    3.6 * basis[feature];
+    Require(MaxError(Decrypt(parallel_attention.value(), client_context),
+                     parallel_expected) < 0.025,
+            "parallel multi-group A*V differs from plaintext reference");
+
     hera::DenseMatrixParameter wo;
     wo.spec = {"Wo", 4, 4, true};
     wo.row_major.assign(16, 0.0);
@@ -504,6 +543,106 @@ void TestHePath()
     Require(report.ciphertext_multiplications > 0 && report.rescales > 0 &&
                 report.rotations > 0 && report.conjugations > 0,
             "attention/LN2 HE operation report is incomplete");
+}
+
+void TestParallelWoProjection()
+{
+    auto config = MakeConfig();
+    auto &layer = config.layers.front();
+    layer.tokens = 8;
+    layer.model_width = 513;
+    layer.kv_heads = layer.q_heads;
+    const auto &profile = config.he_parameter_profiles.at("shared");
+    auto av_plan = hera::AttentionLn2PackingPlanner::AttentionValue(
+        layer, profile.polynomial_degree / 2);
+    auto output_plan = hera::AttentionLn2PackingPlanner::ComplexStrictColumns(
+        {{layer.tokens, layer.model_width}}, profile.polynomial_degree / 2);
+    Require(av_plan.ok() && output_plan.ok(),
+            "parallel Wo packing failed");
+    Require(output_plan.value().ciphertext_count == 2,
+            "parallel Wo test needs two output groups");
+    hera::HeContextRegistry client;
+    Require(client.CreateClientProfiles(config).ok(),
+            "parallel Wo client context failed");
+    // Only feature 0 and feature 512 have nonzero weights. Their source-to-
+    // destination rotations for eight tokens are exactly 0 through 7.
+    Require(client.CompileRotationKeys("shared", {0, 1, 2, 3, 4, 5, 6, 7}).ok(),
+            "parallel Wo rotation keys failed");
+    auto bundle = client.ExportPublicBundle();
+    Require(bundle.ok(), bundle.status().message());
+    hera::HeContextRegistry server;
+    Require(server.CreateServerProfiles(config, bundle.value()).ok(),
+            "parallel Wo server context failed");
+    const auto &client_context = client.Require("shared", hera::PartyRole::kClient);
+    const auto &server_context = server.Require("shared", hera::PartyRole::kServer);
+    std::vector<double> values(
+        layer.tokens * layer.q_heads * layer.value_head_width);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        values[i] = (static_cast<int>(i % 7) - 3) * 0.01;
+    auto input = Encrypt(values, av_plan.value().output_packing,
+                         client_context, 5, hera::HeRegionId::kRegion4);
+    std::vector<double> weights(
+        layer.q_heads * layer.value_head_width * layer.model_width, 0.0);
+    weights[0] = 0.1;
+    weights[512] = -0.15;
+    hera::DenseMatrixParameter wo{
+        {"Wo", layer.q_heads * layer.value_head_width,
+         layer.model_width, true}, weights};
+    hera::AttentionLn2ExecutionReport serial_report, parallel_report;
+    auto serial = hera::AttentionOutputProjectionKernel::Evaluate(
+        input, wo, std::nullopt, layer, server_context, &serial_report, 1);
+    auto parallel = hera::AttentionOutputProjectionKernel::Evaluate(
+        input, wo, std::nullopt, layer, server_context, &parallel_report, 2);
+    Require(serial.ok() && parallel.ok(),
+            serial.ok() ? parallel.status().message() : serial.status().message());
+    Require(MaxError(Decrypt(serial.value(), client_context),
+                     Decrypt(parallel.value(), client_context)) < 1e-4,
+            "parallel Wo projection differs from serial");
+    Require(serial_report.rotations == parallel_report.rotations &&
+                serial_report.ciphertext_plain_multiplications ==
+                    parallel_report.ciphertext_plain_multiplications &&
+                serial_report.rescales == parallel_report.rescales,
+            "parallel Wo projection changed operation counts");
+
+    hera::SealPlainParameterStore parameters;
+    parameters.BeginPlaintextPreparation();
+    {
+        hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
+        auto metadata = input;
+        for (auto &ct : metadata.ciphertexts) {
+            const auto id = ct.parms_id();
+            const auto scale = ct.scale();
+            ct = seal::Ciphertext();
+            ct.parms_id() = id;
+            ct.scale() = scale;
+        }
+        auto prepared = hera::AttentionOutputProjectionKernel::Evaluate(
+            metadata, wo, std::nullopt, layer, server_context);
+        Require(prepared.ok(), prepared.status().message());
+    }
+    parameters.FreezePlaintextCache();
+    Require(parameters.prepared_projection_count() == 1,
+            "Prepare did not compile Wo projection");
+    hera::AttentionLn2ExecutionReport cached_report;
+    hera::Result<hera::SealCipherTensor> cached =
+        hera::Status::Internal("cached Wo was not evaluated");
+    {
+        hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
+        cached = hera::AttentionOutputProjectionKernel::Evaluate(
+            input, wo, std::nullopt, layer, server_context,
+            &cached_report, 2);
+    }
+    Require(cached.ok(), cached.status().message());
+    Require(parameters.prepared_projection_hits() == 1,
+            "online Wo did not use its prepared projection plan");
+    Require(MaxError(Decrypt(serial.value(), client_context),
+                     Decrypt(cached.value(), client_context)) < 1e-4,
+            "prepared Wo differs from the direct HE path");
+    Require(cached_report.rotations == serial_report.rotations &&
+                cached_report.ciphertext_plain_multiplications ==
+                    serial_report.ciphertext_plain_multiplications &&
+                cached_report.rescales == serial_report.rescales,
+            "prepared Wo changed HE operation counts");
 }
 
 struct IntegrationPacket {
@@ -766,6 +905,7 @@ int main()
     try {
         TestPackingAndLevels();
         TestHePath();
+        TestParallelWoProjection();
         TestIntegratedExecutor();
         std::cout << "ATTENTION_LN2_HE_READY=YES\n"
                   << "ATTENTION_LN2_STATUS=PASS\n";

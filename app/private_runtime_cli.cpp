@@ -1,5 +1,7 @@
 #include "hera/private_runtime.h"
 #include "hera/mpc_session.h"
+#include "hera/detail/parallel_ranges.h"
+#include "hera/seal_wire.h"
 
 #include <seal/seal.h>
 #include <seal/version.h>
@@ -28,6 +30,20 @@ constexpr int kSoftmaxOffset = 300;
 // without changing their firewall allowance.
 constexpr int kRuntimePortExtent = 800;
 
+seal::compr_mode_type CompressionMode(const std::string &name)
+{
+    seal::compr_mode_type mode;
+    if (name == "none") mode = seal::compr_mode_type::none;
+    else if (name == "zstd") mode = static_cast<seal::compr_mode_type>(2);
+    else if (name == "zlib") mode = static_cast<seal::compr_mode_type>(1);
+    else throw std::invalid_argument(
+        "--seal-compression must be none, zstd or zlib");
+    if (!seal::Serialization::IsSupportedComprMode(mode))
+        throw std::invalid_argument(
+            "requested SEAL compression is unavailable in this build");
+    return mode;
+}
+
 void Check(const Result<void> &result)
 {
     if (!result.ok()) throw std::runtime_error(result.status().message());
@@ -45,6 +61,8 @@ std::uint64_t RuntimeFingerprint(const HeraConfig &config,
         }
     };
     auto scalar = [&](const auto &value) { mix(&value, sizeof(value)); };
+    constexpr std::uint32_t wire_protocol_version = 2;
+    scalar(wire_protocol_version);
     scalar(config.schema_version);
     scalar(config.mpc_numeric.ring_bits);
     scalar(config.mpc_numeric.scale_bits);
@@ -112,7 +130,9 @@ std::uint64_t RuntimeFingerprint(const HeraConfig &config,
     const auto effective_templates = options.virtual_weights
         ? options.weight_template_count : std::size_t{0};
     scalar(effective_templates);
-    scalar(options.threads);
+    scalar(options.he_threads);
+    scalar(options.conversion_workers);
+    mix(options.seal_compression.data(), options.seal_compression.size());
     return hash;
 }
 
@@ -129,16 +149,12 @@ std::uint64_t ReceiveU64(IProtocolTransport &transport)
 }
 
 void SendCiphertexts(IProtocolTransport &transport,
-                     const std::vector<seal::Ciphertext> &ciphertexts)
+                     const std::vector<seal::Ciphertext> &ciphertexts,
+                     seal::compr_mode_type compression)
 {
     SendU64(transport, ciphertexts.size());
-    for (const auto &ciphertext : ciphertexts) {
-        std::stringstream stream;
-        ciphertext.save(stream, seal::compr_mode_type::none);
-        const auto bytes = stream.str();
-        SendU64(transport, bytes.size());
-        if (!bytes.empty()) transport.Send(bytes.data(), bytes.size());
-    }
+    for (const auto &ciphertext : ciphertexts)
+        SendSealObject(transport, ciphertext, compression);
 }
 
 std::vector<seal::Ciphertext> ReceiveCiphertexts(
@@ -149,13 +165,7 @@ std::vector<seal::Ciphertext> ReceiveCiphertexts(
         throw std::runtime_error("invalid ciphertext batch size");
     std::vector<seal::Ciphertext> result(count);
     for (auto &ciphertext : result) {
-        const auto size = ReceiveU64(transport);
-        if (size == 0 || size > (std::uint64_t{1} << 34))
-            throw std::runtime_error("invalid serialized ciphertext size");
-        std::string bytes(size, '\0');
-        transport.Receive(bytes.data(), bytes.size());
-        std::stringstream stream(bytes);
-        ciphertext.load(context, stream);
+        ciphertext = ReceiveSealObject<seal::Ciphertext>(transport, context);
     }
     return result;
 }
@@ -244,19 +254,29 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
                 const HeraConfig &config, PartyRole role)
 {
     const auto setup_started = Clock::now();
+    const auto compression = CompressionMode(options.seal_compression);
+    auto compiled = CompiledTransformerExecutionPlan::Compile(config);
+    if (!compiled.ok())
+        throw std::runtime_error(compiled.status().message());
+    std::shared_ptr<const CompiledTransformerExecutionPlan> plan =
+        std::make_shared<CompiledTransformerExecutionPlan>(
+            compiled.take_value());
+    std::size_t rotation_key_steps = 0;
+    for (const auto &entry : plan->rotation_steps_by_profile)
+        rotation_key_steps += entry.second.size();
+    std::size_t galois_key_bytes = 0;
     auto control = MakeNetIoTransport(
         role, role == PartyRole::kClient ? options.ip : "", options.port);
     HeContextRegistry contexts;
     if (role == PartyRole::kClient) {
         Check(contexts.CreateClientProfiles(config));
-        auto rotations = SealSciTransformerRuntime::RequiredRotationSteps(config);
-        if (!rotations.ok())
-            throw std::runtime_error(rotations.status().message());
-        for (const auto &entry : rotations.value())
+        for (const auto &entry : plan->rotation_steps_by_profile)
             Check(contexts.CompileRotationKeys(entry.first, entry.second));
         SendU64(*control, RuntimeFingerprint(config, options));
-        auto bundle = contexts.ExportSerializedPublicBundle();
+        auto bundle = contexts.ExportSerializedPublicBundle(compression);
         if (!bundle.ok()) throw std::runtime_error(bundle.status().message());
+        for (const auto &profile : bundle.value().profiles)
+            galois_key_bytes += profile.galois_keys.size();
         Check(SendPublicContextBundle(*control, bundle.value()));
     } else {
         if (ReceiveU64(*control) != RuntimeFingerprint(config, options))
@@ -264,6 +284,8 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
                 "client/server configs or benchmark modes differ");
         auto bundle = ReceivePublicContextBundle(*control);
         if (!bundle.ok()) throw std::runtime_error(bundle.status().message());
+        for (const auto &profile : bundle.value().profiles)
+            galois_key_bytes += profile.galois_keys.size();
         Check(contexts.CreateServerProfiles(config, bundle.value()));
         for (const auto &entry : config.he_parameter_profiles)
             if (contexts.Require(entry.first, PartyRole::kServer).has_secret_key())
@@ -280,7 +302,7 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
     if (role == PartyRole::kClient) {
         client_input = EncryptSyntheticInput(config, input_context,
                                              options.input_seed);
-        SendCiphertexts(*control, client_input.ciphertexts);
+        SendCiphertexts(*control, client_input.ciphertexts, compression);
     } else {
         auto ciphertexts = ReceiveCiphertexts(*control, *input_context.context);
         auto packing = AttentionLn2PackingPlanner::RealStrictColumns(
@@ -308,7 +330,7 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
         role, ProtocolConfig(config), contexts, conversion_transport,
         MakeProductionRandomSource(), options.ip,
         options.port + kConversionWorkerOffset,
-        options.threads);
+        options.conversion_workers, compression);
     auto nonlinear_session = std::make_shared<SharedMpcSession>(
         role, options.ip, options.port + kSoftmaxOffset);
     MpcSoftmaxRuntime softmax(nonlinear_session);
@@ -332,7 +354,7 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
     Check(nonlinear_session->Prepare());
     auto runtime = std::make_shared<SealSciTransformerRuntime>(
         config, contexts, arena, parameters, converter, softmax, norm, gelu,
-        coordinator.value().get());
+        coordinator.value().get(), plan);
     auto framework = HeraContext::Create(config);
     if (!framework.ok()) throw std::runtime_error(framework.status().message());
     Check(framework.value()->BindExecutionRuntime(runtime));
@@ -365,7 +387,8 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
             auto payload = arena.he.Get(output.value().tensor.id);
             if (!payload.ok())
                 throw std::runtime_error(payload.status().message());
-            SendCiphertexts(*control, payload.value().ciphertexts);
+            SendCiphertexts(*control, payload.value().ciphertexts,
+                            compression);
         } else {
             if (!output.value().tensor.spec.he_parameter_profile)
                 throw std::runtime_error("output HE profile is absent");
@@ -410,6 +433,7 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
         }
     }
     Check(coordinator.value()->Finish());
+    const auto conversion_stats = converter.stats();
     const auto denominator = static_cast<double>(options.repeat);
     for (const auto &stage : last_report.stages) {
         const auto &metrics = stage.metrics;
@@ -430,11 +454,23 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
               << (role == PartyRole::kClient ? "client" : "server")
               << "\nHERA_SEAL_VERSION=" << SEAL_VERSION_MAJOR << '.'
               << SEAL_VERSION_MINOR << '.' << SEAL_VERSION_PATCH
+              << "\nHERA_HE_THREADS=" << options.he_threads
+              << "\nHERA_CONVERSION_WORKERS=" << options.conversion_workers
+              << "\nHERA_HE_MEMORY_BUDGET_MIB=" << options.he_memory_mib
+              << "\nHERA_HE_POOL_WORKERS="
+              << detail::HeWorkerPool::Instance().WorkerThreadCount()
+              << "\nHERA_SEAL_COMPRESSION=" << options.seal_compression
               << "\nHERA_SETUP_MS=" << setup_ms
+              << "\nHERA_ROTATION_KEY_STEPS=" << rotation_key_steps
+              << "\nHERA_GALOIS_KEY_BYTES=" << galois_key_bytes
               << "\nHERA_PREPARE_MS=" << preparation.milliseconds
               << "\nHERA_PREPARED_PLAINTEXTS="
               << preparation.encoded_plaintext_count
               << "\nHERA_PREPARED_BYTES=" << preparation.encoded_bytes
+              << "\nHERA_PREPARED_PROJECTION_PLANS="
+              << parameters.prepared_projection_count()
+              << "\nHERA_ONLINE_PROJECTION_PLAN_HITS="
+              << parameters.prepared_projection_hits()
               << "\nHERA_PREPARE_CACHE_HITS=" << preparation.cache_hits
               << "\nHERA_WEIGHT_MODE="
               << (options.virtual_weights ? "VIRTUAL" : "MATERIALIZED")
@@ -447,6 +483,14 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
               << "\nHERA_MODEL_NUMERICAL_VALIDATION="
               << (options.virtual_weights ? "DISABLED" : "FINAL_FINITE_ONLY")
               << "\nHERA_ONLINE_MODEL_ENCODES=0"
+              << "\nHERA_CONVERSION_TRANSFORM_CACHE_HITS="
+              << conversion_stats.transform_cache_hits
+              << "\nHERA_CONVERSION_TRANSFORM_CACHE_MISSES="
+              << conversion_stats.transform_cache_misses
+              << "\nHERA_CONVERSION_LOCAL_TASKS="
+              << conversion_stats.local_transform_tasks
+              << "\nHERA_CONVERSION_LOCAL_PEAK_INFLIGHT="
+              << conversion_stats.local_transform_peak_inflight
               << "\nHERA_ONLINE_MS=" << measured_online / denominator
               << "\nHERA_OUTPUT_TRANSFER_MS="
               << measured_transfer / denominator
@@ -476,14 +520,21 @@ int RunPrivateRuntimeCli(const PrivateRuntimeCliOptions &options)
         if (options.port < 1024 ||
             options.port + kRuntimePortExtent >= 32768)
             throw std::invalid_argument("runtime port range is invalid");
-        if (options.threads == 0 || options.repeat == 0)
-            throw std::invalid_argument("threads/repeat must be positive");
+        if (options.he_threads == 0 || options.he_threads > 64 ||
+            options.conversion_workers == 0 ||
+            options.conversion_workers > 16 ||
+            options.he_memory_mib == 0 || options.he_memory_mib > 1048576 ||
+            options.repeat == 0)
+            throw std::invalid_argument("invalid thread, memory or repeat budget");
         if (options.weight_template_count == 0)
             throw std::invalid_argument(
                 "--weight-template-count must be positive");
         auto loaded = LoadHeraConfig(options.config);
         if (!loaded.ok()) throw std::runtime_error(loaded.status().message());
-        const auto config = loaded.take_value();
+        auto config = loaded.take_value();
+        config.threads = options.he_threads;
+        detail::HeWorkerPool::Instance().SetMemoryBudget(
+            options.he_memory_mib * (std::size_t{1} << 20));
         if (options.party == "client")
             return RunOneParty(options, config, PartyRole::kClient);
         if (options.party == "server")

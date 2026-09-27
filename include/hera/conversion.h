@@ -98,6 +98,10 @@ struct ConversionStats {
     std::uint64_t a_mask_bytes{};
     std::uint64_t z_mask_bytes{};
     std::size_t internal_mod_switches{};
+    std::size_t transform_cache_hits{};
+    std::size_t transform_cache_misses{};
+    std::size_t local_transform_tasks{};
+    std::size_t local_transform_peak_inflight{};
     double milliseconds{};
 };
 
@@ -148,7 +152,9 @@ public:
                      std::shared_ptr<IProtocolTransport> transport,
                      std::shared_ptr<IRandomSource> randomness,
                      std::string peer_address, int worker_port,
-                     std::size_t threads);
+                     std::size_t threads,
+                     seal::compr_mode_type wire_compression =
+                         seal::compr_mode_type::none);
     ~CkksMpcConverter();
     CkksMpcConverter(CkksMpcConverter &&) noexcept;
     CkksMpcConverter &operator=(CkksMpcConverter &&) noexcept;

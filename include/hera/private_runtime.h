@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hera/block5_bridge.h"
+#include "hera/execution_plan.h"
 #include "hera/private_transformer.h"
 #include "hera/runtime_coordinator.h"
 
@@ -51,7 +52,8 @@ public:
         const HeraConfig &config, std::size_t layer_index,
         HeContextRegistry &contexts, RuntimeTensorArena &arena,
         SealPlainParameterStore &parameters, CkksMpcConverter &converter,
-        MpcLayerNormRuntime &mpc_layer_norm);
+        MpcLayerNormRuntime &mpc_layer_norm,
+        const CompiledLayerExecutionPlan *plan = nullptr);
 
     Result<PreLnEntryOutputs> Evaluate(
         const TensorHandle &hidden, const LayerWeightHandles &weights,
@@ -65,6 +67,7 @@ private:
     SealPlainParameterStore &parameters_;
     CkksMpcConverter &converter_;
     MpcLayerNormRuntime &mpc_layer_norm_;
+    const CompiledLayerExecutionPlan *plan_{};
 };
 
 // Concrete fused-stage implementation behind PrivateTransformer::Evaluate.
@@ -77,7 +80,8 @@ public:
         RuntimeTensorArena &arena, SealPlainParameterStore &parameters,
         CkksMpcConverter &converter, MpcSoftmaxRuntime &softmax_mpc,
         MpcLayerNormRuntime &layer_norm_mpc, MpcGeluRuntime &gelu_mpc,
-        RuntimeCoordinator *coordinator = nullptr);
+        RuntimeCoordinator *coordinator = nullptr,
+        std::shared_ptr<const CompiledTransformerExecutionPlan> plan = {});
 
     Result<void> Prepare(
         const TransformerWeightHandles &weights,
@@ -102,6 +106,7 @@ private:
     MpcLayerNormRuntime &layer_norm_mpc_;
     MpcGeluRuntime &gelu_mpc_;
     RuntimeCoordinator *coordinator_{};
+    std::shared_ptr<const CompiledTransformerExecutionPlan> plan_;
     bool prepared_{};
     std::uint64_t prepared_manifest_{};
 };
@@ -119,7 +124,10 @@ struct PrivateRuntimeCliOptions {
     std::string party{"local"};
     std::string ip{"127.0.0.1"};
     int port{20500};
-    std::size_t threads{1};
+    std::size_t he_threads{1};
+    std::size_t conversion_workers{1};
+    std::size_t he_memory_mib{512};
+    std::string seal_compression{"none"};
     std::uint64_t input_seed{1};
     std::uint64_t weight_seed{2};
     bool virtual_weights{};

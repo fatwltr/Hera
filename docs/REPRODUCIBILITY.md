@@ -14,6 +14,11 @@ The dependency pipeline is:
 6. Configure HERA against only those two package locations.
 
 Input repositories are never patched in place. The generated manifests record the selected ABI and SEAL revision.
+The first bootstrap needs network access to GitHub and the BOLT Eigen
+submodule on GitLab. A repeated bootstrap with clean, pinned checkouts and
+complete installations does not refetch the source. An older matching
+HERA-SCI installation that lacks only the exported header-only `emp-tool`
+files is repaired from its copied, pinned SCI source tree.
 
 ## Test tiers
 

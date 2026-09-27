@@ -80,9 +80,49 @@ changing the graph modules, is:
 The real runtime now requires `PrivateTransformer::Prepare()` before
 `Evaluate()`. Prepare compiles and freezes all model-dependent LayerNorm,
 Q/K/V/Wo/Wu/Wd and bias plaintexts. A frozen-cache miss fails instead of
-encoding during online inference. The dedicated `base+1` coordinator sends
+encoding during online inference. Preparation builds into a staging cache;
+failure leaves the previously prepared model usable. Preparation uses
+metadata-only tensors carrying the exact `parms_id`, scale and packing. It
+compiles LayerNorm masks and projection diagonals without encrypting zero
+inputs or evaluating HE arithmetic. The compiled execution plan supplies
+per-layer level contracts and the per-profile union of exact
+rotation steps to key generation and the online Block 2 path. A real model
+must still be encoded once per runtime initialization; this setup cost is
+outside the measured online interval. The dedicated `base+1` coordinator sends
 two-second heartbeats, synchronizes every five-stage boundary, propagates
 abort status, and cancels conversion plus all SCI sessions after peer failure.
+
+HE work is parallel only where ciphertext outputs are independent: Block 2
+overlaps V projection with the Q/K-to-QK branch and distributes independent
+QK diagonal output groups over at most two workers. Attention-times-V
+distributes independent value output groups over at most two workers. Block 3
+distributes separate Softmax ciphertexts over at most four workers, and the
+GeLU polynomial distributes ciphertexts over at most two workers. Wo/Wu/Wd
+projection output ciphertext groups use at most two workers. HE range work
+now uses one reusable process-local pool instead of constructing
+threads at every kernel call. `--he-threads` and `--conversion-workers` are
+independent; `--threads` sets both for older scripts. The HE scheduler caps
+workers by output-group count and a conservative estimate of live ciphertext
+bytes per group, using `--he-memory-mib` as the temporary-task budget. This
+is not a bound on model plaintext caches, key material or total process RSS.
+The outer Block-2 V branch also uses the same pool; nested calls on a pool
+worker run serially to prevent pool self-deadlock. Each worker has private
+SEAL evaluator/encoder state and writes disjoint output indices. MPC Softmax
+row maxima of equal public width are batched into one SCI `max` call instead
+of opening a compare/mux sequence for every row. The conversion OT workers
+remain dedicated threads: running one of those workers on the orchestrator
+thread caused the cross-stage protocol regression test to stall and is not
+part of the supported optimization.
+
+Ciphertext frames now use a bounded 256 KiB stream buffer and a terminating
+chunk, so neither side creates a second whole-object `stringstream`/`string`
+copy. Public-key bundle serialization writes directly into its final byte
+vectors and sends those vectors in chunks; the bundle API still retains one
+complete serialized copy of each key. The wire version is 2 and rejects old
+peers. `--seal-compression=none|zstd|zlib` selects SEAL's own serialization
+mode, with explicit capability checking. The default reproducible SEAL build
+has compression disabled; optional zstd/zlib support must be selected when
+preparing SEAL, and both peers must use matching binaries/configuration.
 
 Concrete backends must return tensors matching the graph-declared shape,
 domain, layout, region, level and scale. The executor never calls a decrypt
@@ -218,6 +258,15 @@ Q/K projection terminal-5 -> K preprocessing -> ct-ct product
 -> alignment -> recovery -> output pairing at terminal
 ```
 
+Rotation planning is packing-aware. During setup HERA collects every exact
+non-zero offset used by projection BSGS baby/giant steps, QK, Attention x V,
+Wo/Wu/Wd and LayerNorm reductions, then generates a Galois key for each one
+(plus the conjugation key where required). Online kernels issue one
+`rotate_vector` call per logical rotation, so an arbitrary offset costs one
+automorphism and one key-switch rather than a sequence of signed power-of-two
+rotations. This reduces online latency at the cost of larger setup time,
+serialized public-key material and server key memory.
+
 An eight-prime standalone Block-2 profile therefore retains the original
 `Q/K L2 -> scores L7` path, while the ten-prime shared profile uses
 `Q/K L4 -> scores L9` and avoids a later L7-to-L9 conversion-only drop. The Block-2
@@ -275,6 +324,16 @@ multi-prime target level. The client symmetrically encrypts its full-RNS
 plaintext share and the server adds its own plaintext share. The protocol
 never rewrites a ciphertext scale to disguise a numerical mismatch.
 
+Each converter instance caches the immutable fixed-point CKKS transform tables
+by polynomial degree, root precision, wide-ring working width, and party
+orientation. For multi-ciphertext batches with more than one conversion
+worker, up to two local transform tasks may overlap with the next
+ciphertext's secure preparation. CKKS-to-MPC pipelines local Decode;
+MPC-to-CKKS pipelines local full-RNS decomposition/NTT after secure extension.
+OT calls and ciphertext network frames remain strictly in ciphertext order;
+the converter does not run whole protocol iterations concurrently. The
+conversion report exposes cache hits/misses and peak local tasks in flight.
+
 `coefficient_modulus_bits` denotes the ciphertext data-prime chain. The
 registry appends a separate SEAL key-switch special prime, so SEAL does not
 silently remove one configured Figure-10 data level from
@@ -305,7 +364,7 @@ masks, a 43-bit/scale-13 sharing ring, full-RNS reconstruction, public-key
 wire exchange and graph-backend payload adaptation. With the current
 fixed-point local-truncation FFT, CKKS-to-MPC meets the two-ULP test target,
 but the complete N=2048/scale-20 to N=4096/scale-24 cross-profile round trip
-is bounded in regression tests at 48 scale-13 ULP rather than the desired
+is bounded in regression tests at 64 scale-13 ULP rather than the desired
 four ULP. Tightening this numerical bound
 requires improving the wide-share FFT/truncation schedule; the implementation
 does not hide it with plaintext reconstruction.

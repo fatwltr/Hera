@@ -106,18 +106,58 @@ hera::HeraConfig TestConfig()
     return config;
 }
 
-hera::PhysicalSlotMap ComplexTestMap(std::size_t slots)
+hera::PhysicalSlotMap ComplexTestMap(std::size_t slots,
+                                     std::size_t ciphertext_count = 1)
 {
     hera::PhysicalSlotMap map;
-    map.ciphertext_count = 1;
+    map.ciphertext_count = ciphertext_count;
     map.slots_per_ciphertext = slots;
-    map.logical_element_count = 8;
-    map.assignments.resize(slots);
-    for (std::size_t i = 0; i < 4; ++i) {
-        map.assignments[i].real_logical_index = 2 * i;
-        map.assignments[i].imaginary_logical_index = 2 * i + 1;
+    map.logical_element_count = 8 * ciphertext_count;
+    map.assignments.resize(slots * ciphertext_count);
+    for (std::size_t ct = 0; ct < ciphertext_count; ++ct) {
+        for (std::size_t i = 0; i < 4; ++i) {
+            auto &assignment = map.assignments[ct * slots + i];
+            assignment.real_logical_index = 8 * ct + 2 * i;
+            assignment.imaginary_logical_index = 8 * ct + 2 * i + 1;
+        }
     }
     return map;
+}
+
+hera::ComplexMpcSharePair RetargetShares(
+    const hera::ComplexMpcSharePair &source,
+    const hera::PhysicalSlotMap &source_map,
+    const hera::PhysicalSlotMap &target_map)
+{
+    std::vector<std::uint64_t> logical(source_map.logical_element_count);
+    for (std::size_t physical = 0; physical < source_map.assignments.size();
+         ++physical) {
+        const auto assignment = source_map.assignments[physical];
+        if (assignment.real_logical_index != hera::kUnusedLogicalIndex)
+            logical[assignment.real_logical_index] =
+                source.real.local_share[physical];
+        if (assignment.imaginary_logical_index != hera::kUnusedLogicalIndex)
+            logical[assignment.imaginary_logical_index] =
+                source.imag.local_share[physical];
+    }
+    const auto count = target_map.assignments.size();
+    const auto shape = hera::TensorShape{{target_map.ciphertext_count,
+                                          target_map.slots_per_ciphertext}};
+    hera::ComplexMpcSharePair target{
+        {std::vector<std::uint64_t>(count), shape, source.real.numeric,
+         hera::ComplexComponent::kReal},
+        {std::vector<std::uint64_t>(count), shape, source.imag.numeric,
+         hera::ComplexComponent::kImaginary}};
+    for (std::size_t physical = 0; physical < count; ++physical) {
+        const auto assignment = target_map.assignments[physical];
+        if (assignment.real_logical_index != hera::kUnusedLogicalIndex)
+            target.real.local_share[physical] =
+                logical[assignment.real_logical_index];
+        if (assignment.imaginary_logical_index != hera::kUnusedLogicalIndex)
+            target.imag.local_share[physical] =
+                logical[assignment.imaginary_logical_index];
+    }
+    return target;
 }
 
 void WriteAll(int fd, const void *data, std::size_t bytes)
@@ -223,7 +263,7 @@ int main()
                     hera::PartyRole::kClient, {43, 13, 40, 24, true},
                     client_registry, transport,
                     hera::MakeDeterministicRandomSourceForTesting({9, 8, 7}),
-                    "127.0.0.1", 18300, 1);
+                    "127.0.0.1", 18300, 2);
                 hera::CryptoTensorStore store;
                 hera::ConversionPackingRegistry packing;
                 Require(packing.Register(input_he_spec, map).ok(),
@@ -315,6 +355,52 @@ int main()
                 // its independent two-ULP bound.
                 Require(maximum_error <= 64.0 / 8192.0,
                         "complex round-trip exceeds measured 64-ULP bound");
+                auto multi_shares = converter.CkksToMpc(std::nullopt);
+                Require(multi_shares.ok(), multi_shares.status().message());
+                Require(multi_shares.value().real.physical_shape ==
+                            hera::TensorShape{{3, slots}},
+                        "multi-ciphertext conversion lost physical shape");
+                hera::MpcToCkksTarget multi_target{
+                    "target_profile", 0, 24, hera::TensorShape{{24}},
+                    hera::Layout::kSpatial,
+                    ComplexTestMap(target_profile.slot_count(), 3)};
+                auto multi_output = converter.MpcToCkks(
+                    RetargetShares(multi_shares.value(),
+                                   ComplexTestMap(slots, 3),
+                                   multi_target.slot_map), multi_target);
+                Require(multi_output.ok(), multi_output.status().message());
+                Require(!multi_output.value().has_value(),
+                        "client received multi-ciphertext HE output");
+                for (std::size_t ct = 0; ct < 3; ++ct) {
+                    std::uint64_t multi_size = 0;
+                    ReadAll(result_pipe[0], &multi_size, sizeof(multi_size));
+                    Require(multi_size != 0 && multi_size <
+                                (std::uint64_t{1} << 30),
+                            "invalid multi-ciphertext result size");
+                    std::string multi_bytes(multi_size, '\0');
+                    ReadAll(result_pipe[0], multi_bytes.data(),
+                            multi_bytes.size());
+                    std::stringstream multi_stream(multi_bytes);
+                    seal::Ciphertext multi_result;
+                    multi_result.load(*target_profile.context, multi_stream);
+                    seal::Plaintext multi_plain;
+                    decryptor.decrypt(multi_result, multi_plain);
+                    target_encoder.decode(multi_plain, decoded);
+                    for (std::size_t i = 0; i < 4; ++i) {
+                        Require(std::abs(decoded[i].real() - clear[i].real()) <=
+                                    64.0 / 8192.0 &&
+                                    std::abs(decoded[i].imag() -
+                                             clear[i].imag()) <=
+                                        64.0 / 8192.0,
+                                "multi-ciphertext round-trip error");
+                    }
+                }
+                const auto client_stats = converter.stats();
+                Require(client_stats.transform_cache_hits >= 2 &&
+                            client_stats.transform_cache_misses == 2 &&
+                            client_stats.local_transform_tasks == 8 &&
+                            client_stats.local_transform_peak_inflight == 2,
+                        "client transform cache or pipeline was not exercised");
                 close(result_pipe[0]);
                 _exit(0);
             } catch (const std::exception &error) {
@@ -332,7 +418,7 @@ int main()
             capture);
         hera::CkksMpcConverter converter(
             hera::PartyRole::kServer, {43, 13, 40, 24, true},
-            server_registry, transport, server_random, "", 18300, 1);
+            server_registry, transport, server_random, "", 18300, 2);
         hera::CryptoTensorStore store;
         hera::ConversionPackingRegistry packing;
         Require(packing.Register(input_he_spec, map).ok(),
@@ -391,16 +477,47 @@ int main()
         const std::uint64_t size = bytes.size();
         WriteAll(result_pipe[1], &size, sizeof(size));
         WriteAll(result_pipe[1], bytes.data(), bytes.size());
+        hera::SealCipherBatch multi_batch{
+            "test_profile", {input, input, input},
+            hera::TensorShape{{24}}, hera::Layout::kSpatial,
+            ComplexTestMap(slots, 3)};
+        auto multi_shares = converter.CkksToMpc(multi_batch);
+        Require(multi_shares.ok(), multi_shares.status().message());
+        hera::MpcToCkksTarget multi_target{
+            "target_profile", 0, 24, hera::TensorShape{{24}},
+            hera::Layout::kSpatial,
+            ComplexTestMap(target_profile.slot_count(), 3)};
+        auto multi_output = converter.MpcToCkks(
+            RetargetShares(multi_shares.value(),
+                           multi_batch.slot_map, multi_target.slot_map),
+            multi_target);
+        Require(multi_output.ok(), multi_output.status().message());
+        Require(multi_output.value().has_value() &&
+                    multi_output.value()->ciphertexts.size() == 3,
+                "server multi-ciphertext output count mismatch");
+        for (const auto &ciphertext : multi_output.value()->ciphertexts) {
+            std::stringstream multi_stream;
+            ciphertext.save(multi_stream, seal::compr_mode_type::none);
+            const std::string multi_bytes = multi_stream.str();
+            const std::uint64_t multi_size = multi_bytes.size();
+            WriteAll(result_pipe[1], &multi_size, sizeof(multi_size));
+            WriteAll(result_pipe[1], multi_bytes.data(), multi_bytes.size());
+        }
         close(result_pipe[1]);
         int status = 0;
         waitpid(child, &status, 0);
         Require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "client conversion verification failed");
         const auto stats = converter.stats();
-        Require(stats.a_mask_bytes == 2048 * sizeof(std::uint64_t),
+        Require(stats.a_mask_bytes == 4 * 2048 * sizeof(std::uint64_t),
                 "A-domain mask accounting mismatch");
-        Require(stats.z_mask_bytes == 2 * slots * sizeof(std::uint64_t),
+        Require(stats.z_mask_bytes == 4 * 2 * slots * sizeof(std::uint64_t),
                 "Z-domain mask accounting mismatch");
+        Require(stats.transform_cache_hits >= 2 &&
+                    stats.transform_cache_misses == 2 &&
+                    stats.local_transform_tasks == 8 &&
+                    stats.local_transform_peak_inflight == 2,
+                "server transform cache or pipeline was not exercised");
         std::cout << "HERA_CONVERSION_PROTOCOL_STATUS=PASS\n";
         return 0;
     } catch (const std::exception &error) {

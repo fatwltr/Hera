@@ -75,7 +75,8 @@ public:
         const SealCipherBatch &shifted_scores,
         const HeContext &context,
         const SoftmaxConfig &config,
-        SoftmaxExecutionReport *report = nullptr);
+        SoftmaxExecutionReport *report = nullptr,
+        std::size_t he_workers = 1);
 };
 
 class MpcSoftmaxRuntime {

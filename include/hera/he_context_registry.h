@@ -50,7 +50,7 @@ struct SerializedProfilePublicMaterial {
 };
 
 struct SerializedPublicContextBundle {
-    std::uint32_t protocol_version{1};
+    std::uint32_t protocol_version{2};
     std::vector<SerializedProfilePublicMaterial> profiles;
 };
 
@@ -58,7 +58,9 @@ class HeContextRegistry {
 public:
     Result<void> CreateClientProfiles(const HeraConfig &config);
     Result<PublicContextBundle> ExportPublicBundle() const;
-    Result<SerializedPublicContextBundle> ExportSerializedPublicBundle() const;
+    Result<SerializedPublicContextBundle> ExportSerializedPublicBundle(
+        seal::compr_mode_type compression =
+            seal::compr_mode_type::none) const;
     Result<void> CreateServerProfiles(const HeraConfig &config,
                                       const PublicContextBundle &bundle);
     Result<void> CreateServerProfiles(

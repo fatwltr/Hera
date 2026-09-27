@@ -117,6 +117,35 @@ void TestExponent(const hera::HeraConfig &config)
         Require(std::abs(decoded[i] - expected) < 2e-3,
                 "Block-3 exponent approximation mismatch");
     }
+
+    // Force two independent HE ciphertexts through the bounded parallel
+    // path; both outputs must retain the same numerical and level contract.
+    hera::SealCipherBatch parallel_batch{
+        profile, {ciphertext, ciphertext},
+        {{1, 1, context.slot_count() + input.size()}},
+        hera::Layout::kSoftmaxRows,
+        hera::PhysicalSlotMap::DenseReal(
+            context.slot_count() + input.size(), context.slot_count())};
+    hera::SoftmaxExecutionReport parallel_report;
+    auto parallel_output = hera::SoftmaxExponentKernel::Evaluate(
+        parallel_batch, context, config.softmax, &parallel_report, 2);
+    Require(parallel_output.ok(), parallel_output.status().message());
+    Require(parallel_report.ciphertext_multiplications == 12 &&
+                parallel_report.rescales == 14,
+            "parallel Block-3 operation accounting is wrong");
+    for (const auto &computed : parallel_output.value().ciphertexts) {
+        Require(computed.parms_id() == context.context->last_parms_id(),
+                "parallel Block-3 output is not terminal-level");
+        decryptor.decrypt(computed, plain);
+        encoder.decode(plain, decoded);
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            const auto expected = std::pow(
+                1.0 + std::ldexp(input[i], -config.softmax.exp_divisor_bits),
+                std::uint64_t{1} << config.softmax.exp_squarings);
+            Require(std::abs(decoded[i] - expected) < 2e-3,
+                    "parallel Block-3 exponent mismatch");
+        }
+    }
 }
 
 void TestRowPacking(const hera::HeraConfig &root_config)

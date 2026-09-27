@@ -6,10 +6,12 @@
 #include <atomic>
 #include <complex>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace hera {
@@ -107,6 +109,64 @@ struct DenseVectorParameter {
     std::vector<double> values;
 };
 
+// Immutable model-specific projection program. The plaintext objects are
+// shared with the prepared plaintext pool, so an online kernel needs neither
+// to rebuild slot masks nor to hash their full contents for every product.
+struct PreparedProjectionTerm {
+    std::size_t source_ct{};
+    ComplexLane source_component{ComplexLane::kReal};
+    int baby_rotation{};
+    std::shared_ptr<const seal::Plaintext> plaintext;
+};
+
+struct PreparedProjectionGroup {
+    std::size_t target_ct{};
+    int giant_rotation{};
+    std::vector<PreparedProjectionTerm> terms;
+};
+
+struct PreparedProjectionPlan {
+    std::string profile;
+    seal::parms_id_type input_parms_id{};
+    double input_scale{};
+    HePackingPlan input_packing;
+    HePackingPlan output_packing;
+    std::vector<PreparedProjectionGroup> groups;
+    std::vector<std::shared_ptr<const seal::Plaintext>> bias_plaintexts;
+    bool bias_after_rescale{};
+    bool reuse_baby_rotations{};
+    int output_scale_bits{};
+    double scale_tolerance{1e-3};
+};
+
+struct PreparedProjectionCounts {
+    std::size_t rotations{};
+    std::size_t conjugations{};
+    std::size_t ciphertext_plain_multiplications{};
+    std::size_t rescales{};
+};
+
+struct PreparedProjectionRotationCache {
+    std::map<std::pair<std::size_t, ComplexLane>, seal::Ciphertext> bases;
+    std::map<std::tuple<std::size_t, ComplexLane, int>, seal::Ciphertext> babies;
+};
+
+Result<std::vector<seal::Ciphertext>> EvaluatePreparedProjection(
+    const PreparedProjectionPlan &plan, const SealCipherTensor &input,
+    const HeContext &context, PreparedProjectionCounts *counts = nullptr,
+    PreparedProjectionRotationCache *rotation_cache = nullptr);
+Result<std::shared_ptr<const seal::Plaintext>> CompileModelPlaintext(
+    seal::CKKSEncoder &encoder,
+    const std::vector<std::complex<double>> &values,
+    const seal::parms_id_type &parms_id, double scale,
+    std::string_view kernel_tag);
+
+bool SamePreparedPacking(const HePackingPlan &left,
+                         const HePackingPlan &right);
+Result<void> ValidatePreparedProjection(
+    const PreparedProjectionPlan &plan, const SealCipherTensor &input,
+    const HeContext &context);
+
 class SealPlainParameterStore {
 public:
     Result<void> PutMatrix(const WeightHandle &handle,
@@ -115,6 +175,12 @@ public:
                            std::vector<double> values);
     Result<DenseMatrixParameter> GetMatrix(WeightId id) const;
     Result<DenseVectorParameter> GetVector(PlainParameterId id) const;
+    // Stable immutable views for the online path. A dense model matrix must
+    // not be copied for every inference or every projection invocation.
+    Result<std::shared_ptr<const DenseMatrixParameter>> GetMatrixShared(
+        WeightId id) const;
+    Result<std::shared_ptr<const DenseVectorParameter>> GetVectorShared(
+        PlainParameterId id) const;
 
     // Benchmark-only mode: compatible projection diagonals are mapped to a
     // bounded pool of encoded plaintext templates. This preserves HE call
@@ -123,9 +189,13 @@ public:
         std::size_t templates_per_compatibility_group);
     void BeginPlaintextPreparation();
     void FreezePlaintextCache();
+    void AbortPlaintextPreparation() noexcept;
+    bool preparing_plaintexts() const noexcept;
     bool plaintext_cache_frozen() const noexcept;
     std::size_t encoded_plaintext_count() const;
     std::size_t encoded_plaintext_bytes() const;
+    std::size_t prepared_projection_count() const;
+    std::size_t prepared_projection_hits() const;
     std::size_t plaintext_cache_hits() const;
     std::size_t virtual_weight_template_count() const noexcept;
     std::size_t virtual_weight_requests() const noexcept;
@@ -135,6 +205,16 @@ public:
         seal::CKKSEncoder &encoder, const std::vector<double> &values,
         const seal::parms_id_type &parms_id, double scale,
         std::string_view kernel_tag);
+
+    Result<std::shared_ptr<const seal::Plaintext>> PrepareModelPlaintext(
+        seal::CKKSEncoder &encoder,
+        const std::vector<std::complex<double>> &values,
+        const seal::parms_id_type &parms_id, double scale,
+        std::string_view kernel_tag);
+    Result<void> PutPreparedProjection(
+        std::string key, std::shared_ptr<const PreparedProjectionPlan> plan);
+    Result<std::shared_ptr<const PreparedProjectionPlan>> GetPreparedProjection(
+        std::string_view key) const;
     Result<seal::Plaintext> EncodeModelPlaintext(
         seal::CKKSEncoder &encoder,
         const std::vector<std::complex<double>> &values,
@@ -143,9 +223,14 @@ public:
 
 private:
     mutable std::mutex mutex_;
-    std::map<WeightId, DenseMatrixParameter> matrices_;
-    std::map<PlainParameterId, DenseVectorParameter> vectors_;
-    std::map<std::string, seal::Plaintext> encoded_plaintexts_;
+    std::map<WeightId, std::shared_ptr<const DenseMatrixParameter>> matrices_;
+    std::map<PlainParameterId, std::shared_ptr<const DenseVectorParameter>> vectors_;
+    std::map<std::string, std::shared_ptr<const seal::Plaintext>> encoded_plaintexts_;
+    std::map<std::string, std::shared_ptr<const seal::Plaintext>> staged_plaintexts_;
+    std::map<std::string, std::shared_ptr<const PreparedProjectionPlan>>
+        prepared_projections_;
+    std::map<std::string, std::shared_ptr<const PreparedProjectionPlan>>
+        staged_projections_;
     bool preparing_plaintexts_{};
     bool plaintext_cache_frozen_{};
     std::size_t encoded_plaintext_bytes_{};
@@ -153,6 +238,11 @@ private:
     std::size_t virtual_weight_template_count_{};
     std::size_t virtual_weight_requests_{};
     std::size_t virtual_weight_cache_hits_{};
+    std::size_t staged_encoded_plaintext_bytes_{};
+    std::size_t staged_plaintext_cache_hits_{};
+    std::size_t staged_virtual_weight_requests_{};
+    std::size_t staged_virtual_weight_cache_hits_{};
+    mutable std::size_t prepared_projection_hits_{};
 };
 
 // Runtime-only lexical binding used by the reusable kernels. Standalone
@@ -161,6 +251,7 @@ private:
 // hard error rather than an online encode fallback.
 class ModelPlaintextCacheScope {
 public:
+    static std::pair<SealPlainParameterStore *, std::string> Current();
     explicit ModelPlaintextCacheScope(
         SealPlainParameterStore *store, std::string key_namespace = {});
     ~ModelPlaintextCacheScope();
@@ -253,6 +344,11 @@ private:
 
 class MultiHeadQkKernel {
 public:
+    // Exact automorphism offsets for the standalone QK kernel. Step zero
+    // requests complex conjugation; key generation is outside benchmarks.
+    static Result<std::vector<int>> RequiredRotationSteps(
+        const TransformerLayerConfig &layer, std::size_t slot_count);
+
     // Computes Q_h*K_h^T with GQA/MQA physical head mapping. The public
     // 1/sqrt(head_width) factor must already be folded into Q. Output uses
     // attention-diagonal packing at the terminal Block-2 level.
@@ -260,7 +356,8 @@ public:
         const SealCipherTensor &q, const SealCipherTensor &k,
         const TransformerLayerConfig &layer,
         const HeContext &context,
-        Block2ExecutionReport *report = nullptr);
+        Block2ExecutionReport *report = nullptr,
+        std::size_t he_workers = 1);
 };
 
 // True SEAL CKKS implementation of Figure-10 Block 2. It owns no secret key,
@@ -272,11 +369,20 @@ public:
                        const TransformerLayerConfig &layer,
                        HeContextRegistry &contexts,
                        SealCipherTensorStore &tensors,
-                       SealPlainParameterStore &parameters);
+                       SealPlainParameterStore &parameters,
+                       const std::vector<int> *required_rotations = nullptr);
 
     static Result<std::vector<int>> RequiredRotationSteps(
         const TransformerLayerConfig &layer,
         const HeParameterConfig &parameters);
+
+    // Variant for callers that provide a non-default spatial packing. The
+    // returned set contains every exact offset used by Q/K/V projection and
+    // QK; compiling it makes each logical rotation one SEAL key-switch.
+    static Result<std::vector<int>> RequiredRotationSteps(
+        const TransformerLayerConfig &layer,
+        const HeParameterConfig &parameters,
+        const HePackingPlan &input_packing);
 
     Result<Block2HeOutputs> Evaluate(
         const Block2HeInputs &inputs,
@@ -289,6 +395,7 @@ private:
     HeContextRegistry &contexts_;
     SealCipherTensorStore &tensors_;
     SealPlainParameterStore &parameters_;
+    const std::vector<int> *required_rotations_{};
 };
 
 } // namespace hera

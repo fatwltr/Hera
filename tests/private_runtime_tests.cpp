@@ -174,6 +174,56 @@ void TestVirtualWeightPlaintextPool()
         "layer2/attention.wo.diagonal");
     Require(online_hit.ok() && store.virtual_weight_cache_hits() == 2,
             "frozen virtual cache did not reuse its prepared template");
+
+    store.BeginPlaintextPreparation();
+    auto staged = store.EncodeModelPlaintext(
+        encoder, third, parms_id, scale, "layer3/ffn.ln2.beta");
+    Require(staged.ok() && store.encoded_plaintext_count() == 1,
+            "replacement preparation did not use an isolated cache");
+    store.AbortPlaintextPreparation();
+    Require(store.plaintext_cache_frozen() &&
+                store.encoded_plaintext_count() == 3,
+            "aborted preparation destroyed the active model cache");
+    Require(store.EncodeModelPlaintext(
+        encoder, first, parms_id, scale, "layer0/ffn.ln2.beta").ok(),
+        "aborted preparation lost an existing plaintext");
+    Require(!store.EncodeModelPlaintext(
+        encoder, third, parms_id, scale, "layer3/ffn.ln2.beta").ok(),
+        "aborted preparation allowed online encoding");
+}
+
+void TestCompiledExecutionPlan()
+{
+    auto config = MakeConfig();
+    auto second_layer = config.layers.front();
+    second_layer.id = "layer1";
+    config.layers.push_back(second_layer);
+    auto second_execution = config.layer_execution.front();
+    second_execution.layer_id = second_layer.id;
+    config.layer_execution.push_back(second_execution);
+
+    auto compiled = hera::CompiledTransformerExecutionPlan::Compile(config);
+    Require(compiled.ok(), compiled.status().message());
+    Require(compiled.value().layers.size() == 2,
+            "compiled plan omitted a Transformer layer");
+    for (const auto &layer : compiled.value().layers) {
+        Require(layer.statistics_input_level == 1 &&
+                    layer.qk_projection_input_level == 3 &&
+                    layer.attention_scores_level == 9 &&
+                    layer.retained_value_level == 2,
+                "compiled plan has an incorrect level boundary");
+        Require(!layer.block2_rotation_steps.empty(),
+                "compiled Block 2 rotation plan is empty");
+    }
+    auto runtime_steps =
+        hera::SealSciTransformerRuntime::RequiredRotationSteps(config);
+    Require(runtime_steps.ok() &&
+                runtime_steps.value() ==
+                    compiled.value().rotation_steps_by_profile,
+            "runtime key generation diverged from the compiled plan");
+    config.layers.front().norm = hera::NormPlacement::kPostNorm;
+    Require(!hera::CompiledTransformerExecutionPlan::Compile(config).ok(),
+            "unsupported Post-LN config unexpectedly compiled");
 }
 
 PartyResult RunParty(
@@ -246,6 +296,11 @@ PartyResult RunParty(
         hera::ExecutionReport report;
         auto output = transformer.value().Evaluate(input, weights, &report);
         if (!output.ok()) return {false, {}, output.status().message()};
+        if (role == hera::PartyRole::kServer &&
+            parameters.encoded_plaintext_count() !=
+                preparation.encoded_plaintext_count)
+            return {false, {},
+                    "online inference encoded a new model plaintext"};
         Require(report.stages.size() == config.layers.size() * 5,
                 "runtime did not report five fused stages per layer");
         const auto expected_he = role == hera::PartyRole::kServer
@@ -343,7 +398,9 @@ int main()
 {
     try {
         TestVirtualWeightPlaintextPool();
+        TestCompiledExecutionPlan();
         auto two_layers = MakeConfig();
+        two_layers.threads = 3;
         auto second_layer = two_layers.layers.front();
         second_layer.id = "layer1";
         two_layers.layers.push_back(second_layer);

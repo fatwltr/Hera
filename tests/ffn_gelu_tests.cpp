@@ -193,6 +193,32 @@ void TestPacking()
             "FFN packing plan is invalid");
 }
 
+void TestImmutableParameterViews()
+{
+    hera::SealPlainParameterStore store;
+    hera::WeightHandle matrix{4101, {"shared-Wu", 2, 3, true}};
+    hera::PlainParameterHandle vector{4102, {"shared-gamma", 3}};
+    Require(store.PutMatrix(matrix, {1, 2, 3, 4, 5, 6}).ok() &&
+                store.PutVector(vector, {0.5, 1.0, 1.5}).ok(),
+            "cannot register immutable parameter views");
+    auto first_matrix = store.GetMatrixShared(matrix.id);
+    auto second_matrix = store.GetMatrixShared(matrix.id);
+    auto first_vector = store.GetVectorShared(vector.id);
+    auto second_vector = store.GetVectorShared(vector.id);
+    Require(first_matrix.ok() && second_matrix.ok() &&
+                first_vector.ok() && second_vector.ok(),
+            "cannot load immutable parameter views");
+    Require(first_matrix.value().get() == second_matrix.value().get() &&
+                first_vector.value().get() == second_vector.value().get(),
+            "online parameter lookup copied a registered payload");
+    Require(first_matrix.value()->row_major[5] == 6.0 &&
+                first_vector.value()->values[2] == 1.5,
+            "immutable parameter view changed its values");
+    Require(!store.GetMatrixShared(999999).ok() &&
+                !store.GetVectorShared(999999).ok(),
+            "missing immutable parameter was accepted");
+}
+
 void TestHeKernels()
 {
     auto config = MakeConfig();
@@ -416,6 +442,45 @@ void TestHeKernels()
                 MaxError(Decrypt(polynomials.value().positive_branch,
                                  client_context), expected_f1) < 1.0e-2,
             "HE GeLU branch error exceeds 1e-2");
+    auto parallel_input = real.value();
+    parallel_input.ciphertexts.push_back(
+        parallel_input.ciphertexts.front());
+    parallel_input.logical_spec.shape =
+        {{layer.tokens, 2 * layer.ffn_width}};
+    auto &parallel_packing = parallel_input.physical_packing;
+    const auto original_packing = real.value().physical_packing;
+    parallel_packing.logical_shape = parallel_input.logical_spec.shape;
+    parallel_packing.ciphertext_count = 2;
+    parallel_packing.logical_locations.resize(
+        layer.tokens * 2 * layer.ffn_width);
+    std::vector<double> parallel_f0(
+        layer.tokens * 2 * layer.ffn_width);
+    std::vector<double> parallel_f1(parallel_f0.size());
+    for (std::size_t token = 0; token < layer.tokens; ++token)
+        for (std::size_t feature = 0; feature < layer.ffn_width; ++feature)
+            for (std::size_t copy = 0; copy < 2; ++copy) {
+                const auto old_index = token * layer.ffn_width + feature;
+                const auto new_index = token * 2 * layer.ffn_width +
+                    copy * layer.ffn_width + feature;
+                auto location = original_packing.Locations(old_index).front();
+                location.ciphertext = copy;
+                parallel_packing.logical_locations[new_index] = {location};
+                parallel_f0[new_index] = expected_f0[old_index];
+                parallel_f1[new_index] = expected_f1[old_index];
+            }
+    hera::FfnGeluExecutionReport parallel_report;
+    auto parallel_polynomials = hera::GeluPolynomialKernel::Evaluate(
+        parallel_input, config.gelu, server_context, &parallel_report, 2);
+    Require(parallel_polynomials.ok(),
+            parallel_polynomials.status().message());
+    Require(parallel_report.ciphertext_multiplications == 6 &&
+                parallel_report.ciphertext_plain_multiplications == 12,
+            "parallel GeLU operation accounting is wrong");
+    Require(MaxError(Decrypt(parallel_polynomials.value().negative_branch,
+                             client_context), parallel_f0) < 1.0e-2 &&
+                MaxError(Decrypt(parallel_polynomials.value().positive_branch,
+                                 client_context), parallel_f1) < 1.0e-2,
+            "parallel GeLU branch error exceeds 1e-2");
     for (const auto *tensor : {&polynomials.value().input,
                                &polynomials.value().negative_branch,
                                &polynomials.value().positive_branch})
@@ -426,6 +491,118 @@ void TestHeKernels()
     Require(report.ciphertext_multiplications != 0 &&
                 report.relinearizations != 0 && report.rescales != 0,
             "FFN HE operation report is empty");
+}
+
+void TestParallelColumnProjection()
+{
+    auto config = MakeConfig();
+    const auto &profile = config.he_parameter_profiles.at("ffn");
+    constexpr std::size_t tokens = 128;
+    constexpr std::size_t input_width = 4;
+    constexpr std::size_t output_width = 65;
+    auto input_plan = hera::FfnGeluPackingPlanner::ComplexColumns(
+        {{tokens, input_width}}, profile.polynomial_degree / 2,
+        hera::Layout::kComplexStrictColumn);
+    auto output_plan = hera::FfnGeluPackingPlanner::ComplexColumns(
+        {{tokens, output_width}}, profile.polynomial_degree / 2,
+        hera::Layout::kComplexStrictColumn);
+    Require(input_plan.ok() && output_plan.ok(),
+            "parallel projection packing failed");
+    Require(output_plan.value().ciphertext_count > 1,
+            "parallel projection test needs multiple output groups");
+    auto steps = hera::ComplexColumnProjectionKernel::RequiredRotationSteps(
+        input_plan.value(), output_plan.value());
+    Require(steps.ok(), steps.status().message());
+    hera::HeContextRegistry client;
+    Require(client.CreateClientProfiles(config).ok(),
+            "parallel projection client setup failed");
+    Require(client.CompileRotationKeys("ffn", steps.value()).ok(),
+            "parallel projection rotation keys failed");
+    auto bundle = client.ExportPublicBundle();
+    Require(bundle.ok(), bundle.status().message());
+    hera::HeContextRegistry server;
+    Require(server.CreateServerProfiles(config, bundle.value()).ok(),
+            "parallel projection server setup failed");
+    const auto &client_context = client.Require("ffn", hera::PartyRole::kClient);
+    const auto &server_context = server.Require("ffn", hera::PartyRole::kServer);
+    std::vector<double> values(tokens * input_width);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        values[i] = (static_cast<int>(i % 9) - 4) * 0.004;
+    auto input = Encrypt(values, input_plan.value(), client_context,
+                         hera::Layout::kComplexStrictColumn, 2);
+    std::vector<double> weight_values(input_width * output_width);
+    for (std::size_t i = 0; i < weight_values.size(); ++i)
+        weight_values[i] = (static_cast<int>(i % 7) - 3) * 0.006;
+    hera::DenseMatrixParameter weights{
+        {"parallel", input_width, output_width, true}, weight_values};
+    hera::HeKernelOperationCounts serial_counts, parallel_counts;
+    auto serial = hera::ComplexColumnProjectionKernel::Evaluate(
+        input, weights, std::nullopt, output_plan.value(),
+        hera::HeRegionId::kRegion5, profile.default_scale_bits,
+        server_context, &serial_counts, 1);
+    auto parallel = hera::ComplexColumnProjectionKernel::Evaluate(
+        input, weights, std::nullopt, output_plan.value(),
+        hera::HeRegionId::kRegion5, profile.default_scale_bits,
+        server_context, &parallel_counts, 2);
+    Require(serial.ok() && parallel.ok(),
+            serial.ok() ? parallel.status().message() : serial.status().message());
+    Require(MaxError(Decrypt(serial.value(), client_context),
+                     Decrypt(parallel.value(), client_context)) < 1e-4,
+            "parallel column projection differs from serial");
+    Require(serial_counts.rotations == parallel_counts.rotations &&
+                serial_counts.ciphertext_plain_multiplications ==
+                    parallel_counts.ciphertext_plain_multiplications &&
+                serial_counts.rescales == parallel_counts.rescales,
+            "parallel column projection changed operation counts");
+
+    hera::SealPlainParameterStore prepared_store;
+    prepared_store.BeginPlaintextPreparation();
+    {
+        hera::ModelPlaintextCacheScope scope(&prepared_store, "layer0");
+        auto metadata = input;
+        for (auto &ct : metadata.ciphertexts) {
+            const auto id = ct.parms_id();
+            const auto scale = ct.scale();
+            ct = seal::Ciphertext();
+            ct.parms_id() = id;
+            ct.scale() = scale;
+        }
+        auto compiled = hera::ComplexColumnProjectionKernel::Evaluate(
+            metadata, weights, std::nullopt, output_plan.value(),
+            hera::HeRegionId::kRegion5, profile.default_scale_bits,
+            server_context);
+        Require(compiled.ok(), compiled.status().message());
+    }
+    Require(prepared_store.prepared_projection_count() == 1,
+            "Prepare did not compile the column projection plan");
+    prepared_store.FreezePlaintextCache();
+    hera::HeKernelOperationCounts cached_counts;
+    {
+        hera::ModelPlaintextCacheScope scope(&prepared_store, "layer0");
+        auto cached = hera::ComplexColumnProjectionKernel::Evaluate(
+            input, weights, std::nullopt, output_plan.value(),
+            hera::HeRegionId::kRegion5, profile.default_scale_bits,
+            server_context, &cached_counts, 2);
+        Require(cached.ok(), cached.status().message());
+        Require(MaxError(Decrypt(serial.value(), client_context),
+                         Decrypt(cached.value(), client_context)) < 1e-4,
+                "cached projection differs from uncached projection");
+        auto wrong_level = input;
+        seal::Evaluator evaluator(*server_context.context);
+        for (auto &ciphertext : wrong_level.ciphertexts)
+            evaluator.mod_switch_to_next_inplace(ciphertext);
+        auto rejected = hera::ComplexColumnProjectionKernel::Evaluate(
+            wrong_level, weights, std::nullopt, output_plan.value(),
+            hera::HeRegionId::kRegion5, profile.default_scale_bits,
+            server_context);
+        Require(!rejected.ok(), "cached projection accepted a wrong level");
+    }
+    Require(prepared_store.prepared_projection_hits() == 2,
+            "cached projection lookup count is wrong");
+    Require(cached_counts.rotations == serial_counts.rotations &&
+                cached_counts.ciphertext_plain_multiplications ==
+                    serial_counts.ciphertext_plain_multiplications,
+            "cached projection changed HE operation counts");
 }
 
 std::uint64_t Encode(double value)
@@ -780,7 +957,9 @@ int main()
 {
     try {
         TestPacking();
+        TestImmutableParameterViews();
         TestHeKernels();
+        TestParallelColumnProjection();
         TestMpcGelu();
         TestIntegratedExecutor();
         std::cout << "FFN_GELU_STATUS=PASS\n";

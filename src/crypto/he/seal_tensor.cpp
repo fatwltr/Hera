@@ -1,11 +1,13 @@
 #include "hera/block2_he.h"
 
 #include <limits>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
+#include <tuple>
 
 namespace hera {
 namespace {
@@ -140,6 +142,12 @@ Result<std::vector<Tile>> MakeTiles(std::size_t tokens,
 
 } // namespace
 
+std::pair<SealPlainParameterStore *, std::string>
+ModelPlaintextCacheScope::Current()
+{
+    return {g_model_plaintext_store, g_model_plaintext_namespace};
+}
+
 ModelPlaintextCacheScope::ModelPlaintextCacheScope(
     SealPlainParameterStore *store, std::string key_namespace)
     : previous_(g_model_plaintext_store),
@@ -153,6 +161,182 @@ ModelPlaintextCacheScope::~ModelPlaintextCacheScope()
 {
     g_model_plaintext_store = previous_;
     g_model_plaintext_namespace = std::move(previous_namespace_);
+}
+
+bool SamePreparedPacking(const HePackingPlan &left,
+                         const HePackingPlan &right)
+{
+    if (left.layout != right.layout ||
+        left.logical_shape != right.logical_shape ||
+        left.slot_count != right.slot_count ||
+        left.ciphertext_count != right.ciphertext_count ||
+        left.logical_locations.size() != right.logical_locations.size())
+        return false;
+    for (std::size_t i = 0; i < left.logical_locations.size(); ++i) {
+        const auto &a = left.logical_locations[i];
+        const auto &b = right.logical_locations[i];
+        if (a.size() != b.size()) return false;
+        for (std::size_t j = 0; j < a.size(); ++j)
+            if (a[j].ciphertext != b[j].ciphertext ||
+                a[j].slot != b[j].slot ||
+                a[j].component != b[j].component ||
+                a[j].packed_query_head != b[j].packed_query_head)
+                return false;
+    }
+    return true;
+}
+
+Result<void> ValidatePreparedProjection(
+    const PreparedProjectionPlan &plan, const SealCipherTensor &input,
+    const HeContext &context)
+{
+    if (plan.profile != context.profile ||
+        input.parameter_profile != context.profile ||
+        !SamePreparedPacking(plan.input_packing, input.physical_packing) ||
+        input.ciphertexts.size() != plan.input_packing.ciphertext_count)
+        return Status::FailedPrecondition(
+            "prepared projection profile or input packing mismatch");
+    for (const auto &ciphertext : input.ciphertexts)
+        if (ciphertext.parms_id() != plan.input_parms_id ||
+            !std::isfinite(ciphertext.scale()) ||
+            std::abs(ciphertext.scale() / plan.input_scale - 1.0) > 1e-6)
+            return Status::FailedPrecondition(
+                "prepared projection input level or scale mismatch");
+    return {};
+}
+
+Result<std::shared_ptr<const seal::Plaintext>> CompileModelPlaintext(
+    seal::CKKSEncoder &encoder,
+    const std::vector<std::complex<double>> &values,
+    const seal::parms_id_type &parms_id, double scale,
+    std::string_view kernel_tag)
+{
+    if (g_model_plaintext_store) {
+        const auto tag = g_model_plaintext_namespace.empty()
+            ? std::string(kernel_tag)
+            : g_model_plaintext_namespace + "/" + std::string(kernel_tag);
+        return g_model_plaintext_store->PrepareModelPlaintext(
+            encoder, values, parms_id, scale, tag);
+    }
+    seal::Plaintext plain;
+    encoder.encode(values, parms_id, scale, plain);
+    return std::make_shared<const seal::Plaintext>(std::move(plain));
+}
+
+Result<std::vector<seal::Ciphertext>> EvaluatePreparedProjection(
+    const PreparedProjectionPlan &plan, const SealCipherTensor &input,
+    const HeContext &context, PreparedProjectionCounts *counts,
+    PreparedProjectionRotationCache *rotation_cache)
+{
+    auto valid = ValidatePreparedProjection(plan, input, context);
+    if (!valid.ok()) return valid.status();
+    if (plan.bias_plaintexts.size() != plan.output_packing.ciphertext_count)
+        return Status::Internal("prepared projection bias group count mismatch");
+    try {
+        seal::Evaluator evaluator(*context.context);
+        PreparedProjectionRotationCache local_cache;
+        auto &cache = rotation_cache ? *rotation_cache : local_cache;
+        auto &bases = cache.bases;
+        auto &babies = cache.babies;
+        std::vector<seal::Ciphertext> output(
+            plan.output_packing.ciphertext_count);
+        std::vector<bool> initialized(output.size(), false);
+        auto rotated = [&](const seal::Ciphertext &source, int step) {
+            seal::Ciphertext result = source;
+            const auto slots = static_cast<long long>(context.slot_count());
+            long long canonical = static_cast<long long>(step) % slots;
+            if (canonical > slots / 2) canonical -= slots;
+            if (canonical <= -slots / 2) canonical += slots;
+            if (canonical != 0) {
+                evaluator.rotate_vector_inplace(result,
+                                                static_cast<int>(canonical),
+                                                context.galois_keys);
+                if (counts) ++counts->rotations;
+            }
+            return result;
+        };
+        for (const auto &group : plan.groups) {
+            if (group.target_ct >= output.size() || group.terms.empty())
+                return Status::Internal("prepared projection group is invalid");
+            seal::Ciphertext group_sum;
+            bool first_term = true;
+            for (const auto &term : group.terms) {
+                if (!term.plaintext ||
+                    term.source_ct >= input.ciphertexts.size())
+                    return Status::Internal("prepared projection term is invalid");
+                const auto base_key = std::make_pair(
+                    term.source_ct, term.source_component);
+                auto base = bases.find(base_key);
+                if (base == bases.end()) {
+                    const auto &source = input.ciphertexts[term.source_ct];
+                    seal::Ciphertext conjugated, extracted;
+                    evaluator.complex_conjugate(source, context.galois_keys,
+                                                conjugated);
+                    if (term.source_component == ComplexLane::kReal)
+                        evaluator.add(source, conjugated, extracted);
+                    else
+                        evaluator.sub(source, conjugated, extracted);
+                    base = bases.emplace(base_key, std::move(extracted)).first;
+                    if (counts) ++counts->conjugations;
+                }
+                seal::Ciphertext baby;
+                if (plan.reuse_baby_rotations) {
+                    const auto baby_key = std::make_tuple(
+                        term.source_ct, term.source_component,
+                        term.baby_rotation);
+                    auto saved = babies.find(baby_key);
+                    if (saved == babies.end())
+                        saved = babies.emplace(
+                            baby_key,
+                            rotated(base->second, term.baby_rotation)).first;
+                    baby = saved->second;
+                } else {
+                    baby = rotated(base->second, term.baby_rotation);
+                }
+                seal::Ciphertext product;
+                evaluator.multiply_plain(baby, *term.plaintext, product);
+                if (counts) ++counts->ciphertext_plain_multiplications;
+                if (first_term) {
+                    group_sum = std::move(product);
+                    first_term = false;
+                } else {
+                    evaluator.add_inplace(group_sum, product);
+                }
+            }
+            if (group.giant_rotation != 0)
+                group_sum = rotated(group_sum, group.giant_rotation);
+            if (!initialized[group.target_ct]) {
+                output[group.target_ct] = std::move(group_sum);
+                initialized[group.target_ct] = true;
+            } else {
+                evaluator.add_inplace(output[group.target_ct], group_sum);
+            }
+        }
+        const double target = std::ldexp(1.0, plan.output_scale_bits);
+        for (std::size_t ct = 0; ct < output.size(); ++ct) {
+            if (!initialized[ct])
+                return Status::Internal(
+                    "prepared projection output group is empty");
+            if (!plan.bias_after_rescale && plan.bias_plaintexts[ct])
+                evaluator.add_plain_inplace(output[ct],
+                                            *plan.bias_plaintexts[ct]);
+            evaluator.rescale_to_next_inplace(output[ct]);
+            if (!std::isfinite(output[ct].scale()) ||
+                std::abs(output[ct].scale() / target - 1.0) >
+                    plan.scale_tolerance)
+                return Status::FailedPrecondition(
+                    "prepared projection output scale drift");
+            output[ct].scale() = target;
+            if (counts) ++counts->rescales;
+            if (plan.bias_after_rescale && plan.bias_plaintexts[ct])
+                evaluator.add_plain_inplace(output[ct],
+                                            *plan.bias_plaintexts[ct]);
+        }
+        return output;
+    } catch (const std::exception &error) {
+        return Status::Internal(std::string("prepared projection failed: ") +
+                                error.what());
+    }
 }
 
 template <typename Value>
@@ -444,13 +628,10 @@ ComplexDiagonalProjectionPlanner::Build(
     else
         return Status::Invalid(
             "complex diagonal projection requires Q, K, or V output");
+    // Exact projection offsets depend on the caller's physical input
+    // packing. SealBlock2Executor::RequiredRotationSteps computes them once
+    // that packing is known; do not advertise a binary decomposition here.
     std::vector<int> rotations;
-    for (std::size_t power = 1; power <= slot_count / 2; power <<= 1U) {
-        rotations.push_back(static_cast<int>(power));
-        if (power != slot_count / 2)
-            rotations.push_back(-static_cast<int>(power));
-        if (power > slot_count / 4) break;
-    }
     return ComplexDiagonalProjectionPlan{
         layer.model_width, output_columns, output_layout,
         output_layout != Layout::kMultiHeadQ &&
@@ -531,9 +712,9 @@ Result<void> SealPlainParameterStore::PutMatrix(
     if (row_major.size() != handle.spec.rows * handle.spec.columns)
         return Status::Invalid(handle.spec.name + ": matrix payload size mismatch");
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!matrices_.emplace(handle.id,
-                           DenseMatrixParameter{handle.spec,
-                                                std::move(row_major)}).second)
+    auto parameter = std::make_shared<const DenseMatrixParameter>(
+        DenseMatrixParameter{handle.spec, std::move(row_major)});
+    if (!matrices_.emplace(handle.id, std::move(parameter)).second)
         return Status::FailedPrecondition("matrix parameter ID already exists");
     return {};
 }
@@ -545,9 +726,9 @@ Result<void> SealPlainParameterStore::PutVector(
     if (values.size() != handle.spec.length)
         return Status::Invalid(handle.spec.name + ": vector payload size mismatch");
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!vectors_.emplace(handle.id,
-                          DenseVectorParameter{handle.spec,
-                                               std::move(values)}).second)
+    auto parameter = std::make_shared<const DenseVectorParameter>(
+        DenseVectorParameter{handle.spec, std::move(values)});
+    if (!vectors_.emplace(handle.id, std::move(parameter)).second)
         return Status::FailedPrecondition("vector parameter ID already exists");
     return {};
 }
@@ -559,11 +740,31 @@ Result<DenseMatrixParameter> SealPlainParameterStore::GetMatrix(
     const auto found = matrices_.find(id);
     if (found == matrices_.end())
         return Status::NotFound("matrix parameter payload is not registered");
-    return found->second;
+    return *found->second;
 }
 
 Result<DenseVectorParameter> SealPlainParameterStore::GetVector(
     PlainParameterId id) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = vectors_.find(id);
+    if (found == vectors_.end())
+        return Status::NotFound("vector parameter payload is not registered");
+    return *found->second;
+}
+
+Result<std::shared_ptr<const DenseMatrixParameter>>
+SealPlainParameterStore::GetMatrixShared(WeightId id) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = matrices_.find(id);
+    if (found == matrices_.end())
+        return Status::NotFound("matrix parameter payload is not registered");
+    return found->second;
+}
+
+Result<std::shared_ptr<const DenseVectorParameter>>
+SealPlainParameterStore::GetVectorShared(PlainParameterId id) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = vectors_.find(id);
@@ -587,20 +788,42 @@ Result<void> SealPlainParameterStore::ConfigureVirtualWeightPlaintexts(
 void SealPlainParameterStore::BeginPlaintextPreparation()
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    encoded_plaintexts_.clear();
-    encoded_plaintext_bytes_ = 0;
-    plaintext_cache_hits_ = 0;
-    virtual_weight_requests_ = 0;
-    virtual_weight_cache_hits_ = 0;
+    staged_plaintexts_.clear();
+    staged_projections_.clear();
+    staged_encoded_plaintext_bytes_ = 0;
+    staged_plaintext_cache_hits_ = 0;
+    staged_virtual_weight_requests_ = 0;
+    staged_virtual_weight_cache_hits_ = 0;
     preparing_plaintexts_ = true;
-    plaintext_cache_frozen_ = false;
 }
 
 void SealPlainParameterStore::FreezePlaintextCache()
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!preparing_plaintexts_) return;
+    encoded_plaintexts_.swap(staged_plaintexts_);
+    staged_plaintexts_.clear();
+    prepared_projections_.swap(staged_projections_);
+    staged_projections_.clear();
+    prepared_projection_hits_ = 0;
+    encoded_plaintext_bytes_ = staged_encoded_plaintext_bytes_;
+    plaintext_cache_hits_ = staged_plaintext_cache_hits_;
+    virtual_weight_requests_ = staged_virtual_weight_requests_;
+    virtual_weight_cache_hits_ = staged_virtual_weight_cache_hits_;
     preparing_plaintexts_ = false;
     plaintext_cache_frozen_ = true;
+}
+
+void SealPlainParameterStore::AbortPlaintextPreparation() noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    staged_plaintexts_.clear();
+    staged_projections_.clear();
+    staged_encoded_plaintext_bytes_ = 0;
+    staged_plaintext_cache_hits_ = 0;
+    staged_virtual_weight_requests_ = 0;
+    staged_virtual_weight_cache_hits_ = 0;
+    preparing_plaintexts_ = false;
 }
 
 bool SealPlainParameterStore::plaintext_cache_frozen() const noexcept
@@ -609,22 +832,44 @@ bool SealPlainParameterStore::plaintext_cache_frozen() const noexcept
     return plaintext_cache_frozen_;
 }
 
+bool SealPlainParameterStore::preparing_plaintexts() const noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return preparing_plaintexts_;
+}
+
 std::size_t SealPlainParameterStore::encoded_plaintext_count() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return encoded_plaintexts_.size();
+    return preparing_plaintexts_ ? staged_plaintexts_.size()
+                                 : encoded_plaintexts_.size();
 }
 
 std::size_t SealPlainParameterStore::encoded_plaintext_bytes() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return encoded_plaintext_bytes_;
+    return preparing_plaintexts_ ? staged_encoded_plaintext_bytes_
+                                 : encoded_plaintext_bytes_;
+}
+
+std::size_t SealPlainParameterStore::prepared_projection_count() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return preparing_plaintexts_ ? staged_projections_.size()
+                                 : prepared_projections_.size();
+}
+
+std::size_t SealPlainParameterStore::prepared_projection_hits() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return prepared_projection_hits_;
 }
 
 std::size_t SealPlainParameterStore::plaintext_cache_hits() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return plaintext_cache_hits_;
+    return preparing_plaintexts_ ? staged_plaintext_cache_hits_
+                                 : plaintext_cache_hits_;
 }
 
 std::size_t SealPlainParameterStore::virtual_weight_template_count() const
@@ -637,13 +882,15 @@ std::size_t SealPlainParameterStore::virtual_weight_template_count() const
 std::size_t SealPlainParameterStore::virtual_weight_requests() const noexcept
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return virtual_weight_requests_;
+    return preparing_plaintexts_ ? staged_virtual_weight_requests_
+                                 : virtual_weight_requests_;
 }
 
 std::size_t SealPlainParameterStore::virtual_weight_cache_hits() const noexcept
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return virtual_weight_cache_hits_;
+    return preparing_plaintexts_ ? staged_virtual_weight_cache_hits_
+                                 : virtual_weight_cache_hits_;
 }
 
 Result<seal::Plaintext> SealPlainParameterStore::EncodeModelPlaintext(
@@ -658,24 +905,33 @@ Result<seal::Plaintext> SealPlainParameterStore::EncodeModelPlaintext(
         ? VirtualPlaintextKey(values, parms_id, scale,
                               virtual_weight_template_count_)
         : PlaintextKey(values, parms_id, scale, kernel_tag);
-    if (virtualized) ++virtual_weight_requests_;
-    const auto found = encoded_plaintexts_.find(key);
-    if (found != encoded_plaintexts_.end()) {
-        ++plaintext_cache_hits_;
-        if (virtualized) ++virtual_weight_cache_hits_;
-        return found->second;
+    auto &cache = preparing_plaintexts_ ? staged_plaintexts_
+                                        : encoded_plaintexts_;
+    if (virtualized) {
+        if (preparing_plaintexts_) ++staged_virtual_weight_requests_;
+        else ++virtual_weight_requests_;
     }
-    if (plaintext_cache_frozen_)
-        return Status::FailedPrecondition(
-            std::string("online model plaintext cache miss: ") +
-            std::string(kernel_tag));
+    const auto found = cache.find(key);
+    if (found != cache.end()) {
+        if (preparing_plaintexts_) {
+            ++staged_plaintext_cache_hits_;
+            if (virtualized) ++staged_virtual_weight_cache_hits_;
+        } else {
+            ++plaintext_cache_hits_;
+            if (virtualized) ++virtual_weight_cache_hits_;
+        }
+        return *found->second;
+    }
     if (!preparing_plaintexts_)
-        return Status::FailedPrecondition(
-            "model plaintext encode attempted outside Prepare()");
+        return Status::FailedPrecondition(plaintext_cache_frozen_
+            ? std::string("online model plaintext cache miss: ") +
+                std::string(kernel_tag)
+            : "model plaintext encode attempted outside Prepare()");
     seal::Plaintext plain;
     encoder.encode(values, parms_id, scale, plain);
-    encoded_plaintext_bytes_ += plain.save_size(seal::compr_mode_type::none);
-    encoded_plaintexts_.emplace(key, plain);
+    staged_encoded_plaintext_bytes_ +=
+        plain.save_size(seal::compr_mode_type::none);
+    cache.emplace(key, std::make_shared<const seal::Plaintext>(plain));
     return plain;
 }
 
@@ -692,25 +948,94 @@ Result<seal::Plaintext> SealPlainParameterStore::EncodeModelPlaintext(
         ? VirtualPlaintextKey(values, parms_id, scale,
                               virtual_weight_template_count_)
         : PlaintextKey(values, parms_id, scale, kernel_tag);
-    if (virtualized) ++virtual_weight_requests_;
-    const auto found = encoded_plaintexts_.find(key);
-    if (found != encoded_plaintexts_.end()) {
-        ++plaintext_cache_hits_;
-        if (virtualized) ++virtual_weight_cache_hits_;
-        return found->second;
+    auto &cache = preparing_plaintexts_ ? staged_plaintexts_
+                                        : encoded_plaintexts_;
+    if (virtualized) {
+        if (preparing_plaintexts_) ++staged_virtual_weight_requests_;
+        else ++virtual_weight_requests_;
     }
-    if (plaintext_cache_frozen_)
-        return Status::FailedPrecondition(
-            std::string("online model plaintext cache miss: ") +
-            std::string(kernel_tag));
+    const auto found = cache.find(key);
+    if (found != cache.end()) {
+        if (preparing_plaintexts_) {
+            ++staged_plaintext_cache_hits_;
+            if (virtualized) ++staged_virtual_weight_cache_hits_;
+        } else {
+            ++plaintext_cache_hits_;
+            if (virtualized) ++virtual_weight_cache_hits_;
+        }
+        return *found->second;
+    }
     if (!preparing_plaintexts_)
-        return Status::FailedPrecondition(
-            "model plaintext encode attempted outside Prepare()");
+        return Status::FailedPrecondition(plaintext_cache_frozen_
+            ? std::string("online model plaintext cache miss: ") +
+                std::string(kernel_tag)
+            : "model plaintext encode attempted outside Prepare()");
     seal::Plaintext plain;
     encoder.encode(values, parms_id, scale, plain);
-    encoded_plaintext_bytes_ += plain.save_size(seal::compr_mode_type::none);
-    encoded_plaintexts_.emplace(key, plain);
+    staged_encoded_plaintext_bytes_ +=
+        plain.save_size(seal::compr_mode_type::none);
+    cache.emplace(key, std::make_shared<const seal::Plaintext>(plain));
     return plain;
+}
+
+Result<std::shared_ptr<const seal::Plaintext>>
+SealPlainParameterStore::PrepareModelPlaintext(
+    seal::CKKSEncoder &encoder,
+    const std::vector<std::complex<double>> &values,
+    const seal::parms_id_type &parms_id, double scale,
+    std::string_view kernel_tag)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!preparing_plaintexts_)
+        return Status::FailedPrecondition(
+            "projection plaintext compilation requires Prepare()");
+    const bool virtualized = virtual_weight_template_count_ != 0 &&
+                             IsVirtualizableWeight(kernel_tag);
+    const auto key = virtualized
+        ? VirtualPlaintextKey(values, parms_id, scale,
+                              virtual_weight_template_count_)
+        : PlaintextKey(values, parms_id, scale, kernel_tag);
+    if (virtualized) ++staged_virtual_weight_requests_;
+    const auto found = staged_plaintexts_.find(key);
+    if (found != staged_plaintexts_.end()) {
+        ++staged_plaintext_cache_hits_;
+        if (virtualized) ++staged_virtual_weight_cache_hits_;
+        return found->second;
+    }
+    seal::Plaintext plain;
+    encoder.encode(values, parms_id, scale, plain);
+    staged_encoded_plaintext_bytes_ +=
+        plain.save_size(seal::compr_mode_type::none);
+    auto shared = std::make_shared<const seal::Plaintext>(std::move(plain));
+    staged_plaintexts_.emplace(key, shared);
+    return shared;
+}
+
+Result<void> SealPlainParameterStore::PutPreparedProjection(
+    std::string key, std::shared_ptr<const PreparedProjectionPlan> plan)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!preparing_plaintexts_)
+        return Status::FailedPrecondition(
+            "projection plan compilation requires Prepare()");
+    if (!plan || !staged_projections_.emplace(std::move(key), std::move(plan)).second)
+        return Status::FailedPrecondition(
+            "projection plan is null or already compiled");
+    return {};
+}
+
+Result<std::shared_ptr<const PreparedProjectionPlan>>
+SealPlainParameterStore::GetPreparedProjection(std::string_view key) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto &plans = preparing_plaintexts_ ? staged_projections_
+                                               : prepared_projections_;
+    const auto found = plans.find(std::string(key));
+    if (found == plans.end())
+        return Status::NotFound("prepared projection plan is absent: " +
+                                std::string(key));
+    if (!preparing_plaintexts_) ++prepared_projection_hits_;
+    return found->second;
 }
 
 } // namespace hera

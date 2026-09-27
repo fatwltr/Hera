@@ -1,8 +1,10 @@
 #include "hera/block2_he.h"
+#include "hera/detail/parallel_ranges.h"
 
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <future>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -77,28 +79,19 @@ int CanonicalRotation(long long value, std::size_t slots)
     return static_cast<int>(value);
 }
 
-seal::Ciphertext RotateComposite(const seal::Ciphertext &input, int rotation,
-                                 const HeContext &context,
-                                 seal::Evaluator &evaluator,
-                                 Block2ExecutionReport *report)
+seal::Ciphertext RotateDirect(const seal::Ciphertext &input, int rotation,
+                              const HeContext &context,
+                              seal::Evaluator &evaluator,
+                              Block2ExecutionReport *report)
 {
     seal::Ciphertext result = input;
-    int remaining = CanonicalRotation(rotation, context.slot_count());
-    if (remaining == 0) return result;
-    const int sign = remaining < 0 ? -1 : 1;
-    std::uint64_t magnitude = static_cast<std::uint64_t>(
-        remaining < 0 ? -static_cast<long long>(remaining) : remaining);
-    std::uint64_t bit = 1;
-    while (magnitude != 0) {
-        if (magnitude & 1U) {
-            evaluator.rotate_vector_inplace(result,
-                                            sign * static_cast<int>(bit),
-                                            context.galois_keys);
-            if (report) ++report->rotations;
-        }
-        magnitude >>= 1U;
-        bit <<= 1U;
-    }
+    const int step = CanonicalRotation(rotation, context.slot_count());
+    if (step == 0) return result;
+    // Every planned offset has its own Galois key. Do not decompose this
+    // logical rotation into signed powers of two: one call below therefore
+    // performs exactly one automorphism and one key-switch.
+    evaluator.rotate_vector_inplace(result, step, context.galois_keys);
+    if (report) ++report->rotations;
     return result;
 }
 
@@ -234,6 +227,76 @@ Result<SealCipherTensor> LayerNormTail(
             !CloseScale(inverse.ciphertexts[i].scale(), wanted_input))
             return Status::FailedPrecondition(
                 "LayerNorm inputs have incompatible level or scale");
+    }
+
+    const auto cache = ModelPlaintextCacheScope::Current();
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        seal::CKKSEncoder encoder(*context.context);
+        const auto input_id = centered.ciphertexts.front().parms_id();
+        const auto next = context.context->get_context_data(input_id)
+                              ->next_context_data();
+        if (!next)
+            return Status::FailedPrecondition(
+                "Block 2 LayerNorm preparation has no next level");
+        const double target = std::ldexp(
+            1.0, context.parameters.default_scale_bits);
+        const double gamma_scale = target * DroppedPrime(context, input_id) /
+            (wanted_input * wanted_input);
+        if (!std::isfinite(gamma_scale) || gamma_scale < 1.0)
+            return Status::FailedPrecondition(
+                "LayerNorm gamma scale cannot realize the configured target");
+        for (std::size_t ct = 0; ct < centered.ciphertexts.size(); ++ct) {
+            std::vector<Complex> real(context.slot_count());
+            std::vector<Complex> imag(context.slot_count());
+            for (auto &slot : imag) slot = {0.0, -0.0};
+            std::vector<Complex> beta_slots(context.slot_count());
+            bool has_real = false, has_imag = false;
+            for (std::size_t logical = 0;
+                 logical < centered.physical_packing.logical_locations.size();
+                 ++logical) {
+                const auto feature = logical % layer.model_width;
+                for (const auto &location :
+                     centered.physical_packing.logical_locations[logical]) {
+                    if (location.ciphertext != ct) continue;
+                    if (location.component == ComplexLane::kReal) {
+                        real[location.slot] = {0.25 * gamma.values[feature], 0.0};
+                        beta_slots[location.slot].real(beta.values[feature]);
+                        has_real = true;
+                    } else {
+                        imag[location.slot] = {0.0, -0.25 * gamma.values[feature]};
+                        beta_slots[location.slot].imag(beta.values[feature]);
+                        has_imag = true;
+                    }
+                }
+            }
+            if (!has_real && !has_imag)
+                return Status::Internal("LayerNorm produced an empty ciphertext");
+            if (has_real) {
+                auto encoded = EncodeModelPlaintext(
+                    encoder, real, input_id, gamma_scale,
+                    "block2.ln1.gamma.real");
+                if (!encoded.ok()) return encoded.status();
+            }
+            if (has_imag) {
+                auto encoded = EncodeModelPlaintext(
+                    encoder, imag, input_id, gamma_scale,
+                    "block2.ln1.gamma.imag");
+                if (!encoded.ok()) return encoded.status();
+            }
+            auto encoded = EncodeModelPlaintext(
+                encoder, beta_slots, next->parms_id(), target,
+                "block2.ln1.beta");
+            if (!encoded.ok()) return encoded.status();
+        }
+        auto result = centered;
+        for (auto &ct : result.ciphertexts) {
+            ct.parms_id() = next->parms_id();
+            ct.scale() = target;
+        }
+        result.logical_spec.planned_level = 1;
+        result.logical_spec.planned_scale_bits =
+            context.parameters.default_scale_bits;
+        return result;
     }
 
     seal::Evaluator evaluator(*context.context);
@@ -427,6 +490,7 @@ Result<SealCipherTensor> Project(
     const TransformerLayerConfig &layer,
     const HeContext &context,
     RotationCache &rotation_cache,
+    PreparedProjectionRotationCache &prepared_rotation_cache,
     Block2ExecutionReport *report)
 {
     if (input.logical_spec.shape !=
@@ -445,6 +509,43 @@ Result<SealCipherTensor> Project(
                                " payload has the wrong rectangular shape");
     if (bias && bias->values.size() != output_columns)
         return Status::Invalid(weights.spec.name + " bias has the wrong size");
+    if (input.ciphertexts.empty())
+        return Status::Invalid("projection input has no ciphertexts");
+    const auto cache = ModelPlaintextCacheScope::Current();
+    const auto prepared_key = cache.second + "/block2/" +
+                              weights.spec.name;
+    if (cache.first && !cache.first->preparing_plaintexts()) {
+        auto prepared = cache.first->GetPreparedProjection(prepared_key);
+        if (!prepared.ok()) return prepared.status();
+        if (prepared.value()->output_packing.layout != output_layout)
+            return Status::FailedPrecondition(
+                "prepared Block-2 projection layout mismatch");
+        PreparedProjectionCounts counts;
+        auto ciphertexts = EvaluatePreparedProjection(
+            *prepared.value(), input, context, &counts,
+            &prepared_rotation_cache);
+        if (!ciphertexts.ok()) return ciphertexts.status();
+        if (report) {
+            report->rotations += counts.rotations;
+            report->conjugations += counts.conjugations;
+            report->ciphertext_plain_multiplications +=
+                counts.ciphertext_plain_multiplications;
+            report->rescales += counts.rescales;
+        }
+        auto input_level = LevelOf(
+            context, input.ciphertexts.front().parms_id());
+        if (!input_level.ok()) return input_level.status();
+        SealCipherTensor result;
+        result.parameter_profile = context.profile;
+        result.ciphertexts = ciphertexts.take_value();
+        result.logical_spec = MakeHeSpec(
+            prepared.value()->output_packing.logical_shape, output_layout,
+            context.profile, input_level.value() + 1,
+            context.parameters.default_scale_bits);
+        result.logical_spec.numeric = input.logical_spec.numeric;
+        result.physical_packing = prepared.value()->output_packing;
+        return result;
+    }
     auto projection_plan = ComplexDiagonalProjectionPlanner::Build(
         layer, output_layout, context.slot_count());
     if (!projection_plan.ok()) return projection_plan.status();
@@ -490,8 +591,8 @@ Result<SealCipherTensor> Project(
                         ProjectionKey key{source.ciphertext,
                                           destination.ciphertext,
                                           source.component, rotation};
-                        auto inserted = masks.emplace(
-                            key, std::vector<Complex>(context.slot_count()));
+                        auto inserted = masks.try_emplace(
+                            key, context.slot_count(), Complex{});
                         const auto coefficient =
                             weights.row_major[feature * output_columns +
                                               output_column] * q_scale;
@@ -521,7 +622,7 @@ Result<SealCipherTensor> Project(
 
     using BabyMasks = std::map<int, std::vector<Complex>>;
     std::map<ProjectionGiantKey, BabyMasks> bsgs;
-    for (const auto &entry : masks) {
+    for (auto &entry : masks) {
         if (!AnyNonzero(entry.second)) continue;
         int residue = CanonicalRotation(entry.first.rotation,
                                         context.slot_count());
@@ -531,16 +632,100 @@ Result<SealCipherTensor> Project(
         ProjectionGiantKey key{entry.first.source_ct,
                                entry.first.target_ct,
                                entry.first.source_component, giant};
-        auto inserted = bsgs[key].emplace(
-            baby, std::vector<Complex>(context.slot_count()));
-        auto &adjusted = inserted.first->second;
-        for (std::size_t slot = 0; slot < context.slot_count(); ++slot) {
-            if (std::abs(entry.second[slot]) == 0.0) continue;
-            const auto shifted =
-                (slot + static_cast<std::size_t>(giant)) %
-                context.slot_count();
-            adjusted[shifted] += entry.second[slot];
+        // Each canonical rotation maps to exactly one (giant,baby) pair.
+        // Transfer the dense mask instead of keeping a second full slots
+        // vector alive until the HE evaluation starts.
+        auto adjusted = std::move(entry.second);
+        if (giant != 0)
+            std::rotate(adjusted.rbegin(),
+                        adjusted.rbegin() + giant, adjusted.rend());
+        if (!bsgs[key].emplace(baby, std::move(adjusted)).second)
+            return Status::Internal("projection BSGS rotation collision");
+    }
+    masks.clear();
+
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        const auto input_id = input.ciphertexts.front().parms_id();
+        const auto next = context.context->get_context_data(input_id)
+                              ->next_context_data();
+        if (!next)
+            return Status::FailedPrecondition(
+                "Block 2 projection preparation has no next level");
+        seal::CKKSEncoder encoder(*context.context);
+        const double target = std::ldexp(
+            1.0, context.parameters.default_scale_bits);
+        const double plain_scale = target * DroppedPrime(context, input_id) /
+            input.ciphertexts.front().scale();
+        auto prepared = std::make_shared<PreparedProjectionPlan>();
+        prepared->profile = context.profile;
+        prepared->input_parms_id = input_id;
+        prepared->input_scale = input.ciphertexts.front().scale();
+        prepared->input_packing = input.physical_packing;
+        prepared->output_packing = plan;
+        prepared->bias_plaintexts.resize(plan.ciphertext_count);
+        prepared->reuse_baby_rotations = true;
+        prepared->output_scale_bits = context.parameters.default_scale_bits;
+        std::vector<bool> initialized(plan.ciphertext_count, false);
+        for (const auto &entry : bsgs) {
+            PreparedProjectionGroup group;
+            group.target_ct = entry.first.target_ct;
+            group.giant_rotation = entry.first.giant_rotation;
+            for (const auto &baby : entry.second) {
+                auto encoded = CompileModelPlaintext(
+                    encoder, baby.second, input_id, plain_scale,
+                    "block2.projection.diagonal");
+                if (!encoded.ok()) return encoded.status();
+                group.terms.push_back({entry.first.source_ct,
+                                       entry.first.source_component,
+                                       baby.first, encoded.take_value()});
+            }
+            initialized[group.target_ct] = true;
+            prepared->groups.push_back(std::move(group));
         }
+        for (std::size_t ct = 0; ct < initialized.size(); ++ct) {
+            if (!initialized[ct])
+                return Status::Internal(
+                    "projection generated an empty output group");
+            if (!bias) continue;
+            std::vector<Complex> bias_slots(context.slot_count());
+            for (std::size_t logical = 0;
+                 logical < plan.logical_locations.size(); ++logical) {
+                const auto head = (logical / width) % logical_heads;
+                const auto dimension = logical % width;
+                const double value =
+                    bias->values[head * width + dimension] * q_scale;
+                for (const auto &location : plan.Locations(logical)) {
+                    if (location.ciphertext != ct) continue;
+                    if (location.component == ComplexLane::kReal)
+                        bias_slots[location.slot].real(value);
+                    else
+                        bias_slots[location.slot].imag(value);
+                }
+            }
+            auto encoded = CompileModelPlaintext(
+                encoder, bias_slots, input_id,
+                input.ciphertexts.front().scale() * plain_scale,
+                "block2.projection.bias");
+            if (!encoded.ok()) return encoded.status();
+            prepared->bias_plaintexts[ct] = encoded.take_value();
+        }
+        auto stored = cache.first->PutPreparedProjection(
+            prepared_key, std::move(prepared));
+        if (!stored.ok()) return stored.status();
+        SealCipherTensor result;
+        result.parameter_profile = context.profile;
+        result.ciphertexts.resize(plan.ciphertext_count);
+        for (auto &ct : result.ciphertexts) {
+            ct.parms_id() = next->parms_id();
+            ct.scale() = target;
+        }
+        result.logical_spec = MakeHeSpec(
+            plan.logical_shape, output_layout, context.profile,
+            input_level.value() + 1,
+            context.parameters.default_scale_bits);
+        result.logical_spec.numeric = input.logical_spec.numeric;
+        result.physical_packing = plan;
+        return result;
     }
 
     seal::Evaluator evaluator(*context.context);
@@ -549,8 +734,23 @@ Result<SealCipherTensor> Project(
     std::vector<bool> initialized(output.size(), false);
     const double target = std::ldexp(
         1.0, context.parameters.default_scale_bits);
+    std::shared_ptr<PreparedProjectionPlan> prepared;
+    if (cache.first) {
+        prepared = std::make_shared<PreparedProjectionPlan>();
+        prepared->profile = context.profile;
+        prepared->input_parms_id = input.ciphertexts.front().parms_id();
+        prepared->input_scale = input.ciphertexts.front().scale();
+        prepared->input_packing = input.physical_packing;
+        prepared->output_packing = plan;
+        prepared->bias_plaintexts.resize(plan.ciphertext_count);
+        prepared->reuse_baby_rotations = true;
+        prepared->output_scale_bits = context.parameters.default_scale_bits;
+    }
     for (const auto &entry : bsgs) {
         const auto &key = entry.first;
+        PreparedProjectionGroup prepared_group;
+        prepared_group.target_ct = key.target_ct;
+        prepared_group.giant_rotation = key.giant_rotation;
         const RotationKey base_key{key.source_ct, key.source_component, 0};
         auto source_base = rotation_cache.find(base_key);
         if (source_base == rotation_cache.end()) {
@@ -574,7 +774,7 @@ Result<SealCipherTensor> Project(
                                        baby_entry.first};
             auto baby = rotation_cache.find(baby_key);
             if (baby == rotation_cache.end()) {
-                auto rotated = RotateComposite(
+                auto rotated = RotateDirect(
                     source_base->second, baby_entry.first, context,
                     evaluator, report);
                 baby = rotation_cache.emplace(baby_key,
@@ -584,13 +784,17 @@ Result<SealCipherTensor> Project(
                 context, baby->second.parms_id());
             const double plain_scale =
                 target * dropped / baby->second.scale();
-            auto encoded = EncodeModelPlaintext(
+            auto encoded = CompileModelPlaintext(
                 encoder, baby_entry.second, baby->second.parms_id(),
                 plain_scale, "block2.projection.diagonal");
             if (!encoded.ok()) return encoded.status();
             auto plain = encoded.take_value();
+            if (prepared)
+                prepared_group.terms.push_back({
+                    key.source_ct, key.source_component, baby_entry.first,
+                    plain});
             seal::Ciphertext term;
-            evaluator.multiply_plain(baby->second, plain, term);
+            evaluator.multiply_plain(baby->second, *plain, term);
             if (report) ++report->ciphertext_plain_multiplications;
             if (!giant_initialized) {
                 giant_sum = std::move(term);
@@ -600,7 +804,7 @@ Result<SealCipherTensor> Project(
             }
         }
         if (key.giant_rotation != 0)
-            giant_sum = RotateComposite(giant_sum, key.giant_rotation,
+            giant_sum = RotateDirect(giant_sum, key.giant_rotation,
                                         context, evaluator, report);
         if (!initialized[key.target_ct]) {
             output[key.target_ct] = std::move(giant_sum);
@@ -608,6 +812,8 @@ Result<SealCipherTensor> Project(
         } else {
             evaluator.add_inplace(output[key.target_ct], giant_sum);
         }
+        if (prepared)
+            prepared->groups.push_back(std::move(prepared_group));
     }
 
     for (std::size_t ct = 0; ct < output.size(); ++ct) {
@@ -629,12 +835,13 @@ Result<SealCipherTensor> Project(
                         bias_slots[location.slot].imag(value);
                 }
             }
-            auto encoded_bias = EncodeModelPlaintext(
+            auto encoded_bias = CompileModelPlaintext(
                 encoder, bias_slots, output[ct].parms_id(),
                 output[ct].scale(), "block2.projection.bias");
             if (!encoded_bias.ok()) return encoded_bias.status();
             auto bias_plain = encoded_bias.take_value();
-            evaluator.add_plain_inplace(output[ct], bias_plain);
+            if (prepared) prepared->bias_plaintexts[ct] = bias_plain;
+            evaluator.add_plain_inplace(output[ct], *bias_plain);
         }
         evaluator.rescale_to_next_inplace(output[ct]);
         NormalizeScale(output[ct], target);
@@ -650,6 +857,11 @@ Result<SealCipherTensor> Project(
         context.parameters.default_scale_bits);
     result.logical_spec.numeric = input.logical_spec.numeric;
     result.physical_packing = projection_plan.take_value().output_packing;
+    if (prepared) {
+        auto stored = cache.first->PutPreparedProjection(
+            prepared_key, std::move(prepared));
+        if (!stored.ok()) return stored.status();
+    }
     return result;
 }
 
@@ -684,6 +896,151 @@ std::vector<HeadTile> QkTiles(const TransformerLayerConfig &layer,
         begin += heads;
     }
     return result;
+}
+
+Result<void> CollectProjectionRotationSteps(
+    const TransformerLayerConfig &layer, const HePackingPlan &input_packing,
+    Layout output_layout, std::size_t slots, std::set<int> &steps)
+{
+    auto input_valid = input_packing.Validate();
+    if (!input_valid.ok()) return input_valid.status();
+    if (input_packing.layout != Layout::kSpatial ||
+        input_packing.logical_shape !=
+            TensorShape{{layer.tokens, layer.model_width}} ||
+        input_packing.slot_count != slots)
+        return Status::Invalid(
+            "Block 2 rotation plan requires its exact spatial input packing");
+    auto output = MultiHeadPackingPlan::ProjectionOutput(
+        layer, output_layout, slots);
+    if (!output.ok()) return output.status();
+    const auto logical_heads = output_layout == Layout::kMultiHeadQ
+        ? layer.q_heads : layer.kv_heads;
+    const auto width = output_layout == Layout::kMultiHeadV
+        ? layer.value_head_width : layer.qk_head_width;
+    // In the runtime's dense spatial input, all model_width source slots
+    // for one token form a cyclic interval. Mark that interval in O(1) for
+    // each destination, then materialize unique offsets in O(slots). A
+    // custom spatial packing retains the general coordinate fallback.
+    bool dense_spatial = true;
+    for (std::size_t logical = 0;
+         logical < input_packing.logical_locations.size(); ++logical) {
+        const auto &locations = input_packing.Locations(logical);
+        const auto local = logical % (2 * slots);
+        if (locations.size() != 1 ||
+            locations.front().ciphertext != logical / (2 * slots) ||
+            locations.front().slot != local % slots ||
+            locations.front().component !=
+                (local < slots ? ComplexLane::kReal
+                               : ComplexLane::kImaginary)) {
+            dense_spatial = false;
+            break;
+        }
+    }
+    std::vector<unsigned char> present(slots, 0);
+    std::vector<int> difference(dense_spatial ? slots + 1 : 0, 0);
+    bool all_offsets = false;
+    for (std::size_t token = 0; token < layer.tokens; ++token)
+        for (std::size_t head = 0; head < logical_heads; ++head)
+            for (std::size_t dimension = 0; dimension < width; ++dimension) {
+                const auto output_logical =
+                    (token * logical_heads + head) * width + dimension;
+                for (const auto &destination :
+                     output.value().Locations(output_logical)) {
+                    if (dense_spatial) {
+                        if (layer.model_width >= slots) {
+                            all_offsets = true;
+                            continue;
+                        }
+                        const auto first =
+                            (token * layer.model_width + slots -
+                             destination.slot) % slots;
+                        const auto end = first + layer.model_width;
+                        ++difference[first];
+                        --difference[std::min(end, slots)];
+                        if (end > slots) {
+                            ++difference[0];
+                            --difference[end - slots];
+                        }
+                    } else {
+                        for (std::size_t feature = 0;
+                             feature < layer.model_width; ++feature) {
+                            const auto &sources = input_packing.Locations(
+                                token * layer.model_width + feature);
+                            if (sources.size() != 1)
+                                return Status::Invalid(
+                                    "Block 2 spatial input must not be replicated");
+                            const auto residue =
+                                (sources.front().slot + slots -
+                                 destination.slot) % slots;
+                            present[residue] = 1;
+                        }
+                    }
+                }
+            }
+    if (all_offsets) {
+        std::fill(present.begin(), present.end(), 1);
+    } else if (dense_spatial) {
+        int active = 0;
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+            active += difference[slot];
+            present[slot] = active > 0;
+        }
+    }
+
+    // Mirror Project's BSGS split exactly. A key is required for the baby
+    // rotation and for the final giant rotation, never for a binary basis.
+    std::size_t base = slots;
+    for (std::size_t residue = 1; residue < slots; ++residue)
+        if (present[residue]) base = std::gcd(base, residue);
+    if (base == slots || base == 0)
+        base = std::max<std::size_t>(
+            1, static_cast<std::size_t>(std::sqrt(slots)));
+    for (std::size_t residue = 0; residue < slots; ++residue) {
+        if (!present[residue]) continue;
+        const auto giant = static_cast<int>((residue / base) * base);
+        const auto baby = static_cast<int>(residue) - giant;
+        const auto baby_step = CanonicalRotation(baby, slots);
+        const auto giant_step = CanonicalRotation(giant, slots);
+        if (baby_step != 0) steps.insert(baby_step);
+        if (giant_step != 0) steps.insert(giant_step);
+    }
+    return {};
+}
+
+void CollectQkRotationSteps(const TransformerLayerConfig &layer,
+                            std::size_t slots, std::set<int> &steps)
+{
+    for (const auto &tile : QkTiles(layer, slots)) {
+        const auto block = layer.tokens * tile.head_count;
+        for (std::size_t diagonal = 0; diagonal < layer.tokens;
+             ++diagonal) {
+            const auto shift = diagonal * tile.head_count;
+            const auto main = CanonicalRotation(
+                static_cast<long long>(shift), slots);
+            if (main != 0) steps.insert(main);
+            if (diagonal != 0) {
+                const auto wrap = CanonicalRotation(
+                    static_cast<long long>(shift) -
+                        static_cast<long long>(block), slots);
+                if (wrap != 0) steps.insert(wrap);
+            }
+        }
+        const auto active_lanes = std::min(tile.lanes,
+                                           layer.qk_head_width);
+        for (std::size_t lane = 1; lane < active_lanes; ++lane) {
+            const auto step = CanonicalRotation(
+                static_cast<long long>(lane * block), slots);
+            if (step != 0) steps.insert(step);
+        }
+        for (std::size_t diagonal = 0; diagonal < layer.tokens;
+             ++diagonal) {
+            const auto output_lane = diagonal % tile.lanes;
+            if (output_lane == 0) continue;
+            const auto step = CanonicalRotation(
+                -static_cast<long long>(output_lane * block), slots);
+            if (step != 0) steps.insert(step);
+        }
+    }
 }
 
 std::vector<double> InnerRotationMask(const HeadTile &tile,
@@ -740,7 +1097,7 @@ seal::Ciphertext InnerRotateK(
         tile, layer, context.slot_count(), diagonal, true);
     const int shift = static_cast<int>(diagonal * tile.head_count);
     const int block = static_cast<int>(layer.tokens * tile.head_count);
-    auto nonwrap = RotateComposite(input, shift, context, evaluator, report);
+    auto nonwrap = RotateDirect(input, shift, context, evaluator, report);
     const double plain_scale = output_scale *
         DroppedPrime(context, input.parms_id()) / input.scale();
     seal::Plaintext nonwrap_plain;
@@ -749,7 +1106,7 @@ seal::Ciphertext InnerRotateK(
     evaluator.multiply_plain_inplace(nonwrap, nonwrap_plain);
     std::size_t multiplications = 1;
     if (AnyNonzero(wrap_mask)) {
-        auto wrap = RotateComposite(input, shift - block, context, evaluator,
+        auto wrap = RotateDirect(input, shift - block, context, evaluator,
                                     report);
         seal::Plaintext wrap_plain;
         encoder.encode(wrap_mask, input.parms_id(), plain_scale, wrap_plain);
@@ -769,7 +1126,7 @@ seal::Ciphertext InnerRotateK(
 Result<SealCipherTensor> ComputeQk(
     const SealCipherTensor &q, const SealCipherTensor &k,
     const TransformerLayerConfig &layer, const HeContext &context,
-    Block2ExecutionReport *report)
+    Block2ExecutionReport *report, std::size_t he_workers)
 {
     auto q_valid = q.Validate(context);
     if (!q_valid.ok()) return q_valid.status();
@@ -830,86 +1187,121 @@ Result<SealCipherTensor> ComputeQk(
         const auto block = layer.tokens * tile.head_count;
         std::vector<seal::Ciphertext> tile_unpaired(
             (layer.tokens + tile.lanes - 1) / tile.lanes);
-        std::vector<bool> initialized(tile_unpaired.size(), false);
-        for (std::size_t diagonal = 0; diagonal < layer.tokens; ++diagonal) {
-            seal::Ciphertext diagonal_sum;
-            bool diagonal_initialized = false;
-            for (std::size_t group = 0; group < tile.input_groups; ++group) {
-                const auto index = tile.input_begin + group;
-                auto rotated_k = InnerRotateK(
-                    conjugated_k[index], diagonal, tile, layer, context, evaluator,
-                    encoder, k_preprocessed_scale, report);
-                auto q_at_level = q.ciphertexts[index];
-                evaluator.mod_switch_to_inplace(q_at_level,
-                                                rotated_k.parms_id());
-                seal::Ciphertext product;
-                evaluator.multiply(q_at_level, rotated_k, product);
-                evaluator.relinearize_inplace(product,
-                                               context.relinearization_keys);
-                evaluator.rescale_to_next_inplace(product);
-                NormalizeScale(product, scale44);
-                if (report) {
-                    ++report->ciphertext_multiplications;
-                    ++report->relinearizations;
-                    ++report->rescales;
+        std::vector<Block2ExecutionReport> group_reports(
+            tile_unpaired.size());
+        auto groups_ready = detail::ParallelRanges(
+            tile_unpaired.size(), std::min<std::size_t>(he_workers, 2), 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator worker_evaluator(*context.context);
+                seal::CKKSEncoder worker_encoder(*context.context);
+                for (std::size_t output_group = begin;
+                     output_group < end; ++output_group) {
+                    auto *counts = &group_reports[output_group];
+                    bool group_initialized = false;
+                    seal::Ciphertext group_sum;
+                    const auto first_diagonal = output_group * tile.lanes;
+                    const auto last_diagonal = std::min(
+                        first_diagonal + tile.lanes, layer.tokens);
+                    for (std::size_t diagonal = first_diagonal;
+                         diagonal < last_diagonal; ++diagonal) {
+                        seal::Ciphertext diagonal_sum;
+                        bool diagonal_initialized = false;
+                        for (std::size_t group = 0;
+                             group < tile.input_groups; ++group) {
+                            const auto index = tile.input_begin + group;
+                            auto rotated_k = InnerRotateK(
+                                conjugated_k[index], diagonal, tile, layer,
+                                context, worker_evaluator, worker_encoder,
+                                k_preprocessed_scale, counts);
+                            auto q_at_level = q.ciphertexts[index];
+                            worker_evaluator.mod_switch_to_inplace(
+                                q_at_level, rotated_k.parms_id());
+                            seal::Ciphertext product;
+                            worker_evaluator.multiply(q_at_level, rotated_k,
+                                                      product);
+                            worker_evaluator.relinearize_inplace(
+                                product, context.relinearization_keys);
+                            worker_evaluator.rescale_to_next_inplace(product);
+                            NormalizeScale(product, scale44);
+                            ++counts->ciphertext_multiplications;
+                            ++counts->relinearizations;
+                            ++counts->rescales;
+                            if (!diagonal_initialized) {
+                                diagonal_sum = std::move(product);
+                                diagonal_initialized = true;
+                            } else {
+                                worker_evaluator.add_inplace(diagonal_sum,
+                                                             product);
+                            }
+                        }
+
+                        // Each diagonal's lane reduction is independent;
+                        // only diagonals in the same output group accumulate.
+                        seal::Ciphertext lanes_sum = diagonal_sum;
+                        const auto active_lanes = std::min(
+                            tile.lanes, layer.qk_head_width);
+                        for (std::size_t lane = 1; lane < active_lanes;
+                             ++lane) {
+                            auto rotated = RotateDirect(
+                                diagonal_sum,
+                                static_cast<int>(lane * block), context,
+                                worker_evaluator, counts);
+                            worker_evaluator.add_inplace(lanes_sum, rotated);
+                        }
+                        std::vector<double> lane_zero(
+                            context.slot_count(), 0.0);
+                        for (std::size_t row = 0; row < layer.tokens; ++row)
+                            for (std::size_t head = 0;
+                                 head < tile.head_count; ++head)
+                                lane_zero[row * tile.head_count + head] = 1.0;
+                        auto aligned = MultiplyMaskAndRescale(
+                            lanes_sum, lane_zero, scale44, context,
+                            worker_evaluator, worker_encoder, counts);
+                        const auto output_lane = diagonal % tile.lanes;
+                        if (output_lane != 0)
+                            aligned = RotateDirect(
+                                aligned,
+                                -static_cast<int>(output_lane * block),
+                                context, worker_evaluator, counts);
+                        if (!group_initialized) {
+                            group_sum = std::move(aligned);
+                            group_initialized = true;
+                        } else {
+                            worker_evaluator.add_inplace(group_sum, aligned);
+                        }
+                    }
+                    if (!group_initialized)
+                        return Status::Internal("QK output group is empty");
+                    std::vector<double> recovery(
+                        context.slot_count(), 0.0);
+                    for (std::size_t lane = 0;
+                         lane < last_diagonal - first_diagonal; ++lane)
+                        for (std::size_t row = 0;
+                             row < layer.tokens; ++row)
+                            for (std::size_t head = 0;
+                                 head < tile.head_count; ++head)
+                                recovery[lane * block +
+                                         row * tile.head_count + head] = 1.0;
+                    tile_unpaired[output_group] = MultiplyMaskAndRescale(
+                        group_sum, recovery, scale44, context,
+                        worker_evaluator, worker_encoder, counts);
                 }
-                if (!diagonal_initialized) {
-                    diagonal_sum = std::move(product);
-                    diagonal_initialized = true;
-                } else {
-                    evaluator.add_inplace(diagonal_sum, product);
-                }
+                return {};
+            }, detail::EstimatedHeWorkerBytes(
+                context.parameters.polynomial_degree,
+                context.parameters.coefficient_modulus_bits.size(), 24));
+        if (!groups_ready.ok()) return groups_ready.status();
+        if (report)
+            for (const auto &counts : group_reports) {
+                report->rotations += counts.rotations;
+                report->conjugations += counts.conjugations;
+                report->ciphertext_plain_multiplications +=
+                    counts.ciphertext_plain_multiplications;
+                report->ciphertext_multiplications +=
+                    counts.ciphertext_multiplications;
+                report->relinearizations += counts.relinearizations;
+                report->rescales += counts.rescales;
             }
-
-            // Sum all reduction lanes into lane zero. Each complex product
-            // already contributes two dimensions through Re(Q*conj(K)).
-            seal::Ciphertext lanes_sum = diagonal_sum;
-            const auto active_lanes = std::min(
-                tile.lanes, layer.qk_head_width);
-            for (std::size_t lane = 1; lane < active_lanes; ++lane) {
-                auto rotated = RotateComposite(
-                    diagonal_sum, static_cast<int>(lane * block), context,
-                    evaluator, report);
-                evaluator.add_inplace(lanes_sum, rotated);
-            }
-            std::vector<double> lane_zero(context.slot_count(), 0.0);
-            for (std::size_t row = 0; row < layer.tokens; ++row)
-                for (std::size_t head = 0; head < tile.head_count; ++head)
-                    lane_zero[row * tile.head_count + head] = 1.0;
-            auto aligned = MultiplyMaskAndRescale(
-                lanes_sum, lane_zero, scale44, context, evaluator, encoder,
-                report);
-
-            const auto output_group = diagonal / tile.lanes;
-            const auto output_lane = diagonal % tile.lanes;
-            if (output_lane != 0)
-                aligned = RotateComposite(
-                    aligned, -static_cast<int>(output_lane * block), context,
-                    evaluator, report);
-            if (!initialized[output_group]) {
-                tile_unpaired[output_group] = std::move(aligned);
-                initialized[output_group] = true;
-            } else {
-                evaluator.add_inplace(tile_unpaired[output_group], aligned);
-            }
-        }
-
-        // Recovery mask is nontrivial for tail groups and also fixes the
-        // level contract for every group before real/imag pairing.
-        for (std::size_t group = 0; group < tile_unpaired.size(); ++group) {
-            std::vector<double> recovery(context.slot_count(), 0.0);
-            const auto first_diagonal = group * tile.lanes;
-            for (std::size_t lane = 0; lane < tile.lanes; ++lane) {
-                if (first_diagonal + lane >= layer.tokens) continue;
-                for (std::size_t row = 0; row < layer.tokens; ++row)
-                    for (std::size_t head = 0; head < tile.head_count; ++head)
-                        recovery[lane * block + row * tile.head_count + head] =
-                            1.0;
-            }
-            tile_unpaired[group] = MultiplyMaskAndRescale(
-                tile_unpaired[group], recovery, scale44, context, evaluator,
-                encoder, report);
-        }
 
         for (std::size_t pair = 0; pair < (tile_unpaired.size() + 1) / 2;
              ++pair) {
@@ -1012,6 +1404,7 @@ public:
     const HeContext &context;
     Block2ExecutionReport *report;
     RotationCache rotations;
+    PreparedProjectionRotationCache prepared_rotations;
 };
 
 ComplexDiagonalProjectionKernel::ComplexDiagonalProjectionKernel(
@@ -1034,28 +1427,52 @@ Result<SealCipherTensor> ComplexDiagonalProjectionKernel::Evaluate(
     Layout output_layout)
 {
     return Project(input, weights, bias, output_layout, impl_->layer,
-                   impl_->context, impl_->rotations, impl_->report);
+                   impl_->context, impl_->rotations,
+                   impl_->prepared_rotations, impl_->report);
 }
 
 Result<SealCipherTensor> MultiHeadQkKernel::Evaluate(
     const SealCipherTensor &q, const SealCipherTensor &k,
     const TransformerLayerConfig &layer, const HeContext &context,
-    Block2ExecutionReport *report)
+    Block2ExecutionReport *report, std::size_t he_workers)
 {
-    return ComputeQk(q, k, layer, context, report);
+    return ComputeQk(q, k, layer, context, report, he_workers);
+}
+
+Result<std::vector<int>> MultiHeadQkKernel::RequiredRotationSteps(
+    const TransformerLayerConfig &layer, std::size_t slot_count)
+{
+    auto valid = ValidateLayerConfig(layer);
+    if (!valid.ok()) return valid.status();
+    std::set<int> steps{0};
+    CollectQkRotationSteps(layer, slot_count, steps);
+    return std::vector<int>(steps.begin(), steps.end());
 }
 
 SealBlock2Executor::SealBlock2Executor(
     const HeraConfig &config, const TransformerLayerConfig &layer,
     HeContextRegistry &contexts, SealCipherTensorStore &tensors,
-    SealPlainParameterStore &parameters)
+    SealPlainParameterStore &parameters,
+    const std::vector<int> *required_rotations)
     : config_(config), layer_(layer), contexts_(contexts), tensors_(tensors),
-      parameters_(parameters)
+      parameters_(parameters), required_rotations_(required_rotations)
 {}
 
 Result<std::vector<int>> SealBlock2Executor::RequiredRotationSteps(
     const TransformerLayerConfig &layer,
     const HeParameterConfig &parameters)
+{
+    const auto slots = parameters.polynomial_degree / 2;
+    auto input = MultiHeadPackingPlan::DenseSpatial(
+        {{layer.tokens, layer.model_width}}, slots);
+    if (!input.ok()) return input.status();
+    return RequiredRotationSteps(layer, parameters, input.value());
+}
+
+Result<std::vector<int>> SealBlock2Executor::RequiredRotationSteps(
+    const TransformerLayerConfig &layer,
+    const HeParameterConfig &parameters,
+    const HePackingPlan &input_packing)
 {
     auto valid = Block2LevelPlanner::Validate(parameters);
     if (!valid.ok()) return valid.status();
@@ -1064,13 +1481,16 @@ Result<std::vector<int>> SealBlock2Executor::RequiredRotationSteps(
     const auto slots = parameters.polynomial_degree / 2;
     if (layer.tokens > slots)
         return Status::Invalid("Block 2 token dimension exceeds CKKS slots");
+    // Step zero requests SEAL's conjugation key. Every non-zero element is
+    // an exact rotate_vector offset used by the kernels below.
     std::set<int> steps{0};
-    for (std::size_t power = 1; power <= slots / 2; power <<= 1U) {
-        steps.insert(static_cast<int>(power));
-        if (power != slots / 2)
-            steps.insert(-static_cast<int>(power));
-        if (power > slots / 2 / 2) break;
+    for (const auto layout : {Layout::kMultiHeadQ, Layout::kMultiHeadK,
+                              Layout::kMultiHeadV}) {
+        auto collected = CollectProjectionRotationSteps(
+            layer, input_packing, layout, slots, steps);
+        if (!collected.ok()) return collected.status();
     }
+    CollectQkRotationSteps(layer, slots, steps);
     return std::vector<int>(steps.begin(), steps.end());
 }
 
@@ -1091,14 +1511,23 @@ Result<Block2HeOutputs> SealBlock2Executor::Evaluate(
             region->second.parameter_profile, contexts_.role());
         auto level_valid = Block2LevelPlanner::Validate(context.parameters);
         if (!level_valid.ok()) return level_valid.status();
-        auto required = RequiredRotationSteps(layer_, context.parameters);
-        if (!required.ok()) return required.status();
+        if (report) {
+            if (required_rotations_) {
+                report->required_rotation_steps = *required_rotations_;
+            } else {
+                auto required = RequiredRotationSteps(layer_,
+                                                      context.parameters);
+                if (!required.ok()) return required.status();
+                report->required_rotation_steps = required.take_value();
+            }
+        }
         if (context.galois_keys.size() == 0)
             return Status::FailedPrecondition(
                 "Block 2 Galois keys have not been compiled");
         if (report) {
+            const auto rotations = std::move(report->required_rotation_steps);
             *report = {};
-            report->required_rotation_steps = required.value();
+            report->required_rotation_steps = rotations;
         }
 
         auto schema = DeriveWeightSchema(layer_);
@@ -1124,20 +1553,20 @@ Result<Block2HeOutputs> SealBlock2Executor::Evaluate(
         if (!centered.ok()) return centered.status();
         auto inverse = tensors_.Get(inputs.inverse_stddev.id);
         if (!inverse.ok()) return inverse.status();
-        auto gamma = parameters_.GetVector(gamma_handle->id);
+        auto gamma = parameters_.GetVectorShared(gamma_handle->id);
         if (!gamma.ok()) return gamma.status();
-        auto beta = parameters_.GetVector(beta_handle->id);
+        auto beta = parameters_.GetVectorShared(beta_handle->id);
         if (!beta.ok()) return beta.status();
         auto normalized = LayerNormTailKernel::Evaluate(
-            centered.value(), inverse.value(), gamma.value(), beta.value(),
+            centered.value(), inverse.value(), *gamma.value(), *beta.value(),
             layer_, context, report);
         if (!normalized.ok()) return normalized.status();
 
-        auto q_weights = parameters_.GetMatrix(weights.wq.id);
+        auto q_weights = parameters_.GetMatrixShared(weights.wq.id);
         if (!q_weights.ok()) return q_weights.status();
-        auto k_weights = parameters_.GetMatrix(weights.wk.id);
+        auto k_weights = parameters_.GetMatrixShared(weights.wk.id);
         if (!k_weights.ok()) return k_weights.status();
-        auto v_weights = parameters_.GetMatrix(weights.wv.id);
+        auto v_weights = parameters_.GetMatrixShared(weights.wv.id);
         if (!v_weights.ok()) return v_weights.status();
         auto load_bias = [&](const std::string &name)
             -> Result<std::optional<DenseVectorParameter>> {
@@ -1185,26 +1614,71 @@ Result<Block2HeOutputs> SealBlock2Executor::Evaluate(
                 qk_projection_input_level;
         }
 
-        // Q and K share rotations at the suffix level. V deliberately keeps
-        // the earlier level-2 representation required by Attention x V.
+        // Q and K share suffix-level rotations. V is independent and uses the
+        // earlier level-2 input, so overlap it with Q/K and QK when requested.
+        // The plaintext-cache scope is thread-local and must be installed in
+        // the V worker as well as on the orchestrating thread.
+        Block2ExecutionReport value_report;
+        const auto cache_binding = ModelPlaintextCacheScope::Current();
+        auto compute_value = [&]() -> Result<SealCipherTensor> {
+            std::unique_ptr<ModelPlaintextCacheScope> cache_scope;
+            if (cache_binding.first)
+                cache_scope = std::make_unique<ModelPlaintextCacheScope>(
+                    cache_binding.first, cache_binding.second);
+            ComplexDiagonalProjectionKernel projection(
+                layer_, context, report ? &value_report : nullptr);
+            return projection.Evaluate(
+                normalized.value(), *v_weights.value(), bv.value(),
+                Layout::kMultiHeadV);
+        };
+        std::future<Result<SealCipherTensor>> value_future;
+        struct FutureDrain {
+            std::future<Result<SealCipherTensor>> &future;
+            ~FutureDrain() { if (future.valid()) future.wait(); }
+        } value_drain{value_future};
+        const auto value_worker_bytes = detail::EstimatedHeWorkerBytes(
+            context.parameters.polynomial_degree,
+            context.parameters.coefficient_modulus_bits.size(), 16);
+        const bool parallel_value = config_.threads > 1 &&
+            value_worker_bytes <=
+                detail::HeWorkerPool::Instance().MemoryBudget() / 2;
+        if (parallel_value)
+            value_future = detail::HeWorkerPool::Instance().Submit(
+                1, compute_value);
         ComplexDiagonalProjectionKernel qk_projection(layer_, context, report);
         auto q = qk_projection.Evaluate(
-            qk_normalized, q_weights.value(), bq.value(),
+            qk_normalized, *q_weights.value(), bq.value(),
             Layout::kMultiHeadQ);
-        if (!q.ok()) return q.status();
+        if (!q.ok()) {
+            if (parallel_value) value_future.wait();
+            return q.status();
+        }
         auto k = qk_projection.Evaluate(
-            qk_normalized, k_weights.value(), bk.value(),
+            qk_normalized, *k_weights.value(), bk.value(),
             Layout::kMultiHeadK);
-        if (!k.ok()) return k.status();
-        ComplexDiagonalProjectionKernel value_projection(
-            layer_, context, report);
-        auto v = value_projection.Evaluate(
-            normalized.value(), v_weights.value(), bv.value(),
-            Layout::kMultiHeadV);
-        if (!v.ok()) return v.status();
+        if (!k.ok()) {
+            if (parallel_value) value_future.wait();
+            return k.status();
+        }
         auto scores = MultiHeadQkKernel::Evaluate(
-            q.value(), k.value(), layer_, context, report);
-        if (!scores.ok()) return scores.status();
+            q.value(), k.value(), layer_, context, report,
+            config_.threads > 1 ? config_.threads - 1 : 1);
+        if (!scores.ok()) {
+            if (parallel_value) value_future.wait();
+            return scores.status();
+        }
+        auto v = parallel_value ? value_future.get() : compute_value();
+        if (!v.ok()) return v.status();
+        if (report) {
+            report->rotations += value_report.rotations;
+            report->conjugations += value_report.conjugations;
+            report->ciphertext_plain_multiplications +=
+                value_report.ciphertext_plain_multiplications;
+            report->ciphertext_multiplications +=
+                value_report.ciphertext_multiplications;
+            report->relinearizations += value_report.relinearizations;
+            report->rescales += value_report.rescales;
+        }
 
         auto score_handle = tensors_.Allocate(scores.take_value());
         if (!score_handle.ok()) return score_handle.status();

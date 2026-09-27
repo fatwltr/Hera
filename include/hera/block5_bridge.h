@@ -57,7 +57,8 @@ public:
 
     static Result<std::map<std::string, std::vector<int>>>
     RequiredRotationSteps(const HeraConfig &config,
-                          std::size_t current_layer_index);
+                          std::size_t current_layer_index,
+                          bool include_next_layer = true);
 
     Result<Block5BridgeOutputs> Evaluate(
         const Block5BridgeInputs &inputs,
