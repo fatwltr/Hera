@@ -29,6 +29,12 @@ cd Hera
 成功标志：`HERA_BUILD_STATUS=PASS`、`HERA_PRIVATE_INFERENCE_STATUS=PASS`。
 本机双进程运行需保证端口 23100 起的协议端口空闲。
 
+仅下载 SEAL、BLB、BOLT 和 Eigen 源码（不编译）：
+
+```bash
+./scripts/download_dependencies.sh .deps
+```
+
 仅检查图框架（无需 SEAL/SCI）：
 
 ```bash
