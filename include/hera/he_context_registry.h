@@ -56,11 +56,14 @@ struct SerializedPublicContextBundle {
 
 class HeContextRegistry {
 public:
-    Result<void> CreateClientProfiles(const HeraConfig &config);
+    // Conversion and ciphertext/plaintext projection do not need relin keys.
+    // Keep the default for callers that also perform ciphertext products.
+    Result<void> CreateClientProfiles(
+        const HeraConfig &config, bool require_relinearization_keys = true);
     Result<PublicContextBundle> ExportPublicBundle() const;
     Result<SerializedPublicContextBundle> ExportSerializedPublicBundle(
         seal::compr_mode_type compression =
-            seal::compr_mode_type::none) const;
+            seal::Serialization::compr_mode_default) const;
     Result<void> CreateServerProfiles(const HeraConfig &config,
                                       const PublicContextBundle &bundle);
     Result<void> CreateServerProfiles(
@@ -71,6 +74,12 @@ public:
     // compiled from the HE graph; step zero requests complex conjugation.
     Result<void> CompileRotationKeys(
         std::string_view profile, const std::vector<int> &steps);
+
+    // After the server has received its public bundle, the online client only
+    // encrypts/decrypts. Keep its secret/public keys, release evaluation keys
+    // and their dedicated pools. Callers evaluating HE on the client retain
+    // those keys by simply not calling this method.
+    Result<void> ReleaseClientEvaluationKeys();
 
     const HeContext &Require(std::string_view profile,
                              PartyRole role) const;

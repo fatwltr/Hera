@@ -27,12 +27,12 @@ Result<TensorId> ActivationGraphModule::Build(
         }
         auto real_spec = HeSpec(input_spec, input_spec.shape,
                                 Layout::kStrictColumn, output_region);
-        real_spec.planned_level = input_spec.planned_level.value_or(2) + 1;
+        real_spec.planned_level = input_spec.planned_level;
         real_spec.planned_scale_bits =
             graph.ActiveParameters(output_region).output_scale_bits;
-        const auto real = graph.AddNode(
-            prefix + ".realify", OpKind::kHeRealifyComplex, {input},
-            real_spec);
+        if (input_spec.layout != Layout::kStrictColumn)
+            return Status::Invalid(prefix + ": GeLU requires real-column Wu output");
+        const auto real = input;
 
         auto polynomial_spec = real_spec;
         const auto &parameters = graph.ActiveParameters(output_region);

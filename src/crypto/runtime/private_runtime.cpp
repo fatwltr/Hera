@@ -1,4 +1,6 @@
 #include "hera/private_runtime.h"
+#include "hera/detail/he_level.h"
+#include "hera/detail/level_schedule.h"
 
 #include <algorithm>
 #include <chrono>
@@ -12,133 +14,7 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-Result<seal::parms_id_type> LevelId(const HeContext &context,
-                                    std::size_t target_level)
-{
-    auto data = context.context->first_context_data();
-    for (std::size_t level = 0; data && level < target_level; ++level)
-        data = data->next_context_data();
-    if (!data)
-        return Status::FailedPrecondition(
-            "requested level exceeds the CKKS modulus chain");
-    return data->parms_id();
-}
-
-Result<PhysicalSlotMap> ToConversionMap(const HePackingPlan &packing)
-{
-    auto valid = packing.Validate();
-    if (!valid.ok()) return valid.status();
-    PhysicalSlotMap map;
-    map.ciphertext_count = packing.ciphertext_count;
-    map.slots_per_ciphertext = packing.slot_count;
-    map.logical_element_count = packing.logical_locations.size();
-    map.assignments.resize(map.ciphertext_count * map.slots_per_ciphertext);
-    for (std::size_t logical = 0; logical < packing.logical_locations.size();
-         ++logical) {
-        const auto &locations = packing.Locations(logical);
-        if (locations.size() != 1)
-            return Status::Invalid(
-                "conversion boundary requires one physical lane per value");
-        const auto &location = locations.front();
-        auto &entry = map.assignments[
-            location.ciphertext * packing.slot_count + location.slot];
-        auto &index = location.component == ComplexLane::kReal
-            ? entry.real_logical_index : entry.imaginary_logical_index;
-        if (index != kUnusedLogicalIndex)
-            return Status::Invalid("conversion slot map is not injective");
-        index = logical;
-    }
-    valid = map.Validate();
-    if (!valid.ok()) return valid.status();
-    return map;
-}
-
-Result<ComplexMpcSharePair> Scatter(const MpcShareTensor &logical,
-                                    const HePackingPlan &packing)
-{
-    auto valid = logical.Validate();
-    if (!valid.ok()) return valid.status();
-    if (logical.local_share.size() != packing.logical_locations.size())
-        return Status::Invalid("share and packing logical sizes differ");
-    const auto count = packing.ciphertext_count * packing.slot_count;
-    std::vector<std::uint64_t> real(count), imag(count);
-    for (std::size_t i = 0; i < logical.local_share.size(); ++i) {
-        for (const auto &location : packing.Locations(i)) {
-            auto &plane = location.component == ComplexLane::kReal
-                ? real : imag;
-            plane[location.ciphertext * packing.slot_count + location.slot] =
-                logical.local_share[i];
-        }
-    }
-    const TensorShape physical{{packing.ciphertext_count, packing.slot_count}};
-    return ComplexMpcSharePair{
-        {std::move(real), physical, logical.numeric, ComplexComponent::kReal},
-        {std::move(imag), physical, logical.numeric,
-         ComplexComponent::kImaginary}};
-}
-
-Result<MpcShareTensor> Compact(const ComplexMpcSharePair &physical,
-                               const HePackingPlan &packing,
-                               const TensorShape &shape, bool is_signed)
-{
-    auto valid = physical.Validate();
-    if (!valid.ok()) return valid.status();
-    std::vector<std::uint64_t> values(packing.logical_locations.size());
-    for (std::size_t logical = 0; logical < values.size(); ++logical) {
-        const auto &location = packing.Locations(logical).front();
-        const auto index = location.ciphertext * packing.slot_count +
-                           location.slot;
-        values[logical] = location.component == ComplexLane::kReal
-            ? physical.real.local_share[index]
-            : physical.imag.local_share[index];
-    }
-    auto numeric = physical.real.numeric;
-    numeric.is_signed = is_signed;
-    return MpcShareTensor{std::move(values), shape, numeric,
-                          ComplexComponent::kReal};
-}
-
-HePackingPlan VariancePacking(std::size_t tokens, std::size_t slots)
-{
-    HePackingPlan result;
-    result.layout = Layout::kReduction;
-    result.logical_shape = {{tokens, 1}};
-    result.slot_count = slots;
-    result.ciphertext_count = 1;
-    result.logical_locations.resize(tokens);
-    for (std::size_t token = 0; token < tokens; ++token)
-        result.logical_locations[token].push_back(
-            {0, token, ComplexLane::kReal, std::nullopt});
-    return result;
-}
-
-TensorSpec HeSpec(const TensorShape &shape, Layout layout, HeRegionId region,
-                  const HeContext &context, std::size_t level,
-                  int scale_bits, const NumericFormat &numeric)
-{
-    TensorSpec result;
-    result.shape = shape;
-    result.domain = Domain::kHeCiphertext;
-    result.layout = layout;
-    result.numeric = numeric;
-    result.he_region = region;
-    result.he_parameter_profile = context.profile;
-    result.planned_level = level;
-    result.planned_scale_bits = scale_bits;
-    return result;
-}
-
-void AddConversion(const ConversionStats &before, const ConversionStats &after,
-                   PreLnEntryExecutionReport *report, bool to_he)
-{
-    if (!report) return;
-    if (to_he) ++report->mpc_to_ckks_calls;
-    else ++report->ckks_to_mpc_calls;
-    report->conversion_communication_bytes +=
-        after.communication_bytes - before.communication_bytes;
-    report->conversion_rounds += after.rounds - before.rounds;
-    report->conversion_milliseconds += after.milliseconds - before.milliseconds;
-}
+using detail::LevelId;
 
 const LayerWeightHandles *FindLayerWeights(
     const TransformerWeightHandles &weights, const std::string &id)
@@ -159,6 +35,8 @@ void AppendStage(ExecutionReport *report, std::size_t layer,
                   << " status=" << (status.ok() ? "OK" : status.message())
                   << '\n';
     if (!report) return;
+    report->communication_bytes += metrics.communication_bytes;
+    report->rounds += metrics.rounds;
     report->stages.push_back({layer, std::move(name),
         std::chrono::duration<double, std::milli>(Clock::now() - started).count(),
         status, std::move(metrics)});
@@ -167,12 +45,14 @@ void AppendStage(ExecutionReport *report, std::size_t layer,
 ExecutionReport::StageMetrics Metrics(const PreLnEntryExecutionReport &value,
                                       std::size_t tokens)
 {
-    return {value.conversion_communication_bytes, value.conversion_rounds,
+    return {value.conversion_communication_bytes + value.statistics.mpc_communication_bytes,
+            value.conversion_rounds + value.statistics.mpc_rounds,
             value.ckks_to_mpc_calls + value.mpc_to_ckks_calls,
-            value.block2.rotations,
-            value.block2.ciphertext_plain_multiplications,
-            value.block2.ciphertext_multiplications,
-            value.block2.relinearizations, value.block2.rescales, tokens};
+            value.block2.rotations + value.statistics.rotations,
+            value.block2.ciphertext_plain_multiplications + value.statistics.ciphertext_plain_multiplications,
+            value.block2.ciphertext_multiplications + value.statistics.ciphertext_multiplications,
+            value.block2.relinearizations + value.statistics.relinearizations,
+            value.block2.rescales + value.statistics.rescales, tokens};
 }
 
 ExecutionReport::StageMetrics Metrics(const SoftmaxExecutionReport &value)
@@ -223,25 +103,14 @@ ExecutionReport::StageMetrics Metrics(
 Result<void> ValidateRuntimeConfig(const HeraConfig &config)
 {
     for (const auto &layer : config.layers) {
-        if (layer.norm != NormPlacement::kPreNorm)
+        if (layer.norm == NormPlacement::kPostNorm)
             return Status::KernelUnavailable(
-                "real HERA runtime currently supports Pre-LN only");
+                "real HERA runtime currently supports pre or normalized_residual, not post");
         if (layer.activation != ActivationKind::kGelu)
             return Status::KernelUnavailable(
                 "real HERA runtime currently supports GeLU only");
     }
     return {};
-}
-
-Result<seal::parms_id_type> ParmsAtLevel(const HeContext &context,
-                                         std::size_t level)
-{
-    auto data = context.context->first_context_data();
-    for (std::size_t current = 0; data && current < level; ++current)
-        data = data->next_context_data();
-    if (!data) return Status::FailedPrecondition(
-        "plaintext preparation level is outside the modulus chain");
-    return data->parms_id();
 }
 
 // A Prepare-only contract carrier: no encryption, ciphertext coefficient
@@ -252,7 +121,7 @@ Result<SealCipherTensor> PreparationTensor(
 {
     auto valid = packing.Validate();
     if (!valid.ok()) return valid.status();
-    auto parms = ParmsAtLevel(context, level);
+    auto parms = LevelId(context, level);
     if (!parms.ok()) return parms.status();
     std::vector<seal::Ciphertext> ciphertexts(packing.ciphertext_count);
     for (auto &ciphertext : ciphertexts) {
@@ -316,332 +185,6 @@ private:
 };
 
 } // namespace
-
-SealSciPreLnEntryExecutor::SealSciPreLnEntryExecutor(
-    const HeraConfig &config, std::size_t layer_index,
-    HeContextRegistry &contexts, RuntimeTensorArena &arena,
-    SealPlainParameterStore &parameters, CkksMpcConverter &converter,
-    MpcLayerNormRuntime &mpc_layer_norm,
-    const CompiledLayerExecutionPlan *plan)
-    : config_(config), layer_index_(layer_index), contexts_(contexts),
-      arena_(arena), parameters_(parameters), converter_(converter),
-      mpc_layer_norm_(mpc_layer_norm), plan_(plan)
-{}
-
-Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
-    const TensorHandle &hidden, const LayerWeightHandles &weights,
-    PreLnEntryExecutionReport *report)
-{
-    const auto started = Clock::now();
-    try {
-        if (report) *report = {};
-        if (layer_index_ >= config_.layers.size())
-            return Status::Invalid("Pre-LN layer index is out of range");
-        const auto &layer = config_.layers[layer_index_];
-        if (weights.layer_id != layer.id)
-            return Status::Invalid("Pre-LN weight layer ID mismatch");
-        const TensorShape hidden_shape{{layer.tokens, layer.model_width}};
-        if (!hidden.valid() || hidden.spec.domain != Domain::kHeCiphertext ||
-            hidden.spec.shape != hidden_shape ||
-            hidden.spec.layout != Layout::kStrictColumn ||
-            !hidden.spec.he_parameter_profile)
-            return Status::Invalid(
-                "Pre-LN input must be a real strict-column HE tensor");
-
-        const auto *execution = FindLayerExecution(config_, layer.id);
-        if (!execution) return Status::Invalid("Pre-LN placement is absent");
-        const auto r1_it = execution->regions.find(HeRegionId::kRegion1);
-        const auto r2_it = execution->regions.find(HeRegionId::kRegion2);
-        const auto r4_it = execution->regions.find(HeRegionId::kRegion4);
-        if (r1_it == execution->regions.end() ||
-            r2_it == execution->regions.end() ||
-            r4_it == execution->regions.end())
-            return Status::Invalid("Pre-LN Region 1/2/4 placement is absent");
-        if (r2_it->second.parameter_profile !=
-            r4_it->second.parameter_profile)
-            return Status::FailedPrecondition(
-                "Region 2 and Region 4 must share one HE profile");
-        const auto &source = contexts_.Require(
-            *hidden.spec.he_parameter_profile, contexts_.role());
-        const auto &region1 = contexts_.Require(
-            r1_it->second.parameter_profile, contexts_.role());
-        const auto &shared = contexts_.Require(
-            r2_it->second.parameter_profile, contexts_.role());
-        const auto region1_terminal =
-            region1.parameters.coefficient_modulus_bits.size() -
-            region1.parameters.terminal_prime_count;
-        constexpr std::size_t kRegion1StatisticsDepth = 3;
-        if (region1_terminal < kRegion1StatisticsDepth)
-            return Status::FailedPrecondition(
-                "Region-1 profile has no three-level statistics suffix");
-        const auto region1_start =
-            region1_terminal - kRegion1StatisticsDepth;
-        if (plan_ && (plan_->layer_id != layer.id ||
-                      plan_->statistics_profile != region1.profile ||
-                      plan_->attention_profile != shared.profile ||
-                      plan_->statistics_input_level != region1_start))
-            return Status::FailedPrecondition(
-                "Pre-LN compiled plan does not match its HE contexts");
-
-        auto source_plan = AttentionLn2PackingPlanner::RealStrictColumns(
-            hidden_shape, source.slot_count());
-        if (!source_plan.ok()) return source_plan.status();
-        auto source_map = ToConversionMap(source_plan.value());
-        if (!source_map.ok()) return source_map.status();
-        std::optional<SealCipherBatch> source_batch;
-        std::optional<SealCipherTensor> source_tensor;
-        if (contexts_.role() == PartyRole::kServer) {
-            auto loaded = arena_.he.Get(hidden.id);
-            if (!loaded.ok()) return loaded.status();
-            source_tensor = loaded.take_value();
-            auto valid = source_tensor->Validate(source);
-            if (!valid.ok()) return valid.status();
-            source_batch = SealCipherBatch{
-                source.profile, source_tensor->ciphertexts, hidden_shape,
-                Layout::kStrictColumn, source_map.value()};
-        }
-        auto before = converter_.stats();
-        auto source_physical = converter_.CkksToMpc(source_batch);
-        if (!source_physical.ok()) return source_physical.status();
-        AddConversion(before, converter_.stats(), report, false);
-        auto hidden_shares = Compact(source_physical.value(),
-                                     source_plan.value(), hidden_shape, true);
-        if (!hidden_shares.ok()) return hidden_shares.status();
-
-        // The residual has no HE work before Wo, so create it directly at
-        // Wo's output level. This avoids carrying a long, unused RNS prefix
-        // and removes the online L0->L6 modulus switch at residual addition.
-        const auto shared_terminal =
-            shared.parameters.coefficient_modulus_bits.size() -
-            shared.parameters.terminal_prime_count;
-        if (plan_ && plan_->attention_scores_level != shared_terminal)
-            return Status::FailedPrecondition(
-                "Pre-LN compiled attention terminal level mismatch");
-        constexpr std::size_t kLayerNormStatisticsDepth = 3;
-        if (shared_terminal < kLayerNormStatisticsDepth)
-            return Status::FailedPrecondition(
-                "shared profile has no LayerNorm statistics suffix");
-        const auto attention_residual_level =
-            shared_terminal - kLayerNormStatisticsDepth;
-        auto residual_plan = AttentionLn2PackingPlanner::ComplexStrictColumns(
-            hidden_shape, shared.slot_count());
-        if (!residual_plan.ok()) return residual_plan.status();
-        auto residual_pair = Scatter(hidden_shares.value(),
-                                     residual_plan.value());
-        if (!residual_pair.ok()) return residual_pair.status();
-        auto residual_map = ToConversionMap(residual_plan.value());
-        if (!residual_map.ok()) return residual_map.status();
-        before = converter_.stats();
-        auto residual_he = converter_.MpcToCkks(
-            residual_pair.value(),
-            {shared.profile, attention_residual_level,
-             shared.parameters.input_scale_bits, hidden_shape,
-             Layout::kComplexStrictColumn, residual_map.value()});
-        if (!residual_he.ok()) return residual_he.status();
-        AddConversion(before, converter_.stats(), report, true);
-        const auto residual_id = arena_.ids.Next();
-        const auto residual_spec = HeSpec(
-            hidden_shape, Layout::kComplexStrictColumn, HeRegionId::kRegion4,
-            shared, attention_residual_level,
-            shared.parameters.input_scale_bits,
-            config_.mpc_numeric);
-        if (contexts_.role() == PartyRole::kServer) {
-            if (!residual_he.value())
-                return Status::Internal("server did not receive HE residual");
-            SealCipherTensor tensor{shared.profile,
-                residual_he.value()->ciphertexts, residual_spec,
-                residual_plan.value()};
-            auto stored = arena_.he.Put(residual_id, std::move(tensor));
-            if (!stored.ok()) return stored.status();
-        }
-
-        // Region-1 statistics consume exactly three levels. Start at the
-        // terminal suffix so variance naturally reaches the conversion
-        // boundary instead of performing a final conversion-only drop.
-        auto region1_plan = AttentionLn2PackingPlanner::RealStrictColumns(
-            hidden_shape, region1.slot_count());
-        if (!region1_plan.ok()) return region1_plan.status();
-        std::optional<SealCipherTensor> region1_input;
-        const bool direct_region1 = source.profile == region1.profile &&
-            hidden.spec.planned_level &&
-            *hidden.spec.planned_level <= region1_start &&
-            hidden.spec.planned_scale_bits ==
-                std::optional<int>{region1.parameters.input_scale_bits};
-        if (contexts_.role() == PartyRole::kServer && direct_region1) {
-            region1_input = source_tensor;
-            auto target = LevelId(region1, region1_start);
-            if (!target.ok()) return target.status();
-            seal::Evaluator evaluator(*region1.context);
-            for (auto &ct : region1_input->ciphertexts)
-                if (ct.parms_id() != target.value())
-                    evaluator.mod_switch_to_inplace(ct, target.value());
-            region1_input->logical_spec.planned_level = region1_start;
-        } else if (!direct_region1) {
-            auto pair = Scatter(hidden_shares.value(), region1_plan.value());
-            if (!pair.ok()) return pair.status();
-            auto map = ToConversionMap(region1_plan.value());
-            if (!map.ok()) return map.status();
-            before = converter_.stats();
-            auto refreshed = converter_.MpcToCkks(
-                pair.value(), {region1.profile, region1_start,
-                    region1.parameters.input_scale_bits, hidden_shape,
-                    Layout::kStrictColumn, map.value()});
-            if (!refreshed.ok()) return refreshed.status();
-            AddConversion(before, converter_.stats(), report, true);
-            if (contexts_.role() == PartyRole::kServer) {
-                if (!refreshed.value())
-                    return Status::Internal(
-                        "server did not receive Region-1 refresh");
-                region1_input = SealCipherTensor{
-                    region1.profile, refreshed.value()->ciphertexts,
-                    HeSpec(hidden_shape, Layout::kStrictColumn,
-                           HeRegionId::kRegion1, region1, region1_start,
-                           region1.parameters.input_scale_bits,
-                           config_.mpc_numeric), region1_plan.value()};
-            }
-        }
-
-        std::optional<LayerNormStatisticsOutputs> statistics;
-        if (contexts_.role() == PartyRole::kServer) {
-            auto computed = LayerNormStatisticsKernel::Evaluate(
-                *region1_input, layer, region1, nullptr);
-            if (!computed.ok()) return computed.status();
-            statistics = computed.take_value();
-        }
-
-        auto convert_statistic = [&](bool centered)
-            -> Result<MpcShareTensor> {
-            const TensorShape shape = centered
-                ? hidden_shape : TensorShape{{layer.tokens, 1}};
-            const auto packing = centered ? region1_plan.value()
-                : VariancePacking(layer.tokens, region1.slot_count());
-            auto map = ToConversionMap(packing);
-            if (!map.ok()) return map.status();
-            std::optional<SealCipherBatch> batch;
-            if (contexts_.role() == PartyRole::kServer) {
-                const auto &tensor = centered ? statistics->centered
-                                              : statistics->variance;
-                batch = SealCipherBatch{region1.profile, tensor.ciphertexts,
-                                        shape, packing.layout, map.value()};
-            }
-            auto local_before = converter_.stats();
-            auto physical = converter_.CkksToMpc(batch);
-            if (!physical.ok()) return physical.status();
-            AddConversion(local_before, converter_.stats(), report, false);
-            return Compact(physical.value(), packing, shape, true);
-        };
-        auto centered = convert_statistic(true);
-        if (!centered.ok()) return centered.status();
-        auto variance = convert_statistic(false);
-        if (!variance.ok()) return variance.status();
-        const auto mpc_started = Clock::now();
-        auto inverse = mpc_layer_norm_.ReciprocalSqrt(
-            variance.value(), layer.attention_norm_rsqrt_bits, nullptr);
-        if (!inverse.ok()) return inverse.status();
-        // The LayerNorm runtime is shared by the orchestrator; retaining its
-        // Ferret state avoids another base/setup phase at LN2 and next layers.
-        if (report)
-            report->mpc_milliseconds += std::chrono::duration<double,
-                std::milli>(Clock::now() - mpc_started).count();
-
-        auto dense = MultiHeadPackingPlan::DenseSpatial(
-            hidden_shape, shared.slot_count());
-        if (!dense.ok()) return dense.status();
-        auto centered_pair = Scatter(centered.value(), dense.value());
-        if (!centered_pair.ok()) return centered_pair.status();
-        MpcShareTensor broadcast;
-        broadcast.physical_shape = hidden_shape;
-        broadcast.numeric = inverse.value().numeric;
-        broadcast.component = ComplexComponent::kReal;
-        broadcast.local_share.resize(layer.tokens * layer.model_width);
-        for (std::size_t token = 0; token < layer.tokens; ++token)
-            for (std::size_t feature = 0; feature < layer.model_width; ++feature)
-                broadcast.local_share[token * layer.model_width + feature] =
-                    inverse.value().local_share[token];
-        auto inverse_pair = Scatter(broadcast, dense.value());
-        if (!inverse_pair.ok()) return inverse_pair.status();
-        auto dense_map = ToConversionMap(dense.value());
-        if (!dense_map.ok()) return dense_map.status();
-        auto to_block2 = [&](const ComplexMpcSharePair &pair)
-            -> Result<std::optional<SealCipherBatch>> {
-            auto local_before = converter_.stats();
-            auto result = converter_.MpcToCkks(
-                pair, {shared.profile, std::size_t{0},
-                    shared.parameters.input_scale_bits, hidden_shape,
-                    Layout::kSpatial, dense_map.value()});
-            if (!result.ok()) return result.status();
-            AddConversion(local_before, converter_.stats(), report, true);
-            return result;
-        };
-        auto centered_he = to_block2(centered_pair.value());
-        if (!centered_he.ok()) return centered_he.status();
-        auto inverse_he = to_block2(inverse_pair.value());
-        if (!inverse_he.ok()) return inverse_he.status();
-        const auto centered_id = arena_.ids.Next();
-        const auto inverse_id = arena_.ids.Next();
-        const auto block_spec = HeSpec(
-            hidden_shape, Layout::kSpatial, HeRegionId::kRegion2, shared, 0,
-            shared.parameters.input_scale_bits, config_.mpc_numeric);
-        if (contexts_.role() == PartyRole::kServer) {
-            if (!centered_he.value() || !inverse_he.value())
-                return Status::Internal("server did not receive Block-2 inputs");
-            auto stored = arena_.he.Put(centered_id,
-                {shared.profile, centered_he.value()->ciphertexts,
-                 block_spec, dense.value()});
-            if (!stored.ok()) return stored.status();
-            stored = arena_.he.Put(inverse_id,
-                {shared.profile, inverse_he.value()->ciphertexts,
-                 block_spec, dense.value()});
-            if (!stored.ok()) return stored.status();
-        }
-
-        const auto score_id = arena_.ids.Next();
-        const auto value_id = arena_.ids.Next();
-        TensorSpec score_spec = HeSpec(
-            {{layer.q_heads, layer.tokens, layer.tokens}},
-            Layout::kAttentionDiagonal, HeRegionId::kRegion2, shared,
-            shared_terminal,
-            shared.parameters.output_scale_bits, config_.mpc_numeric);
-        TensorSpec value_spec = HeSpec(
-            {{layer.tokens, layer.kv_heads, layer.value_head_width}},
-            Layout::kMultiHeadV, HeRegionId::kRegion2, shared,
-            plan_ ? plan_->retained_value_level : std::size_t{2},
-            shared.parameters.default_scale_bits, config_.mpc_numeric);
-        if (contexts_.role() == PartyRole::kServer) {
-            SealBlock2Executor block2(config_, layer, contexts_, arena_.he,
-                                      parameters_,
-                                      plan_ ? &plan_->block2_rotation_steps
-                                            : nullptr);
-            auto evaluated = block2.Evaluate(
-                {{centered_id, block_spec}, {inverse_id, block_spec}},
-                weights, report ? &report->block2 : nullptr);
-            if (!evaluated.ok()) return evaluated.status();
-            auto scores = arena_.he.Get(
-                evaluated.value().scaled_attention_scores.id);
-            if (!scores.ok()) return scores.status();
-            auto values = arena_.he.Get(evaluated.value().value.id);
-            if (!values.ok()) return values.status();
-            auto stored = arena_.he.Put(score_id, scores.take_value());
-            if (!stored.ok()) return stored.status();
-            stored = arena_.he.Put(value_id, values.take_value());
-            if (!stored.ok()) return stored.status();
-            arena_.he.Erase(evaluated.value().scaled_attention_scores.id);
-            arena_.he.Erase(evaluated.value().value.id);
-            arena_.he.Erase(centered_id);
-            arena_.he.Erase(inverse_id);
-        }
-        if (report)
-            report->he_milliseconds = std::chrono::duration<double,
-                std::milli>(Clock::now() - started).count() -
-                report->conversion_milliseconds - report->mpc_milliseconds;
-        return PreLnEntryOutputs{
-            {{score_id, score_spec}, {value_id, value_spec}},
-            {residual_id, residual_spec}};
-    } catch (const std::exception &error) {
-        return Status::Internal(std::string("Pre-LN entry failed: ") +
-                                error.what());
-    }
-}
 
 SealSciTransformerRuntime::SealSciTransformerRuntime(
     const HeraConfig &config, HeContextRegistry &contexts,
@@ -720,9 +263,27 @@ Result<void> SealSciTransformerRuntime::Prepare(
                     PartyRole::kServer);
             };
 
-            // Block 2: LN1 affine and Q/K/V transformed diagonals.
+            // Block 2: dynamic normalization and pre-fused Q/K/V diagonals.
             const auto &block2_context = region_context(HeRegionId::kRegion2);
-            auto dense = MultiHeadPackingPlan::DenseSpatial(
+            const auto &statistics_context = region_context(HeRegionId::kRegion1);
+            const auto statistics_terminal = statistics_context.parameters.coefficient_modulus_bits.size() -
+                statistics_context.parameters.terminal_prime_count;
+            if (statistics_terminal < 3)
+                return Status::FailedPrecondition("LN1 preparation needs three statistics levels");
+            auto statistics_plan = AttentionLn2PackingPlanner::RealStrictColumns(
+                {{layer.tokens, layer.model_width}}, statistics_context.slot_count());
+            if (!statistics_plan.ok()) return statistics_plan.status();
+            TensorSpec statistics_spec;
+            statistics_spec.shape = {{layer.tokens, layer.model_width}};
+            statistics_spec.numeric = config_.mpc_numeric;
+            statistics_spec.he_region = HeRegionId::kRegion1;
+            auto statistics_input = PreparationTensor(statistics_context, statistics_plan.value(),
+                statistics_spec, statistics_terminal - 3, plan_->layers[i].statistics_input_scale_bits);
+            if (!statistics_input.ok()) return statistics_input.status();
+            auto statistics_prepared = LayerNormStatisticsKernel::Prepare(
+                statistics_input.value(), layer, statistics_context, nullptr, plan_->layers[i].statistics_input_scale_bits);
+            if (!statistics_prepared.ok()) return statistics_prepared.status();
+            auto dense = MultiHeadPackingPlan::RealStrictColumns(
                 {{layer.tokens, layer.model_width}},
                 block2_context.slot_count());
             if (!dense.ok()) return dense.status();
@@ -734,22 +295,33 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 block2_context, dense.value(), dense_spec, 0,
                 block2_context.parameters.input_scale_bits);
             if (!centered.ok()) return centered.status();
+            auto broadcast = MultiHeadPackingPlan::TokenInverseBroadcast(layer.tokens, block2_context.slot_count());
+            if (!broadcast.ok()) return broadcast.status();
+            auto ln1_inverse_spec = dense_spec;
+            ln1_inverse_spec.shape = {{layer.tokens, 1}};
             auto inverse = PreparationTensor(
-                block2_context, dense.value(), dense_spec, 0,
+                block2_context, broadcast.value(), ln1_inverse_spec, 0,
                 block2_context.parameters.input_scale_bits);
             if (!inverse.ok()) return inverse.status();
-            auto gamma1 = plain("ln1.gamma");
-            auto beta1 = plain("ln1.beta");
-            if (!gamma1.ok()) return gamma1.status();
-            if (!beta1.ok()) return beta1.status();
+            auto affine = parameters_.GetGammaFusedLayerNorm(handles->wq.id);
+            if (!affine.ok()) return affine.status();
+            std::optional<GammaFusedLayerNormParameters> original_ln1;
+            SealCipherTensor ln1_residual;
+            if (layer.norm == NormPlacement::kNormalizedResidual && layer.attention_residual) {
+                auto gamma = plain("ln1.gamma"), beta = plain("ln1.beta");
+                if (!gamma.ok()) return gamma.status();
+                if (!beta.ok()) return beta.status();
+                original_ln1 = GammaFusedLayerNormParameters{gamma.take_value(), beta.take_value()};
+            }
             auto normalized = LayerNormTailKernel::Evaluate(
-                centered.value(), inverse.value(), gamma1.value(),
-                beta1.value(), layer, block2_context);
+                centered.value(), inverse.value(), *affine.value(), layer, block2_context,
+                nullptr, original_ln1 ? &*original_ln1 : nullptr,
+                original_ln1 ? &ln1_residual : nullptr);
             if (!normalized.ok()) return normalized.status();
             const auto block2_terminal =
                 block2_context.parameters.coefficient_modulus_bits.size() -
                 block2_context.parameters.terminal_prime_count;
-            constexpr std::size_t kQkDepth = 5;
+            constexpr auto kQkDepth = MultiHeadQkKernel::kDepth;
             if (block2_terminal <= kQkDepth)
                 return Status::FailedPrecondition(
                     "Block-2 profile has no projection level before QK suffix");
@@ -761,10 +333,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 if (ct.parms_id() != qk_target.value())
                     ct.parms_id() = qk_target.value();
             qk_normalized.logical_spec.planned_level = qk_projection_input;
-            ComplexDiagonalProjectionKernel qk_projection(
-                layer, block2_context);
-            ComplexDiagonalProjectionKernel value_projection(
-                layer, block2_context);
+            ComplexDiagonalProjectionKernel projection(layer, block2_context);
             for (const auto &entry : std::vector<std::tuple<
                      const WeightHandle *, std::string_view, Layout>>{
                      {&handles->wq, "bq", Layout::kMultiHeadQ},
@@ -779,18 +348,28 @@ Result<void> SealSciTransformerRuntime::Prepare(
                     bias = loaded.take_value();
                 }
                 const auto layout = std::get<2>(entry);
-                auto compiled = layout == Layout::kMultiHeadV
-                    ? value_projection.Evaluate(
-                        normalized.value(), *weights_value.value(), bias,
-                        layout)
-                    : qk_projection.Evaluate(
-                        qk_normalized, *weights_value.value(), bias, layout);
+                const auto &source = layout == Layout::kMultiHeadV
+                    ? normalized.value() : qk_normalized;
+                auto compiled = projection.Evaluate(
+                    source, *weights_value.value(), bias, layout);
                 if (!compiled.ok()) return compiled.status();
             }
 
-            // Attention output Wo/bo starts from the A*V recovery packing at
-            // its planned level 5.
+            auto qk_compiled = MultiHeadQkKernel::Prepare(layer, block2_context);
+            if (!qk_compiled.ok()) return qk_compiled.status();
+
+            auto av_compiled = MultiHeadAttentionValueKernel::Prepare(
+                layer, block2_context, plan_->layers[i].attention_value_input_level);
+            if (!av_compiled.ok()) return av_compiled.status();
+
+            auto softmax_compiled = SealSciSoftmaxExecutor::Prepare(
+                layer, block2_context, region_context(HeRegionId::kRegion3), config_.softmax);
+            if (!softmax_compiled.ok()) return softmax_compiled.status();
+
+            // Compile Wo at the refreshed Region-4 level when profiles differ.
             const auto &shared = region_context(HeRegionId::kRegion4);
+            const auto wo_input_level =
+                plan_->layers[i].attention_output_input_level;
             auto av = AttentionLn2PackingPlanner::AttentionValue(
                 layer, shared.slot_count());
             if (!av.ok()) return av.status();
@@ -799,7 +378,7 @@ Result<void> SealSciTransformerRuntime::Prepare(
             attention_spec.numeric = config_.mpc_numeric;
             attention_spec.he_region = HeRegionId::kRegion4;
             auto attention = PreparationTensor(
-                shared, av.value().output_packing, attention_spec, 5,
+                shared, av.value().output_packing, attention_spec, wo_input_level,
                 shared.parameters.default_scale_bits);
             if (!attention.ok()) return attention.status();
             auto wo = matrix(handles->wo);
@@ -810,9 +389,12 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 if (!loaded.ok()) return loaded.status();
                 bo = loaded.take_value();
             }
-            auto wo_compiled = AttentionOutputProjectionKernel::Evaluate(
+            auto wo_compiled = AttentionOutputProjectionKernel::EvaluateReal(
                 attention.value(), *wo.value(), bo, layer, shared);
             if (!wo_compiled.ok()) return wo_compiled.status();
+            statistics_prepared = LayerNormStatisticsKernel::Prepare(
+                wo_compiled.value(), layer, shared);
+            if (!statistics_prepared.ok()) return statistics_prepared.status();
 
             // Region 5 LN2 affine and Wu/bu.
             const auto &ffn_context = region_context(HeRegionId::kRegion5);
@@ -826,10 +408,10 @@ Result<void> SealSciTransformerRuntime::Prepare(
             const auto ffn_terminal =
                 ffn_context.parameters.coefficient_modulus_bits.size() -
                 ffn_context.parameters.terminal_prime_count;
-            constexpr std::size_t kFfnGeluDepth = 6;
+            const auto kFfnGeluDepth = kFfnSuffixDepth;
             if (ffn_terminal < kFfnGeluDepth)
                 return Status::FailedPrecondition(
-                    "FFN preparation profile has no six-level suffix");
+                    "FFN preparation profile has no five-level suffix");
             const auto ffn_start = ffn_terminal - kFfnGeluDepth;
             auto ffn_centered = PreparationTensor(
                 ffn_context, ffn_plan.value().centered,
@@ -845,13 +427,21 @@ Result<void> SealSciTransformerRuntime::Prepare(
                 inverse_spec, ffn_start,
                 ffn_context.parameters.input_scale_bits);
             if (!ffn_inverse.ok()) return ffn_inverse.status();
-            auto gamma2 = plain("ln2.gamma");
-            auto beta2 = plain("ln2.beta");
-            if (!gamma2.ok()) return gamma2.status();
-            if (!beta2.ok()) return beta2.status();
+            auto ln2_affine = parameters_.GetGammaFusedLayerNorm(handles->wu.id);
+            if (!ln2_affine.ok()) return ln2_affine.status();
+            std::optional<GammaFusedLayerNormParameters> original_ln2;
+            SealCipherTensor ln2_residual;
+            if (layer.norm == NormPlacement::kNormalizedResidual && layer.ffn_residual) {
+                auto gamma = plain("ln2.gamma"), beta = plain("ln2.beta");
+                if (!gamma.ok()) return gamma.status();
+                if (!beta.ok()) return beta.status();
+                original_ln2 = GammaFusedLayerNormParameters{gamma.take_value(), beta.take_value()};
+            }
             auto ffn_normalized = FfnLayerNormTailKernel::Evaluate(
-                ffn_centered.value(), ffn_inverse.value(), gamma2.value(),
-                beta2.value(), layer, ffn_context);
+                ffn_centered.value(), ffn_inverse.value(), ln2_affine.value()->gamma,
+                ln2_affine.value()->beta, layer, ffn_context,
+                nullptr, config_.threads, original_ln2 ? &*original_ln2 : nullptr,
+                original_ln2 ? &ln2_residual : nullptr);
             if (!ffn_normalized.ok()) return ffn_normalized.status();
             auto wu = matrix(handles->wu);
             if (!wu.ok()) return wu.status();
@@ -864,30 +454,33 @@ Result<void> SealSciTransformerRuntime::Prepare(
             auto wu_compiled = FfnUpProjectionKernel::Evaluate(
                 ffn_normalized.value(), *wu.value(), bu, layer, ffn_context);
             if (!wu_compiled.ok()) return wu_compiled.status();
+            auto gelu_compiled = GeluPolynomialKernel::Evaluate(
+                wu_compiled.value(), config_.gelu, ffn_context);
+            if (!gelu_compiled.ok()) return gelu_compiled.status();
 
-            // Wd/bd use the terminal suffix for cross-layer conversion; the
-            // final layer retains the conventional L5->L6->L7 HE output.
+            // A shared R1/R5 profile retains complete LN2 directly for Wd.
+            const bool shared_skip = layer.norm == NormPlacement::kNormalizedResidual &&
+                statistics_context.profile == ffn_context.profile;
+            const auto &wd_context = shared_skip ? ffn_context : shared;
+            const int wd_scale_bits = shared_skip ? wd_context.parameters.output_scale_bits : wd_context.parameters.default_scale_bits;
+            const auto wd_region = shared_skip ? HeRegionId::kRegion5 : HeRegionId::kRegion4;
             auto activation_plan = FfnGeluPackingPlanner::ComplexColumns(
-                {{layer.tokens, layer.ffn_width}}, shared.slot_count(),
+                {{layer.tokens, layer.ffn_width}}, wd_context.slot_count(),
                 Layout::kFfn);
-            auto output_plan = FfnGeluPackingPlanner::ComplexColumns(
-                {{layer.tokens, layer.model_width}}, shared.slot_count(),
-                Layout::kComplexStrictColumn);
+            auto output_plan = FfnGeluPackingPlanner::RealColumns(
+                {{layer.tokens, layer.model_width}}, wd_context.slot_count(),
+                Layout::kStrictColumn);
             if (!activation_plan.ok()) return activation_plan.status();
             if (!output_plan.ok()) return output_plan.status();
             TensorSpec activation_spec;
             activation_spec.shape = {{layer.tokens, layer.ffn_width}};
             activation_spec.numeric = config_.mpc_numeric;
-            activation_spec.he_region = HeRegionId::kRegion4;
-            const auto shared_terminal =
-                shared.parameters.coefficient_modulus_bits.size() -
-                shared.parameters.terminal_prime_count;
-            const auto wd_input_level = i + 1 < config_.layers.size()
-                ? shared_terminal - 2 : std::size_t{5};
+            activation_spec.he_region = wd_region;
+            const auto wd_input_level = plan_->layers[i].ffn_output_level - 1;
             auto activation = PreparationTensor(
-                shared, activation_plan.value(), activation_spec,
+                wd_context, activation_plan.value(), activation_spec,
                 wd_input_level,
-                shared.parameters.default_scale_bits);
+                wd_scale_bits);
             if (!activation.ok()) return activation.status();
             auto wd = matrix(handles->wd);
             if (!wd.ok()) return wd.status();
@@ -899,9 +492,27 @@ Result<void> SealSciTransformerRuntime::Prepare(
             }
             auto wd_compiled = ComplexColumnProjectionKernel::Evaluate(
                 activation.value(), *wd.value(), bd, output_plan.value(),
-                HeRegionId::kRegion4,
-                shared.parameters.default_scale_bits, shared);
+                wd_region,
+                wd_scale_bits, wd_context);
             if (!wd_compiled.ok()) return wd_compiled.status();
+        }
+    }
+    if (contexts_.role() == PartyRole::kClient) {
+        // The client uses the same public conversion maps, but never evaluates
+        // the HE exponent and therefore needs no encoded exponent plaintexts.
+        for (const auto &layer : config_.layers) {
+            ModelPlaintextCacheScope layer_cache(&parameters_, layer.id);
+            const auto *execution = FindLayerExecution(config_, layer.id);
+            if (!execution) return Status::Invalid(layer.id + ": HE placement absent");
+            const auto &scores = contexts_.Require(
+                execution->regions.at(HeRegionId::kRegion2).parameter_profile,
+                PartyRole::kClient);
+            const auto &exponent = contexts_.Require(
+                execution->regions.at(HeRegionId::kRegion3).parameter_profile,
+                PartyRole::kClient);
+            auto compiled = SealSciSoftmaxExecutor::Prepare(
+                layer, scores, exponent, config_.softmax, false);
+            if (!compiled.ok()) return compiled.status();
         }
     }
     preparation.Commit();
@@ -1038,7 +649,7 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
         FfnGeluExecutionReport ffn_report;
         SealSciFfnGeluExecutor ffn(
             config_, layer, contexts_, parameters_, arena_.mpc, converter_,
-            gelu_mpc_, &arena_.ids);
+            gelu_mpc_, &arena_.ids, &arena_.he);
         auto activation = ffn.Evaluate(
             {ln2.value().centered_shares,
              ln2.value().inverse_stddev_shares},
@@ -1066,7 +677,11 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
         auto closed = bridge.Evaluate(
             {activation.value().activation_shares,
              layer.ffn_residual
-                ? std::optional<TensorHandle>{ln2.value().ffn_residual}
+                ? (layer.norm == NormPlacement::kNormalizedResidual
+                    ? (activation.value().normalized_residual_he
+                        ? activation.value().normalized_residual_he
+                        : activation.value().normalized_residual_shares)
+                    : std::optional<TensorHandle>{ln2.value().ffn_residual})
                 : std::nullopt},
             *layer_weights, std::nullopt, &bridge_report);
         if (!closed.ok()) {
@@ -1076,6 +691,10 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
             return closed.status();
         }
         arena_.mpc.Erase(activation.value().activation_shares.id);
+        if (activation.value().normalized_residual_shares)
+            arena_.mpc.Erase(activation.value().normalized_residual_shares->id);
+        if (activation.value().normalized_residual_he)
+            arena_.he.Erase(activation.value().normalized_residual_he->id);
         arena_.he.Erase(ln2.value().ffn_residual.id);
         hidden = closed.value().hidden_states;
         AppendStage(report, index, "block5_bridge", started, Status::Ok(),
@@ -1085,22 +704,6 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
             if (!synced.ok()) return synced.status();
         }
 
-        if (report) {
-            report->communication_bytes +=
-                entry_report.conversion_communication_bytes +
-                softmax_report.conversion_communication_bytes +
-                softmax_report.mpc_communication_bytes +
-                attention_report.conversion_communication_bytes +
-                attention_report.mpc_communication_bytes +
-                ffn_report.conversion_communication_bytes +
-                ffn_report.mpc_communication_bytes +
-                bridge_report.conversion_communication_bytes;
-            report->rounds += entry_report.conversion_rounds +
-                softmax_report.conversion_rounds + softmax_report.mpc_rounds +
-                attention_report.conversion_rounds + attention_report.mpc_rounds +
-                ffn_report.conversion_rounds + ffn_report.mpc_rounds +
-                bridge_report.conversion_rounds;
-        }
     }
     if (report)
         report->online_milliseconds = std::chrono::duration<double,
@@ -1158,6 +761,10 @@ Result<TransformerWeightHandles> RegisterTransformerWeights(
                 auto stored = parameters.PutVector(handle, found->second);
                 if (!stored.ok()) return stored.status();
             }
+            auto fused = parameters.FuseLayerNormGammaIntoQkv(handles);
+            if (!fused.ok()) return fused.status();
+            fused = parameters.FuseLayerNormGammaIntoWu(handles);
+            if (!fused.ok()) return fused.status();
         }
         result.layers.push_back(std::move(handles));
     }

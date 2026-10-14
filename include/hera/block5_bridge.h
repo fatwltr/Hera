@@ -2,7 +2,6 @@
 
 #include "hera/ffn_gelu.h"
 
-#include <atomic>
 #include <map>
 #include <optional>
 
@@ -10,6 +9,8 @@ namespace hera {
 
 struct Block5BridgeInputs {
     TensorHandle activation_shares;
+    // Pre-LN: retained HE hidden. normalized_residual with shared R1/R5:
+    // complete LN2 HE output. Independent R1/R5 profiles use LN2 shares.
     std::optional<TensorHandle> ffn_residual;
 };
 
@@ -17,6 +18,9 @@ struct NextLayerBridgeOutputs {
     TensorHandle centered_shares;
     TensorHandle inverse_stddev_shares;
     Block2HeOutputs block2;
+    // Original hidden for pre, complete LN1 for normalized_residual;
+    // invalid when the next attention skip is disabled.
+    TensorHandle attention_residual;
 };
 
 struct Block5BridgeOutputs {
@@ -37,11 +41,14 @@ struct Block5BridgeExecutionReport {
     std::vector<int> required_rotation_steps;
 };
 
-// Closes a Pre-LN Transformer layer without decrypting: GeLU shares are
-// converted directly into the retained residual's HE context, projected by
-// Wd, added to that residual and accurately realified. When a next layer is
-// supplied, its Region-1 LayerNorm statistics and existing Block-2 executor
-// are run in the same two-party call.
+// Closes a normalization-first layer without revealing plaintext: GeLU
+// shares return to the Wd context and Wd emits real columns. Shared R1/R5
+// retains complete LN2 in HE for direct addition and the next LN1 statistics.
+// Independent profiles batch the full LN2 shares with the activation.
+// When a next layer is
+// supplied, the shared Pre-LN entry prepares QK/V and the complete next
+// attention skip in the same two-party call. The caller owns these outputs
+// and the optional centered/inverse compatibility shares.
 class SealSciBlock5BridgeExecutor {
 public:
     SealSciBlock5BridgeExecutor(
@@ -76,7 +83,7 @@ private:
     CkksMpcConverter &converter_;
     MpcLayerNormRuntime &mpc_layer_norm_;
     TensorIdAllocator *ids_{};
-    std::atomic<TensorId> next_id_{9000000};
+    TensorIdAllocator owned_ids_{9000000};
 };
 
 } // namespace hera

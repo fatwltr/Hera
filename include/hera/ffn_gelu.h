@@ -16,6 +16,10 @@ struct FfnGeluInputs {
 
 struct FfnGeluOutputs {
     TensorHandle activation_shares;
+    // Complete original LN2 affine, real columns; present only for the
+    // normalized-residual FFN skip. Gamma-fused Wu input is a separate value.
+    std::optional<TensorHandle> normalized_residual_shares{};
+    std::optional<TensorHandle> normalized_residual_he{};
 };
 
 struct FfnGeluExecutionReport {
@@ -44,7 +48,6 @@ struct FfnGeluPackingPlan {
     HePackingPlan centered;
     HePackingPlan inverse_broadcast;
     HePackingPlan projected;
-    HePackingPlan realified;
     std::size_t token_stride{};
     std::size_t columns_per_component{};
 };
@@ -61,6 +64,8 @@ struct HeKernelOperationCounts {
 
 class FfnGeluPackingPlanner {
 public:
+    static Result<std::shared_ptr<const FfnGeluPackingPlan>> GetShared(
+        const TransformerLayerConfig &layer, std::size_t slot_count);
     static Result<FfnGeluPackingPlan> Build(
         const TransformerLayerConfig &layer, std::size_t slot_count);
     static Result<HePackingPlan> ComplexColumns(
@@ -76,8 +81,10 @@ public:
 
 struct GeluPolynomialOutputs {
     SealCipherTensor input;
-    SealCipherTensor negative_branch;
-    SealCipherTensor positive_branch;
+    // Shape [2, tokens, features]: F0 occupies real lanes, F1 imaginary lanes.
+    SealCipherTensor branches;
+    // Prepared scale-one X^(N/2) phase for real-input conversion pairing.
+    std::shared_ptr<const seal::Plaintext> conversion_phase;
 };
 
 class FfnLayerNormTailKernel {
@@ -89,7 +96,10 @@ public:
         const DenseVectorParameter &beta,
         const TransformerLayerConfig &layer,
         const HeContext &context,
-        FfnGeluExecutionReport *report = nullptr);
+        FfnGeluExecutionReport *report = nullptr,
+        std::size_t he_workers = 1,
+        const GammaFusedLayerNormParameters *original_affine = nullptr,
+        SealCipherTensor *normalized_residual = nullptr);
 };
 
 class FfnUpProjectionKernel {
@@ -132,16 +142,8 @@ public:
         const HePackingPlan &real_output_packing,
         int output_scale_bits,
         const HeContext &context,
-        HeKernelOperationCounts *counts = nullptr);
-};
-
-class FfnRealifyKernel {
-public:
-    static Result<SealCipherTensor> Evaluate(
-        const SealCipherTensor &input,
-        const TransformerLayerConfig &layer,
-        const HeContext &context,
-        FfnGeluExecutionReport *report = nullptr);
+        HeKernelOperationCounts *counts = nullptr,
+        std::size_t he_workers = 1);
 };
 
 class GeluPolynomialKernel {
@@ -189,7 +191,8 @@ public:
         CryptoTensorStore &tensors,
         CkksMpcConverter &converter,
         MpcGeluRuntime &mpc,
-        TensorIdAllocator *ids = nullptr);
+        TensorIdAllocator *ids = nullptr,
+        SealCipherTensorStore *he_tensors = nullptr);
 
     static Result<std::vector<int>> RequiredRotationSteps(
         const TransformerLayerConfig &layer,
@@ -209,6 +212,7 @@ private:
     CkksMpcConverter &converter_;
     MpcGeluRuntime &mpc_;
     TensorIdAllocator *ids_{};
+    SealCipherTensorStore *he_tensors_{};
     std::atomic<TensorId> next_id_{8000000};
 };
 

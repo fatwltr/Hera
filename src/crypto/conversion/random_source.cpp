@@ -44,19 +44,22 @@ public:
     {
         auto *destination = static_cast<std::uint8_t *>(data);
         while (bytes != 0) {
-            std::array<std::uint8_t, 8> encoded{};
-            for (std::size_t i = 0; i < encoded.size(); ++i)
-                encoded[encoded.size() - 1 - i] =
-                    static_cast<std::uint8_t>(counter_ >> (8 * i));
-            Key block{};
-            unsigned int output_bytes = 0;
-            if (!HMAC(EVP_sha256(), key_.data(), static_cast<int>(key_.size()),
-                      encoded.data(), encoded.size(), block.data(),
-                      &output_bytes) || output_bytes != block.size())
-                throw std::runtime_error("HMAC-SHA256 random stream failed");
-            ++counter_;
-            const auto take = std::min(bytes, block.size());
-            std::memcpy(destination, block.data(), take);
+            if (position_ == block_.size()) {
+                std::array<std::uint8_t, 8> encoded{};
+                for (std::size_t i = 0; i < encoded.size(); ++i)
+                    encoded[encoded.size() - 1 - i] =
+                        static_cast<std::uint8_t>(counter_ >> (8 * i));
+                unsigned int output_bytes = 0;
+                if (!HMAC(EVP_sha256(), key_.data(), static_cast<int>(key_.size()),
+                          encoded.data(), encoded.size(), block_.data(),
+                          &output_bytes) || output_bytes != block_.size())
+                    throw std::runtime_error("HMAC-SHA256 random stream failed");
+                ++counter_;
+                position_ = 0;
+            }
+            const auto take = std::min(bytes, block_.size() - position_);
+            std::memcpy(destination, block_.data() + position_, take);
+            position_ += take;
             destination += take;
             bytes -= take;
         }
@@ -64,6 +67,8 @@ public:
 
 private:
     Key key_{};
+    Key block_{};
+    std::size_t position_{block_.size()};
     std::uint64_t counter_{};
 };
 

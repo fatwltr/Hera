@@ -1,4 +1,5 @@
 #include "hera/modules.h"
+#include "hera/detail/level_schedule.h"
 
 #include "module_utils.h"
 
@@ -14,7 +15,7 @@ AttentionGraphModule::BuildProjectionsAndScores(
 {
     try {
         using namespace module_internal;
-        const auto source = EnsureRegion(graph, input, region, Layout::kSpatial,
+        const auto source = EnsureRegion(graph, input, region, Layout::kStrictColumn,
                                          prefix + ".input");
         const auto &base = graph.Spec(source);
         const TensorShape q_shape{{layer.tokens, layer.q_heads,
@@ -30,10 +31,10 @@ AttentionGraphModule::BuildProjectionsAndScores(
         const auto terminal_level =
             parameters.coefficient_modulus_bits.size() -
             parameters.terminal_prime_count;
-        constexpr std::size_t kQkDepth = 5;
+        constexpr std::size_t kQkDepth = 4;
         if (terminal_level < kQkDepth)
             return Status::FailedPrecondition(
-                prefix + ": QK suffix is shorter than five levels");
+                prefix + ": QK suffix is shorter than four levels");
         const auto qk_projection_level = terminal_level - kQkDepth;
         const auto value_projection_level =
             base.planned_level.value_or(1) + 1;
@@ -91,10 +92,16 @@ AttentionGraphModule::BuildAttentionValueAndOutput(
     try {
         using namespace module_internal;
         const auto &probability_spec = graph.Spec(probabilities);
+        const auto &attention_parameters = graph.ActiveParameters(attention_region);
+        if (attention_parameters.coefficient_modulus_bits.size() <
+            attention_parameters.terminal_prime_count + detail::kAttentionValueDepth)
+            return Status::FailedPrecondition(prefix + ": AV needs three remaining levels");
+        const auto av_input_level = detail::AttentionValueInputLevel(
+            attention_parameters);
         const auto a = probability_spec.domain == Domain::kMpcArithmeticShare
             ? MpcToHe(graph, probabilities, attention_region,
                       Layout::kSoftmaxAvDiagonal,
-                      prefix + ".probabilities.mpc_to_he", 2)
+                      prefix + ".probabilities.mpc_to_he", av_input_level)
             : EnsureRegion(graph, probabilities, attention_region,
                            Layout::kSoftmaxAvDiagonal,
                            prefix + ".probabilities");
@@ -105,7 +112,7 @@ AttentionGraphModule::BuildAttentionValueAndOutput(
                                     layer.value_head_width}};
         auto av_spec = HeSpec(graph.Spec(a), av_shape,
                               Layout::kAttentionOutput, attention_region);
-        av_spec.planned_level = 5;
+        av_spec.planned_level = av_input_level + detail::kAttentionValueDepth;
         av_spec.planned_scale_bits =
             graph.ActiveParameters(attention_region).default_scale_bits;
         const auto av = graph.AddNode(
@@ -115,38 +122,48 @@ AttentionGraphModule::BuildAttentionValueAndOutput(
                              Layout::kAttentionOutput, attention_region,
                              layer.q_heads != layer.kv_heads,
                              HeKernelKind::kMultiHeadAttentionValue});
-        const auto av_output_region = EnsureRegion(
-            graph, av, output_region, Layout::kAttentionOutput,
-            prefix + ".attention_value_output_region");
+        if (graph.ActiveProfile(attention_region) != graph.ActiveProfile(output_region))
+            return Status::Invalid("Region 4 must use the same parameter profile as Region 2");
+        const auto &output_parameters = graph.ActiveParameters(output_region);
+        const auto output_terminal = output_parameters.coefficient_modulus_bits.size() -
+            output_parameters.terminal_prime_count;
+        if (output_terminal < 4)
+            return Status::FailedPrecondition(
+                prefix + ": Region 4 needs four Wo/LN2 levels");
+        const auto wo_input_level = output_terminal - 4;
+        auto av_output_region = av;
+        if (!detail::FusedAttentionOutput(attention_parameters)) {
+            const auto av_share = HeToMpc(graph, av, Layout::kAttentionOutput,
+                prefix + ".attention_value_output_region.bridge.he_to_mpc");
+            av_output_region = MpcToHe(
+                graph, av_share, output_region, Layout::kAttentionOutput,
+                prefix + ".attention_value_output_region.bridge.mpc_to_he", wo_input_level);
+        }
         const TensorShape output_shape{{layer.tokens, layer.model_width}};
+        constexpr auto output_layout = Layout::kStrictColumn;
         auto output_spec = HeSpec(graph.Spec(av_output_region), output_shape,
-                                  Layout::kComplexStrictColumn, output_region);
-        output_spec.planned_level = 6;
+                                  output_layout, output_region);
+        output_spec.planned_level =
+            graph.Spec(av_output_region).planned_level.value_or(0) + 1;
         output_spec.planned_scale_bits =
             graph.ActiveParameters(output_region).default_scale_bits;
         auto projected = graph.AddNode(
             prefix + ".Wo", OpKind::kMatMulCipherPlain,
             {av_output_region}, output_spec,
             MatMulAttributes{layer.id, "Wo", output_shape,
-                             Layout::kComplexStrictColumn, output_region,
+                             output_layout, output_region,
                              false,
                              HeKernelKind::kAttentionOutputProjection});
         if (layer.attention_residual) {
             const auto residual_ready = EnsureRegion(
                 graph, residual, output_region,
-                Layout::kComplexStrictColumn, prefix + ".residual");
+                output_layout, prefix + ".residual",
+                output_spec.planned_level);
             projected = graph.AddNode(prefix + ".residual_add",
                                       OpKind::kElementwiseAdd,
                                       {projected, residual_ready}, output_spec);
         }
-        auto real_spec = output_spec;
-        real_spec.layout = Layout::kStrictColumn;
-        real_spec.planned_scale_bits =
-            graph.ActiveParameters(output_region).default_scale_bits + 1;
-        const auto real = graph.AddNode(prefix + ".realify_complex",
-                                        OpKind::kHeRealifyComplex,
-                                        {projected}, real_spec);
-        return AttentionOutputGraphTensors{real, projected};
+        return AttentionOutputGraphTensors{projected, projected};
     } catch (const std::exception &error) {
         return Status::Internal(prefix + ": " + error.what());
     }

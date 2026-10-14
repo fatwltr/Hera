@@ -12,11 +12,13 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace hera::detail {
 
@@ -26,8 +28,21 @@ class HeWorkerPool {
 public:
     static HeWorkerPool &Instance()
     {
-        static HeWorkerPool pool;
-        return pool;
+        struct ProcessPool {
+            pid_t pid{getpid()};
+            std::unique_ptr<HeWorkerPool> pool{new HeWorkerPool};
+        };
+        static ProcessPool state;
+        if (state.pid != getpid()) {
+            // Threads do not survive fork. Destroying their copied std::thread
+            // objects is also invalid, so discard the inherited holder.
+            const auto inherited_budget = state.pool->memory_budget_;
+            state.pool.release();
+            state.pool.reset(new HeWorkerPool);
+            state.pool->memory_budget_ = inherited_budget;
+            state.pid = getpid();
+        }
+        return *state.pool;
     }
 
     HeWorkerPool(const HeWorkerPool &) = delete;
@@ -56,9 +71,9 @@ public:
 
     template <typename Callable>
     auto Submit(std::size_t wanted_threads, Callable &&callable)
-        -> std::future<std::invoke_result_t<Callable>>
+        -> std::future<std::invoke_result_t<std::decay_t<Callable>>>
     {
-        using Return = std::invoke_result_t<Callable>;
+        using Return = std::invoke_result_t<std::decay_t<Callable>>;
         auto task = std::make_shared<std::packaged_task<Return()>>(
             std::forward<Callable>(callable));
         auto result = task->get_future();
@@ -75,6 +90,7 @@ public:
 
 private:
     HeWorkerPool() = default;
+public:
     ~HeWorkerPool()
     {
         {
@@ -85,6 +101,7 @@ private:
         for (auto &worker : workers_) worker.join();
     }
 
+private:
     void WorkerLoop()
     {
         on_worker_ = true;
@@ -109,6 +126,15 @@ private:
     std::size_t memory_budget_{512ULL << 20};
     bool stopping_{};
 };
+
+template <typename Callable>
+auto SubmitLocalTask(std::size_t max_inflight, Callable &&operation)
+    -> std::future<std::invoke_result_t<std::decay_t<Callable>>>
+{
+    if (max_inflight <= 1 || HeWorkerPool::OnWorkerThread())
+        return std::async(std::launch::deferred, std::forward<Callable>(operation));
+    return HeWorkerPool::Instance().Submit(max_inflight, std::forward<Callable>(operation));
+}
 
 inline std::size_t EstimatedHeWorkerBytes(std::size_t degree,
                                           std::size_t data_primes,

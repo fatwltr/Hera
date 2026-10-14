@@ -51,6 +51,8 @@ Result<void> ValidateLayerConfig(const TransformerLayerConfig &layer)
         layer.attention_norm_epsilon <= 0.0)
         return Status::Invalid(
             layer.id + ": attention_norm_epsilon must be finite and positive");
+    if (layer.attention_norm_variance_scale_bits < 1 || layer.attention_norm_variance_scale_bits > 50)
+        return Status::Invalid(layer.id + ": attention_norm_variance_scale_bits must be in [1,50]");
 
     const auto q = CheckedMultiply(layer.q_heads, layer.qk_head_width,
                                    layer.id + ".q_width");
@@ -131,6 +133,7 @@ Result<void> ValidateLayerSequence(
 
 std::string ToString(NormPlacement value)
 {
+    if (value == NormPlacement::kNormalizedResidual) return "normalized_residual";
     return value == NormPlacement::kPreNorm ? "pre" : "post";
 }
 

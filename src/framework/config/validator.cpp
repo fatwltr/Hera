@@ -1,4 +1,5 @@
 #include "hera/config.h"
+#include "hera/detail/nonlinear_contracts.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,6 +58,12 @@ Result<void> ValidateHeraConfig(const HeraConfig &config)
         config.mpc_numeric.scale_bits >= config.mpc_numeric.ring_bits)
         return Status::Invalid("invalid MPC numeric format");
     for (const auto &layer : config.layers) {
+        const int variance_scale = std::max(config.mpc_numeric.scale_bits,
+                                           layer.attention_norm_variance_scale_bits);
+        if (variance_scale < 1 || variance_scale >= config.mpc_numeric.ring_bits - 1 ||
+            layer.attention_norm_epsilon < std::ldexp(8.0, -variance_scale))
+            return Status::Invalid(layer.id +
+                ": LayerNorm variance precision must preserve epsilon and fit the MPC ring");
         if (layer.attention_norm_rsqrt_bits <=
                 config.mpc_numeric.scale_bits + 1 ||
             layer.attention_norm_rsqrt_bits >
@@ -65,6 +72,12 @@ Result<void> ValidateHeraConfig(const HeraConfig &config)
                 layer.id +
                 ": attention_norm_rsqrt_bits must be greater than "
                 "mpc_scale_bits+1 and no greater than mpc_ring_bits");
+        auto rsqrt = detail::PlanLayerNormRsqrt(config.mpc_numeric.ring_bits,
+            variance_scale, layer.attention_norm_rsqrt_bits, config.mpc_numeric.scale_bits);
+        if (!rsqrt.ok()) return Status::Invalid(layer.id + ": " + rsqrt.status().message());
+        auto softmax = detail::SoftmaxAccumulatorBits(layer.tokens,
+            config.mpc_numeric.ring_bits, config.mpc_numeric.scale_bits);
+        if (!softmax.ok()) return Status::Invalid(layer.id + ": " + softmax.status().message());
     }
     if (config.conversion.statistical_security_bits < 1 ||
         config.conversion.statistical_security_bits > 63)
@@ -150,6 +163,15 @@ Result<void> ValidateHeraConfig(const HeraConfig &config)
                     execution.layer_id + "." + ToString(entry.first) +
                     " references unknown profile: " +
                     entry.second.parameter_profile);
+        const auto attention = execution.regions.find(HeRegionId::kRegion2);
+        const auto output = execution.regions.find(HeRegionId::kRegion4);
+        if (attention == execution.regions.end() ||
+            output == execution.regions.end())
+            return Status::Invalid(execution.layer_id +
+                                   ": Region 2 and Region 4 are required");
+        if (attention->second.parameter_profile != output->second.parameter_profile)
+            return Status::Invalid(execution.layer_id +
+                ": Region 4 must use the same parameter profile as Region 2");
     }
     for (const auto &layer : config.layers)
         if (seen.count(layer.id) == 0)

@@ -33,6 +33,21 @@ void Require(bool condition, const char *message)
     if (!condition) throw std::runtime_error(message);
 }
 
+class AlternatingRejectStream final : public hera::IRandomStream {
+public:
+    void Fill(void *data, std::size_t bytes) override
+    {
+        Require(bytes % sizeof(std::uint64_t) == 0, "invalid candidate batch");
+        auto *output = static_cast<std::uint64_t *>(data);
+        for (std::size_t i = 0; i < bytes / sizeof(std::uint64_t); ++i) {
+            output[i] = (position_ & 1) ? position_ / 2 : UINT64_MAX;
+            ++position_;
+        }
+    }
+private:
+    std::uint64_t position_{};
+};
+
 } // namespace
 
 int main()
@@ -70,6 +85,29 @@ int main()
             hera::conversion_internal::FixedCkksTransform::Create(16, 20, 93);
         Require(transform_result.ok(), "fixed CKKS transform creation failed");
         auto transform = transform_result.take_value();
+        for (const std::size_t degree : {16, 2048, 32768}) {
+            auto bounded_transform = hera::conversion_internal::FixedCkksTransform::Create(
+                degree, 20, 103).take_value();
+            const auto bound = bounded_transform.EncodedCoefficientBoundBits(19, 20, 8);
+            Require(bound && *bound <= 49, "narrow producer has no usable coefficient bound");
+            hera::conversion_internal::SlotSharePair bounded_slots;
+            bounded_slots.real.resize(degree/2);
+            bounded_slots.imag.resize(degree/2);
+            for (std::size_t i = 0; i < degree/2; ++i) {
+                const auto magnitude = hera::WideShiftLeft(
+                    hera::WideFromLow((std::uint64_t{1} << 19)-1, 103), 20, 103);
+                bounded_slots.real[i] = i%3 ? magnitude : hera::WideNegate(magnitude, 103);
+                bounded_slots.imag[i] = i%2 ? magnitude : hera::WideNegate(magnitude, 103);
+            }
+            const auto coefficients = bounded_transform.Encode(bounded_slots).take_value();
+            for (auto coefficient : coefficients) {
+                const auto value = Signed(hera::WideLocalTruncate(coefficient, 12, 103, false), 103);
+                const auto limit = static_cast<__int128>(U128{1} << *bound);
+                Require(value > -limit && value < limit, "fixed FFT coefficient exceeded its public bound");
+            }
+            Require(!bounded_transform.EncodedCoefficientBoundBits(90, 20, 8),
+                    "coefficient bound accepted an overflowing workspace");
+        }
         hera::conversion_internal::SlotSharePair slots;
         slots.real.resize(8);
         slots.imag.resize(8);
@@ -187,6 +225,21 @@ int main()
         Require(!random->OpenStream("hera/c2m/A/test/0").ok(),
                 "random domain reuse was not rejected");
 
+        // Reading a stream in arbitrary chunks must consume exactly the same
+        // bytes as one bulk read, including a zero-length read and block edges.
+        auto chunk_random = hera::MakeDeterministicRandomSourceForTesting({1, 2, 3, 4});
+        auto bulk_stream = random->OpenStream("sampling/chunk-consistency");
+        auto chunk_stream = chunk_random->OpenStream("sampling/chunk-consistency");
+        Require(bulk_stream.ok() && chunk_stream.ok(), "chunk streams unavailable");
+        std::vector<std::uint8_t> bulk(79), chunks(79);
+        bulk_stream.value()->Fill(bulk.data(), bulk.size());
+        std::size_t offset = 0;
+        for (const auto size : {8, 1, 0, 17, 32, 21}) {
+            chunk_stream.value()->Fill(chunks.data() + offset, size);
+            offset += size;
+        }
+        Require(bulk == chunks, "random stream discarded partially consumed blocks");
+
         auto distribution_stream = random->OpenStream("sampling/regression");
         Require(distribution_stream.ok(), "sampling stream creation failed");
         constexpr std::size_t sample_count = 170000;
@@ -201,6 +254,47 @@ int main()
         for (const auto count : buckets)
             Require(count > expected * 9 / 10 && count < expected * 11 / 10,
                     "prime rejection sampler uniformity regression failed");
+
+        AlternatingRejectStream reject_stream;
+        const auto retried = hera::conversion_internal::SampleUniformPrime(
+            reject_stream, 600, (std::uint64_t{1} << 63) + 1);
+        for (std::size_t i = 0; i < retried.size(); ++i)
+            Require(retried[i] == i, "batched prime sampler lost accepted candidates");
+
+        // Full-width Z masks can encode far beyond the terminal prime. Use
+        // constant real slots, whose sole nonzero coefficient is known, to
+        // verify signed wide encoding and reduction without decoding a mask.
+        const auto mask_transform =
+            hera::conversion_internal::FixedCkksTransform::Create(16, 20, 100)
+                .take_value();
+        constexpr std::uint64_t prime = 257;
+        constexpr int scale_shift = 31;
+        const std::uint64_t ring_mask = (std::uint64_t{1} << 43) - 1;
+        const std::vector<std::int64_t> mask_values{
+            0, 1, -1, (std::int64_t{1} << 42) - 1,
+            -(std::int64_t{1} << 42)};
+        for (const auto value : mask_values) {
+            std::vector<std::uint64_t> real(
+                8, static_cast<std::uint64_t>(value) & ring_mask);
+            std::vector<std::uint64_t> imag(8, 0);
+            auto coefficients = hera::conversion_internal::EncodeRingMask(
+                real, imag, 43, scale_shift, 20, mask_transform, prime);
+            Require(coefficients.ok(), "Z-mask encoding failed");
+            const __int128 scaled = static_cast<__int128>(value) *
+                (static_cast<__int128>(1) << scale_shift);
+            const auto expected_coefficient = static_cast<std::uint64_t>(
+                (scaled % prime + prime) % prime);
+            Require(coefficients.value()[0] == expected_coefficient,
+                    "Z-mask signed wide coefficient reduction failed");
+            for (std::size_t i = 1; i < coefficients.value().size(); ++i)
+                Require(coefficients.value()[i] == 0,
+                        "constant Z mask has unexpected nonconstant coefficients");
+        }
+        Require(!hera::conversion_internal::EncodeRingMask(
+                    std::vector<std::uint64_t>(8),
+                    std::vector<std::uint64_t>(8), 43, 60, 20,
+                    mask_transform, prime).ok(),
+                "Z-mask encoding accepted an overflowing workspace");
 
         std::cout << "HERA_CONVERSION_UNIT_STATUS=PASS\n";
         return 0;

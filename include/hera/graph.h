@@ -43,6 +43,7 @@ enum class OpKind {
 enum class HeKernelKind {
     kGeneric,
     kLayerNormTail,
+    kLayerNormResidual, // Original affine + real channel extraction, one tail rescale.
     kComplexDiagonalProjection,
     kMultiHeadQk,
     kMultiHeadAttentionValue,
@@ -160,6 +161,7 @@ public:
 
     void SetActiveLayer(const std::string &layer_id);
     const std::string &ActiveLayer() const noexcept { return active_layer_; }
+    const TransformerLayerConfig &ActiveLayerConfig() const;
     const std::string &ActiveProfile(HeRegionId region) const;
     const HeParameterConfig &ActiveParameters(HeRegionId region) const;
 

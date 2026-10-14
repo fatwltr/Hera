@@ -3,7 +3,6 @@
 #include "hera/status.h"
 
 #include <cstdint>
-#include <string>
 
 namespace hera {
 
@@ -29,9 +28,6 @@ WideRingShare WideSignedShiftRight(WideRingShare value, int shift, int bits);
 // at most one except with the statistical-extension failure probability.
 WideRingShare WideLocalTruncate(WideRingShare value, int shift, int bits,
                                 bool negative_share_orientation);
-WideRingShare WideMultiplySignedPublic(WideRingShare value,
-                                       std::int64_t multiplier,
-                                       int bits);
 // Interprets both local ring shares as signed two's-complement integers,
 // computes (left*left_multiplier + right*right_multiplier) >> shift in a
 // signed 128-bit accumulator, and reduces the result back to the ring.
@@ -41,6 +37,5 @@ WideRingShare WideMultiplyAccumulateShift(
     int shift, int bits);
 std::uint64_t WideModuloPrime(WideRingShare value, int bits,
                               std::uint64_t prime);
-std::string WideToHex(WideRingShare value);
 
 } // namespace hera

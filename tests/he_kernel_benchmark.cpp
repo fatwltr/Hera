@@ -1,4 +1,6 @@
 #include "hera/attention_ln2.h"
+#include "hera/detail/parallel_ranges.h"
+#include "hera/detail/level_schedule.h"
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +27,7 @@ struct Options {
     std::size_t warmup{1};
     std::size_t he_threads{1};
     double blb_milliseconds{-1.0};
+    bool block2_chain{};
 };
 
 void Require(bool condition, const std::string &message)
@@ -58,6 +61,7 @@ Options Parse(int argc, char **argv)
         else if (name == "--iterations") result.iterations = number;
         else if (name == "--warmup") result.warmup = number;
         else if (name == "--he-threads") result.he_threads = number;
+        else if (name == "--block2-chain") result.block2_chain = number != 0;
         else throw std::runtime_error("unknown option: " + name);
     }
     Require(result.degree >= 4096 &&
@@ -82,7 +86,7 @@ hera::HeraConfig MakeConfig(const Options &options)
     config.layers = {layer};
 
     // These are kernel-only chains, not Figure-10 fused-block parameters.
-    // QK consumes five levels, A*V consumes three; the last data prime is
+    // QK consumes four levels, A*V consumes three; the last data prime is
     // retained as the output level. HeContextRegistry adds the separate
     // key-switch special prime.
     hera::HeParameterConfig profile;
@@ -90,9 +94,17 @@ hera::HeraConfig MakeConfig(const Options &options)
 #ifdef HERA_BENCHMARK_QK
     profile.coefficient_modulus_bits = {60, 60, 60, 60, 60, 60};
     profile.declared_depth = 5;
+    if (options.block2_chain) {
+        profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
+        profile.declared_depth = 6;
+    }
 #else
     profile.coefficient_modulus_bits = {60, 60, 60, 60};
     profile.declared_depth = 3;
+    if (options.block2_chain) {
+        profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
+        profile.declared_depth = 6;
+    }
 #endif
     profile.default_scale_bits = 44;
     profile.input_scale_bits = 44;
@@ -131,7 +143,7 @@ hera::SealCipherTensor EncryptPacked(
             if (place.component == hera::ComplexLane::kReal)
                 slot.real(values[logical]);
             else
-                slot.imag(values[logical]);
+                slot.imag((packing.layout == hera::Layout::kMultiHeadK ? -1.0 : 1.0) * values[logical]);
         }
     seal::CKKSEncoder encoder(*context.context);
     seal::Encryptor encryptor(*context.context, *context.secret_key);
@@ -151,7 +163,8 @@ hera::SealCipherTensor EncryptPacked(
     spec.he_parameter_profile = context.profile;
     spec.planned_level = 0;
     spec.planned_scale_bits = context.parameters.input_scale_bits;
-    return {context.profile, std::move(ciphertexts), spec, packing};
+    return {context.profile, std::move(ciphertexts), spec, packing,
+            packing.layout == hera::Layout::kMultiHeadK};
 }
 
 std::vector<double> DecryptPacked(const hera::SealCipherTensor &tensor,
@@ -171,7 +184,7 @@ std::vector<double> DecryptPacked(const hera::SealCipherTensor &tensor,
         const auto &place = tensor.physical_packing.Locations(i).front();
         const auto value = decoded[place.ciphertext][place.slot];
         result[i] = place.component == hera::ComplexLane::kReal
-            ? value.real() : value.imag();
+            ? value.real() : (tensor.conjugated_complex ? -value.imag() : value.imag());
     }
     return result;
 }
@@ -189,7 +202,9 @@ std::size_t LevelOf(const hera::HeContext &context,
 void PrintTimings(std::vector<double> milliseconds,
                   const Options &options, std::size_t input_ciphertexts,
                   const hera::SealCipherTensor &output,
-                  std::size_t rotations, std::size_t ct_ct,
+                  const hera::HeContext &context, const seal::Ciphertext &input,
+                  std::size_t rotations, std::size_t conjugations,
+                  std::size_t ct_ct,
                   std::size_t relins, std::size_t rescales,
                   double maximum_error)
 {
@@ -210,19 +225,24 @@ void PrintTimings(std::vector<double> milliseconds,
               << "HEADS=" << options.heads << '\n'
               << "HEAD_WIDTH=" << options.width << '\n'
               << "POLYNOMIAL_DEGREE=" << options.degree << '\n'
-              << "DATA_PRIMES=" << (output.logical_spec.planned_level.value() + 1)
+              << "DATA_PRIMES=" << context.context->first_context_data()->parms().coeff_modulus().size()
               << '\n'
+              << "INPUT_DATA_PRIMES=" << context.context->get_context_data(input.parms_id())->parms().coeff_modulus().size() << '\n'
+              << "OUTPUT_DATA_PRIMES=" << context.context->get_context_data(output.ciphertexts.front().parms_id())->parms().coeff_modulus().size() << '\n'
               << "INPUT_CIPHERTEXTS=" << input_ciphertexts << '\n'
               << "OUTPUT_CIPHERTEXTS=" << output.ciphertexts.size() << '\n'
               << "OUTPUT_LEVEL=" << output.logical_spec.planned_level.value()
               << '\n'
               << "HE_THREADS=" << options.he_threads << '\n'
+              << "HE_POOL_THREADS=" << hera::detail::HeWorkerPool::Instance().WorkerThreadCount() << '\n'
+              << "HE_MEMORY_BUDGET_BYTES=" << hera::detail::HeWorkerPool::Instance().MemoryBudget() << '\n'
               << "WARMUP=" << options.warmup << '\n'
               << "ITERATIONS=" << options.iterations << '\n'
               << "HERA_MEAN_MS=" << mean << '\n'
               << "HERA_MEDIAN_MS=" << median << '\n'
               << "HERA_MIN_MS=" << milliseconds.front() << '\n'
               << "HERA_ROTATIONS=" << rotations << '\n'
+              << "HERA_CONJUGATIONS=" << conjugations << '\n'
               << "HERA_CT_CT_MULTIPLICATIONS=" << ct_ct << '\n'
               << "HERA_RELINEARIZATIONS=" << relins << '\n'
               << "HERA_RESCALES=" << rescales << '\n'
@@ -281,6 +301,11 @@ int main(int argc, char **argv)
         Require(imported.ok(), imported.status().message());
         const auto &client_context = client.Require(
             "kernel_bench", hera::PartyRole::kClient);
+        Require(client_context.galois_keys.size() == steps.value().size(),
+                "kernel generated more Galois keys than requested");
+        std::cout << "HERA_GALOIS_KEYS=" << client_context.galois_keys.size()
+                  << '\n' << "HERA_RELIN_KEYS="
+                  << client_context.relinearization_keys.size() << '\n';
         const auto &server_context = server.Require(
             "kernel_bench", hera::PartyRole::kServer);
         Require(!server_context.has_secret_key(),
@@ -307,17 +332,36 @@ int main(int argc, char **argv)
                         expected[(h * tokens + row) * tokens + col] +=
                             left[(row * heads + h) * width + d] *
                             right[(col * heads + h) * width + d];
+        for (auto &value : left) value /= std::sqrt(2.0);
+        for (auto &value : right) value /= std::sqrt(2.0);
         first = EncryptPacked(left, q_plan.value(), client_context);
         second = EncryptPacked(right, k_plan.value(), client_context);
+        const auto start_level = client_context.parameters
+            .coefficient_modulus_bits.size() -
+            client_context.parameters.terminal_prime_count -
+            hera::MultiHeadQkKernel::kDepth;
+        seal::Evaluator evaluator(*client_context.context);
+        for (auto *tensor : {&first, &second}) {
+            for (auto &ct : tensor->ciphertexts)
+                for (std::size_t level = 0; level < start_level; ++level)
+                    evaluator.mod_switch_to_next_inplace(ct);
+            tensor->logical_spec.planned_level = start_level;
+        }
 #else
         left.resize(tokens * heads * tokens);
         right.resize(tokens * heads * width);
         expected.resize(right.size());
         for (std::size_t row = 0; row < tokens; ++row)
-            for (std::size_t h = 0; h < heads; ++h)
+            for (std::size_t h = 0; h < heads; ++h) {
+                const auto offset = (row * heads + h) * tokens;
+                double sum = 0.0;
+                for (std::size_t col = 0; col < tokens; ++col) {
+                    left[offset + col] = 1.0 + ((row * 3 + h * 2 + col * 5) % 11);
+                    sum += left[offset + col];
+                }
                 for (std::size_t col = 0; col < tokens; ++col)
-                    left[(row * heads + h) * tokens + col] =
-                        1.0 / static_cast<double>(tokens);
+                    left[offset + col] /= sum;
+            }
         for (std::size_t i = 0; i < right.size(); ++i)
             right[i] = std::sin(static_cast<double>(i + 1) * 0.08) / 10.0;
         for (std::size_t row = 0; row < tokens; ++row)
@@ -330,13 +374,74 @@ int main(int argc, char **argv)
         first = EncryptPacked(left, av_plan.value().probability_packing,
                               client_context);
         second = EncryptPacked(right, v_plan.value(), client_context);
+        if (options.block2_chain) {
+            const auto av_start = hera::detail::AttentionValueInputLevel(server_context.parameters);
+            auto data = server_context.context->first_context_data();
+            for (std::size_t level = 0; level < av_start; ++level)
+                data = data->next_context_data();
+            seal::Evaluator evaluator(*server_context.context);
+            for (auto *tensor : {&first, &second}) {
+                for (auto &ct : tensor->ciphertexts) evaluator.mod_switch_to_inplace(ct, data->parms_id());
+                tensor->logical_spec.planned_level = av_start;
+            }
+        }
+#endif
+#ifdef HERA_BENCHMARK_QK
+        auto bsgs = hera::MultiHeadQkKernel::Plan(layer, slots);
+        Require(bsgs.ok(), bsgs.status().message());
+        std::cout << "QK_HEAD_TILE_COUNT=" << bsgs.value().head_tiles.size() << '\n';
+        for (std::size_t i = 0; i < bsgs.value().head_tiles.size(); ++i) {
+            const auto &tile = bsgs.value().head_tiles[i];
+            const auto prefix = "QK_TILE_" + std::to_string(i) + "_";
+            std::cout << prefix << "HEAD_BEGIN=" << tile.head_begin << '\n'
+                      << prefix << "HEADS=" << tile.heads_per_tile << '\n'
+                      << prefix << "INPUT_GROUPS=" << tile.input_groups << '\n'
+                      << prefix << "PREPROCESS_BABY_STEPS=" << tile.preprocessing_baby_steps << '\n'
+                      << prefix << "PREPROCESS_GIANT_STEPS=" << tile.preprocessing_giant_steps << '\n'
+                      << prefix << "BABY_STEPS=" << tile.baby_steps << '\n'
+                      << prefix << "GIANT_STEPS=" << tile.giant_steps << '\n'
+                      << prefix << "PLANNED_KS="
+                      << tile.rotations + tile.conjugations + tile.relinearizations << '\n';
+        }
+#endif
+#ifdef HERA_BENCHMARK_QK
+        hera::SealPlainParameterStore prepared;
+        prepared.BeginPlaintextPreparation();
+        const auto prepare_started = std::chrono::steady_clock::now();
+        {
+            hera::ModelPlaintextCacheScope scope(&prepared, layer.id);
+            auto compiled = hera::MultiHeadQkKernel::Prepare(layer, server_context);
+            Require(compiled.ok(), compiled.status().message());
+        }
+        prepared.FreezePlaintextCache();
+        std::cout << "QK_PREPARE_MS=" << std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - prepare_started).count() << '\n'
+                  << "QK_PREPARED_PLAINTEXTS=" << prepared.encoded_plaintext_count() << '\n'
+                  << "QK_PREPARED_PLAINTEXT_BYTES=" << prepared.encoded_plaintext_bytes() << '\n';
+#else
+        hera::SealPlainParameterStore prepared;
+        prepared.BeginPlaintextPreparation();
+        const auto prepare_started = std::chrono::steady_clock::now();
+        {
+            hera::ModelPlaintextCacheScope scope(&prepared, layer.id);
+            auto compiled = hera::MultiHeadAttentionValueKernel::Prepare(layer, server_context,
+                first.logical_spec.planned_level.value());
+            Require(compiled.ok(), compiled.status().message());
+        }
+        prepared.FreezePlaintextCache();
+        std::cout << "AV_PREPARE_MS=" << std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - prepare_started).count() << '\n'
+                  << "AV_PREPARED_PLAINTEXTS=" << prepared.encoded_plaintext_count() << '\n'
+                  << "AV_PREPARED_PLAINTEXT_BYTES=" << prepared.encoded_plaintext_bytes() << '\n';
 #endif
         auto evaluate = [&](auto *report) {
 #ifdef HERA_BENCHMARK_QK
+            hera::ModelPlaintextCacheScope scope(&prepared, layer.id);
             return hera::MultiHeadQkKernel::Evaluate(
                 first, second, layer, server_context, report,
                 options.he_threads);
 #else
+            hera::ModelPlaintextCacheScope scope(&prepared, layer.id);
             return hera::MultiHeadAttentionValueKernel::Evaluate(
                 first, second, layer, server_context, report,
                 options.he_threads);
@@ -370,6 +475,15 @@ int main(int argc, char **argv)
             output = result.take_value();
             operations = report;
         }
+#ifdef HERA_BENCHMARK_QK
+        std::cout << "QK_PLANNED_KS="
+                  << bsgs.value().rotations + bsgs.value().conjugations +
+                         bsgs.value().relinearizations << '\n';
+        std::cout << "HERA_KS_OPERATIONS="
+                  << operations.rotations + operations.conjugations + operations.relinearizations << '\n'
+                  << "QK_INPUT_LEVEL=" << first.logical_spec.planned_level.value() << '\n'
+                  << "QK_RESCALE_DEPTH=" << hera::MultiHeadQkKernel::kDepth << '\n';
+#endif
         const auto actual = DecryptPacked(output, client_context);
         Require(actual.size() == expected.size(), "output shape mismatch");
         double maximum_error = 0.0;
@@ -378,12 +492,31 @@ int main(int argc, char **argv)
                                      std::abs(actual[i] - expected[i]));
         Require(maximum_error <= 0.025, "kernel numerical error is too large");
         Require(LevelOf(client_context, output.ciphertexts.front().parms_id()) ==
-                    config.he_parameter_profiles.at("kernel_bench")
-                        .coefficient_modulus_bits.size() - 1,
+                    first.logical_spec.planned_level.value() +
+#ifdef HERA_BENCHMARK_QK
+                        hera::MultiHeadQkKernel::kDepth,
+#else
+                        3,
+#endif
                 "kernel did not consume its dedicated modulus chain");
+#ifndef HERA_BENCHMARK_QK
+        std::cout << "AV_LANE_RULE=largest_power_of_two\n"
+                  << "A_INPUT_CIPHERTEXTS=" << first.ciphertexts.size() << '\n'
+                  << "V_INPUT_CIPHERTEXTS=" << second.ciphertexts.size() << '\n'
+                  << "A_PREPROCESS_ROTATIONS="
+                  << operations.attention_probability_rotations << '\n'
+                  << "V_PREPROCESS_ROTATIONS="
+                  << operations.attention_value_rotations << '\n'
+                  << "GIANT_RECOVERY_ROTATIONS="
+                  << operations.attention_recovery_rotations << '\n'
+                  << "HERA_KS_OPERATIONS="
+                  << (operations.rotations + operations.conjugations +
+                      operations.relinearizations) << '\n';
+#endif
         PrintTimings(std::move(elapsed), options,
                      first.ciphertexts.size() + second.ciphertexts.size(),
-                     output, operations.rotations,
+                     output, server_context, first.ciphertexts.front(), operations.rotations,
+                     operations.conjugations,
                      operations.ciphertext_multiplications,
                      operations.relinearizations, operations.rescales,
                      maximum_error);

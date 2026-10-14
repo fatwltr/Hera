@@ -1,4 +1,6 @@
 #include "hera/conversion_backend.h"
+#include "hera/detail/he_packing.h"
+#include <algorithm>
 
 #include <limits>
 
@@ -132,7 +134,25 @@ Result<TensorHandle> SealSciConversionBackend::HeToMpc(
         *ciphertext.spec.he_parameter_profile, role_);
     auto map_result = packing_.Resolve(ciphertext.spec, profile.slot_count());
     if (!map_result.ok()) return map_result.status();
-    const auto map = map_result.take_value();
+    const auto original_map = map_result.take_value();
+    auto map = original_map;
+    const bool real_boundary = std::all_of(map.assignments.begin(), map.assignments.end(),
+        [](const auto &entry) { return entry.imaginary_logical_index == kUnusedLogicalIndex; });
+    if (real_boundary) {
+        HePackingPlan real;
+        real.slot_count = map.slots_per_ciphertext;
+        real.ciphertext_count = map.ciphertext_count;
+        real.logical_shape = ciphertext.spec.shape;
+        real.layout = ciphertext.spec.layout;
+        real.logical_locations.resize(map.logical_element_count);
+        for (std::size_t i = 0; i < map.assignments.size(); ++i)
+            if (map.assignments[i].real_logical_index != kUnusedLogicalIndex)
+                real.logical_locations[map.assignments[i].real_logical_index].push_back(
+                    {i / real.slot_count, i % real.slot_count, ComplexLane::kReal, std::nullopt});
+        auto paired = detail::ToConversionMap(detail::PairedRealPacking(real));
+        if (!paired.ok()) return paired.status();
+        map = paired.take_value();
+    }
 
     std::optional<SealCipherBatch> server_input;
     if (role_ == PartyRole::kServer) {
@@ -142,11 +162,17 @@ Result<TensorHandle> SealSciConversionBackend::HeToMpc(
             return Status::FailedPrecondition(
                 "server HE handle has no ciphertext payload");
         server_input = payload.take_value();
-        if (server_input->slot_map.assignments != map.assignments)
+        if (server_input->slot_map.assignments != original_map.assignments)
             return Status::FailedPrecondition(
                 "ciphertext payload and compiled slot map differ");
+        if (real_boundary) {
+            auto paired = detail::PairRealCiphertexts(std::move(server_input->ciphertexts), profile, 1);
+            if (!paired.ok()) return paired.status();
+            server_input->ciphertexts = paired.take_value();
+            server_input->slot_map = map;
+        }
     }
-    auto converted = converter_.CkksToMpc(server_input);
+    auto converted = converter_.CkksToMpc(server_input, output_spec.numeric.scale_bits);
     if (!converted.ok()) return converted.status();
     auto pair = converted.take_value();
     auto logical_count = output_spec.shape.ElementCount();
@@ -162,7 +188,9 @@ Result<TensorHandle> SealSciConversionBackend::HeToMpc(
                 pair.real.local_share[physical];
         if (assignment.imaginary_logical_index != kUnusedLogicalIndex)
             compact[assignment.imaginary_logical_index] =
-                pair.imag.local_share[physical];
+                real_boundary ? detail::UndoPairedRealPhase(pair.imag.local_share[physical],
+                    physical % map.slots_per_ciphertext, pair.imag.numeric.ring_bits)
+                    : pair.imag.local_share[physical];
     }
     const TensorId id = next_id_.fetch_add(1);
     MpcShareTensor logical{std::move(compact), output_spec.shape,
@@ -215,7 +243,7 @@ Result<TensorHandle> SealSciConversionBackend::MpcToHe(
     MpcToCkksTarget target{*output_spec.he_parameter_profile,
                            output_spec.planned_level, scale_bits,
                            output_spec.shape, output_spec.layout, map};
-    auto converted = converter_.MpcToCkks(pair, target);
+    auto converted = converter_.MpcToCkksPacked(pair, target);
     if (!converted.ok()) return converted.status();
     const TensorId id = next_id_.fetch_add(1);
     auto stored = store_.PutCiphertext(id, converted.take_value());

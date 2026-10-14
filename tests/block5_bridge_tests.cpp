@@ -2,6 +2,7 @@
 #include "hera/private_transformer.h"
 
 #include <iostream>
+#include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
@@ -27,7 +28,9 @@ void TestPlannerAndGraph()
     const auto *execution = hera::FindLayerExecution(
         config.value(), config.value().layers.front().id);
     Require(execution != nullptr, "layer placement is absent");
-    const auto shared = execution->regions.at(hera::HeRegionId::kRegion4)
+    const bool shared_ffn = config.value().layers.front().norm == hera::NormPlacement::kNormalizedResidual &&
+        execution->regions.at(hera::HeRegionId::kRegion1).parameter_profile == execution->regions.at(hera::HeRegionId::kRegion5).parameter_profile;
+    const auto shared = execution->regions.at(shared_ffn ? hera::HeRegionId::kRegion5 : hera::HeRegionId::kRegion4)
                             .parameter_profile;
     Require(steps.value().count(shared) == 1 &&
                 !steps.value().at(shared).empty(),
@@ -50,8 +53,8 @@ void TestPlannerAndGraph()
                             hera::HeKernelKind::kFfnDownProjection,
                     "Wd does not use the typed down-projection kernel");
             Require(graph.value().tensors().at(node.output).layout ==
-                        hera::Layout::kComplexStrictColumn,
-                    "Wd output is not complex strict-column packed");
+                        hera::Layout::kStrictColumn,
+                    "Wd output is not real strict-column packed");
         }
         if (node.name.find(".ffn.residual_add") != std::string::npos) {
             residual_add = true;
@@ -65,7 +68,7 @@ void TestPlannerAndGraph()
         if (node.name.find(".ffn.realify_complex") != std::string::npos)
             realify = true;
     }
-    Require(wd && residual_add && realify,
+    Require(wd && residual_add && !realify,
             "Block-5 graph nodes are incomplete");
 }
 
@@ -149,7 +152,7 @@ seal::parms_id_type LevelId(const hera::HeContext &context,
 
 hera::SealCipherTensor EncryptResidual(
     const std::vector<double> &values, const hera::HePackingPlan &packing,
-    const hera::HeContext &context)
+    const hera::HeContext &context, std::size_t level = 6)
 {
     std::vector<std::vector<std::complex<double>>> slots(
         packing.ciphertext_count,
@@ -166,19 +169,19 @@ hera::SealCipherTensor EncryptResidual(
     std::vector<seal::Ciphertext> ciphertexts(packing.ciphertext_count);
     for (std::size_t i = 0; i < ciphertexts.size(); ++i) {
         seal::Plaintext plain;
-        encoder.encode(slots[i], LevelId(context, 6),
-                       std::ldexp(1.0, 44), plain);
+        encoder.encode(slots[i], LevelId(context, level),
+                       std::ldexp(1.0, context.parameters.default_scale_bits), plain);
         encryptor.encrypt_symmetric(plain, ciphertexts[i]);
     }
     hera::TensorSpec spec;
     spec.shape = packing.logical_shape;
     spec.domain = hera::Domain::kHeCiphertext;
-    spec.layout = hera::Layout::kComplexStrictColumn;
+    spec.layout = packing.layout;
     spec.numeric = {43, 13, true};
     spec.he_region = hera::HeRegionId::kRegion4;
     spec.he_parameter_profile = context.profile;
-    spec.planned_level = 6;
-    spec.planned_scale_bits = 44;
+    spec.planned_level = level;
+    spec.planned_scale_bits = context.parameters.default_scale_bits;
     return {context.profile, std::move(ciphertexts), spec, packing};
 }
 
@@ -204,10 +207,10 @@ std::vector<double> Decrypt(const hera::SealCipherTensor &tensor,
     return result;
 }
 
-std::uint64_t EncodeFixed(double value)
+std::uint64_t EncodeFixed(double value, int scale_bits = 13)
 {
     return static_cast<std::uint64_t>(static_cast<std::int64_t>(
-        std::llround(std::ldexp(value, 13)))) & kMask;
+        std::llround(std::ldexp(value, scale_bits)))) & kMask;
 }
 
 struct PartyResult {
@@ -216,6 +219,8 @@ struct PartyResult {
     std::string error;
     hera::TensorHandle scores;
     hera::TensorHandle value;
+    hera::TensorHandle attention_residual;
+    std::vector<std::uint64_t> centered, inverse;
 };
 
 PartyResult RunParty(
@@ -231,12 +236,17 @@ PartyResult RunParty(
             result.error = std::move(message);
             return result;
         };
-        const int base_port = config.layers.size() == 1 ? 19900 : 20000;
+        // Keep test sockets away from common desktop-service ports (20000).
+        const auto *configured_port = std::getenv("HERA_BLOCK5_TEST_PORT");
+        const int first_port = configured_port ? std::stoi(configured_port) : 26000;
+        Require(first_port >= 1024 && first_port <= 30767, "invalid Block-5 test port");
+        const int base_port = first_port + (config.layers.size() == 1 ? 0 : 1000);
         auto transport = hera::MakeNetIoTransport(
             role, role == hera::PartyRole::kClient ? "127.0.0.1" : "",
             base_port);
         hera::CkksMpcConverter converter(
-            role, {43, 13, 40, 20, true}, registry, transport,
+            role, {config.mpc_numeric.ring_bits, config.mpc_numeric.scale_bits,
+                   config.conversion.statistical_security_bits, config.conversion.fft_scale_bits, true}, registry, transport,
             hera::MakeDeterministicRandomSourceForTesting(
                 role == hera::PartyRole::kClient
                     ? std::vector<std::uint8_t>{31, 37, 41}
@@ -264,12 +274,13 @@ PartyResult RunParty(
         hera::TensorSpec residual_spec;
         residual_spec.shape = {{layer.tokens, layer.model_width}};
         residual_spec.domain = hera::Domain::kHeCiphertext;
-        residual_spec.layout = hera::Layout::kComplexStrictColumn;
+        residual_spec.layout = hera::Layout::kStrictColumn;
         residual_spec.numeric = config.mpc_numeric;
         residual_spec.he_region = hera::HeRegionId::kRegion4;
         residual_spec.he_parameter_profile = "shared";
-        residual_spec.planned_level = 6;
-        residual_spec.planned_scale_bits = 44;
+        residual_spec.planned_level = hera::AttentionLn2LevelPlanner::OutputInputLevel(
+            config.he_parameter_profiles.at("shared")) + 1;
+        residual_spec.planned_scale_bits = config.he_parameter_profiles.at("shared").default_scale_bits;
         hera::LayerWeightHandles weights;
         weights.layer_id = layer.id;
         weights.wd = {601, {"Wd", layer.ffn_width, layer.model_width, true}};
@@ -302,8 +313,8 @@ PartyResult RunParty(
         PartyResult party_result;
         party_result.ok = true;
         party_result.hidden = output.value().hidden_states;
-        const auto expected_m2c = config.layers.size() == 1 ? 1U : 4U;
-        const auto expected_c2m = config.layers.size() == 1 ? 0U : 3U;
+        const auto expected_m2c = config.layers.size() == 1 ? 1U : 2U;
+        const auto expected_c2m = config.layers.size() == 1 ? 0U : 2U;
         if (report.mpc_to_ckks_calls != expected_m2c ||
             report.ckks_to_mpc_calls != expected_c2m)
             return failed("bridge performed an unexpected conversion count");
@@ -312,9 +323,8 @@ PartyResult RunParty(
             return failed("server did not directly add FFN residual");
         if (config.layers.size() > 1) {
             if (output.value().hidden_states.spec.planned_level !=
-                    std::optional<std::size_t>{9})
-                return failed(
-                    "cross-layer hidden state did not land at terminal");
+                    std::optional<std::size_t>{6})
+                return failed("cross-layer hidden state did not preserve the Wo output level");
             if (!output.value().next_layer)
                 return failed("cross-layer output is absent");
             if (output.value().next_layer->block2.scaled_attention_scores.spec
@@ -340,6 +350,16 @@ PartyResult RunParty(
             party_result.scores =
                 output.value().next_layer->block2.scaled_attention_scores;
             party_result.value = output.value().next_layer->block2.value;
+            party_result.attention_residual = output.value().next_layer->attention_residual;
+            if (!party_result.attention_residual.valid() ||
+                !mpc_store.GetMpcShare(output.value().next_layer->centered_shares.id).ok() ||
+                !mpc_store.GetMpcShare(output.value().next_layer->inverse_stddev_shares.id).ok())
+                return failed("shared entry lost next-layer skip or compatibility shares");
+            party_result.centered = mpc_store.GetMpcShare(output.value().next_layer->centered_shares.id).value().local_share;
+            party_result.inverse = mpc_store.GetMpcShare(output.value().next_layer->inverse_stddev_shares.id).value().local_share;
+            if (mpc_store.Size() != 3 ||
+                (role == hera::PartyRole::kServer && he_store.Size() != 5))
+                return failed("explicit bridge retained internal Block-2 tensors");
         }
         return party_result;
     } catch (const std::exception &error) {
@@ -352,6 +372,10 @@ PartyResult RunParty(
 void TestLastLayerRuntime()
 {
     auto config = MakeRuntimeConfig();
+    auto &profile = config.he_parameter_profiles.at("shared");
+    profile.polynomial_degree = 2048;
+    profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
+    profile.declared_depth = 6;
     Require(hera::ValidateHeraConfig(config).ok(),
             "runtime Block-5 config is invalid");
     hera::HeContextRegistry client;
@@ -373,10 +397,10 @@ void TestLastLayerRuntime()
             "Block-5 server owns a secret key");
 
     const auto &layer = config.layers.front();
-    auto residual_plan = hera::FfnGeluPackingPlanner::ComplexColumns(
+    auto residual_plan = hera::FfnGeluPackingPlanner::RealColumns(
         {{layer.tokens, layer.model_width}},
         client.Require("shared", hera::PartyRole::kClient).slot_count(),
-        hera::Layout::kComplexStrictColumn);
+        hera::Layout::kStrictColumn);
     Require(residual_plan.ok(), residual_plan.status().message());
     const std::vector<double> activation{
         -0.5, -0.2, 0.1, 0.4, 0.7,
@@ -400,7 +424,7 @@ void TestLastLayerRuntime()
     hera::SealCipherTensorStore server_he, client_he;
     Require(server_he.Put(9200002, EncryptResidual(
                 residual, residual_plan.value(),
-                client.Require("shared", hera::PartyRole::kClient))).ok(),
+                client.Require("shared", hera::PartyRole::kClient), 3)).ok(),
             "cannot store retained residual");
 
     std::vector<std::uint64_t> server_share(activation.size());
@@ -444,6 +468,10 @@ void TestLastLayerRuntime()
             "Block-5 client process failed");
     auto hidden = server_he.Get(server_result.hidden.id);
     Require(hidden.ok(), hidden.status().message());
+    Require(server_result.hidden.spec.planned_level == std::optional<std::size_t>{3} &&
+                hidden.value().ciphertexts.front().parms_id() ==
+                    LevelId(client.Require("shared", hera::PartyRole::kClient), 3),
+            "real Wd residual output did not remain at L3");
     auto actual = Decrypt(hidden.value(),
         client.Require("shared", hera::PartyRole::kClient));
     std::vector<double> expected(layer.tokens * layer.model_width);
@@ -464,11 +492,19 @@ void TestLastLayerRuntime()
                 std::to_string(maximum));
 }
 
-void TestCrossLayerRuntime()
+void TestCrossLayerRuntime(bool normalized_next)
 {
     auto config = MakeRuntimeConfig();
+    if (normalized_next) {
+        // Use BLB's scale20 for the original-affine oracle on N8192.
+        // M2C quantizes polynomial coefficients at the MPC precision before
+        // lifting to the HE scale; scale13 noise is amplified by this LN.
+        config.mpc_numeric.scale_bits = 20;
+        config.layers.front().attention_norm_rsqrt_bits = 27;
+    }
     auto next = config.layers.front();
     next.id = "layer1";
+    if (normalized_next) next.norm = hera::NormPlacement::kNormalizedResidual;
     next.qkv_bias = false;
     config.layers.push_back(next);
     auto execution = config.layer_execution.front();
@@ -494,9 +530,9 @@ void TestCrossLayerRuntime()
     const auto &layer = config.layers.front();
     const auto &client_context = client.Require(
         "shared", hera::PartyRole::kClient);
-    auto residual_plan = hera::FfnGeluPackingPlanner::ComplexColumns(
+    auto residual_plan = hera::FfnGeluPackingPlanner::RealColumns(
         {{layer.tokens, layer.model_width}}, client_context.slot_count(),
-        hera::Layout::kComplexStrictColumn);
+        hera::Layout::kStrictColumn);
     Require(residual_plan.ok(), residual_plan.status().message());
     const std::vector<double> activation{
         -0.45, -0.15, 0.12, 0.38, 0.64,
@@ -539,14 +575,20 @@ void TestCrossLayerRuntime()
         wk[i] = (static_cast<int>(i % 3) - 1) * 0.03;
     for (std::size_t i = 0; i < wv.size(); ++i)
         wv[i] = (static_cast<int>(i % 4) - 1) * 0.02;
+    const std::vector<double> gamma = normalized_next
+        ? std::vector<double>{1.2, 0.0, -0.8, 0.6} : std::vector<double>(next.model_width, 1.0);
+    const std::vector<double> beta = normalized_next
+        ? std::vector<double>{0.3, -0.2, 0.1, -0.15} : std::vector<double>(next.model_width, 0.0);
     Require(server_parameters.PutMatrix(next_weights.wq, wq).ok() &&
                 server_parameters.PutMatrix(next_weights.wk, wk).ok() &&
                 server_parameters.PutMatrix(next_weights.wv, wv).ok() &&
                 server_parameters.PutVector(next_weights.plain_parameters[0],
-                    std::vector<double>(next.model_width, 1.0)).ok() &&
+                    gamma).ok() &&
                 server_parameters.PutVector(next_weights.plain_parameters[1],
-                    std::vector<double>(next.model_width, 0.0)).ok(),
+                    beta).ok(),
             "cannot register next Block-2 parameters");
+    auto fused = server_parameters.FuseLayerNormGammaIntoQkv(next_weights);
+    Require(fused.ok(), fused.status().message());
 
     hera::SealCipherTensorStore server_he, client_he;
     Require(server_he.Put(9200002, EncryptResidual(
@@ -556,21 +598,25 @@ void TestCrossLayerRuntime()
     std::vector<std::uint64_t> client_share(activation.size());
     for (std::size_t i = 0; i < activation.size(); ++i) {
         server_share[i] = (170011 + i * 65537) & kMask;
-        client_share[i] = (EncodeFixed(activation[i]) - server_share[i]) & kMask;
+        client_share[i] = (EncodeFixed(activation[i], config.mpc_numeric.scale_bits) - server_share[i]) & kMask;
     }
     int pipe_fd[2];
     Require(pipe(pipe_fd) == 0, "cannot create cross-layer pipe");
     const auto child = fork();
     Require(child >= 0, "cannot fork cross-layer client");
+    struct SharePacket { int ok{}; std::uint64_t centered[8]{}, inverse[2]{}; };
     if (child == 0) {
         close(pipe_fd[0]);
         auto result = RunParty(hera::PartyRole::kClient, config, client,
                                client_share, client_he, client_parameters);
         if (!result.ok) std::cerr << "cross-layer client: " << result.error << '\n';
-        const int value = result.ok ? 1 : 0;
-        const auto written = write(pipe_fd[1], &value, sizeof(value));
+        SharePacket packet;
+        packet.ok = result.ok;
+        std::copy(result.centered.begin(), result.centered.end(), packet.centered);
+        std::copy(result.inverse.begin(), result.inverse.end(), packet.inverse);
+        const auto written = write(pipe_fd[1], &packet, sizeof(packet));
         close(pipe_fd[1]);
-        _exit(result.ok && written == static_cast<ssize_t>(sizeof(value))
+        _exit(result.ok && written == static_cast<ssize_t>(sizeof(packet))
                   ? 0 : 92);
     }
     close(pipe_fd[1]);
@@ -583,12 +629,12 @@ void TestCrossLayerRuntime()
         close(pipe_fd[0]);
         throw std::runtime_error(server_result.error);
     }
-    int client_ok = 0;
-    const auto received = read(pipe_fd[0], &client_ok, sizeof(client_ok));
+    SharePacket peer;
+    const auto received = read(pipe_fd[0], &peer, sizeof(peer));
     close(pipe_fd[0]);
     int status = 0;
     waitpid(child, &status, 0);
-    Require(received == sizeof(client_ok) && client_ok == 1 &&
+    Require(received == sizeof(peer) && peer.ok == 1 &&
                 WIFEXITED(status) && WEXITSTATUS(status) == 0,
             "cross-layer client process failed");
     auto hidden = server_he.Get(server_result.hidden.id);
@@ -616,25 +662,66 @@ void TestCrossLayerRuntime()
             "cross-layer Block-2 tensors cannot be loaded");
     const auto actual_scores = Decrypt(score_tensor.value(), client_context);
     const auto actual_value = Decrypt(value_tensor.value(), client_context);
-    std::vector<double> normalized(expected.size());
-    for (std::size_t token = 0; token < next.tokens; ++token) {
-        double mean = 0.0;
-        for (std::size_t feature = 0; feature < next.model_width; ++feature)
-            mean += expected[token * next.model_width + feature];
-        mean /= static_cast<double>(next.model_width);
-        double variance = 0.0;
-        for (std::size_t feature = 0; feature < next.model_width; ++feature) {
-            const auto centered =
-                expected[token * next.model_width + feature] - mean;
-            variance += centered * centered;
+    const auto normalize = [&](const std::vector<double> &input) {
+        std::vector<double> normalized(input.size());
+        for (std::size_t token = 0; token < next.tokens; ++token) {
+            double mean = 0.0;
+            for (std::size_t feature = 0; feature < next.model_width; ++feature)
+                mean += input[token * next.model_width + feature];
+            mean /= static_cast<double>(next.model_width);
+            double variance = 0.0;
+            for (std::size_t feature = 0; feature < next.model_width; ++feature) {
+                const auto centered =
+                    input[token * next.model_width + feature] - mean;
+                variance += centered * centered;
+            }
+            variance /= static_cast<double>(next.model_width);
+            const auto inverse = 1.0 / std::sqrt(
+                variance + next.attention_norm_epsilon);
+            for (std::size_t feature = 0; feature < next.model_width; ++feature)
+                normalized[token * next.model_width + feature] =
+                    (input[token * next.model_width + feature] - mean) * inverse * gamma[feature] + beta[feature];
         }
-        variance /= static_cast<double>(next.model_width);
-        const auto inverse = 1.0 / std::sqrt(
-            variance + next.attention_norm_epsilon);
-        for (std::size_t feature = 0; feature < next.model_width; ++feature)
-            normalized[token * next.model_width + feature] =
-                (expected[token * next.model_width + feature] - mean) * inverse;
+        return normalized;
+    };
+    const auto normalized = normalize(expected);
+    auto next_skip = server_he.Get(server_result.attention_residual.id);
+    Require(next_skip.ok(), "next-layer attention residual is absent");
+    const auto actual_skip = Decrypt(next_skip.value(), client_context);
+    // Validate the next skip against the actual HE hidden producer. Its
+    // separate oracle above already checks Wd/conversion error against the
+    // original activation. This isolates the next LN1 affine/source contract.
+    const auto expected_skip = normalized_next ? normalize(actual) : actual;
+    double mpc_error = 0.0, he_tail_error = 0.0;
+    if (normalized_next) {
+        for (std::size_t t = 0; t < next.tokens; ++t) {
+            const auto inv = std::ldexp(static_cast<double>((server_result.inverse[t] + peer.inverse[t]) & kMask),
+                -config.mpc_numeric.scale_bits);
+            for (std::size_t f = 0; f < next.model_width; ++f) {
+                const auto i = t * next.model_width + f;
+                const auto raw = (server_result.centered[i] + peer.centered[i]) & kMask;
+                const auto signed_value = raw >= (std::uint64_t{1} << 42)
+                    ? static_cast<std::int64_t>(raw) - (std::int64_t{1} << 43) : static_cast<std::int64_t>(raw);
+                const auto center = std::ldexp(static_cast<double>(signed_value), -config.mpc_numeric.scale_bits);
+                const auto affine = center * inv * gamma[f] + beta[f];
+                mpc_error = std::max(mpc_error, std::abs(affine - expected_skip[i]));
+                he_tail_error = std::max(he_tail_error, std::abs(actual_skip[i] - affine));
+            }
+        }
+        Require(mpc_error < 0.005 && he_tail_error < 0.005,
+            "next LN1 error exceeds the separate MPC/HE affine bounds: MPC=" + std::to_string(mpc_error) +
+            " HE=" + std::to_string(he_tail_error));
+        std::cout << "NEXT_LN1_MPC_ERROR=" << mpc_error << ",HE_TAIL_ERROR=" << he_tail_error << '\n';
     }
+    double skip_error = 0.0;
+    for (std::size_t i = 0; i < expected_skip.size(); ++i)
+        skip_error = std::max(skip_error, std::abs(actual_skip[i] - expected_skip[i]));
+    if (skip_error >= 0.02)
+        for (std::size_t i = 0; i < expected_skip.size(); ++i)
+            std::cerr << "SKIP_VALUE=" << i << ",ACTUAL=" << actual_skip[i]
+                      << ",EXPECTED=" << expected_skip[i] << '\n';
+    Require(skip_error < 0.02, "next-layer skip has the wrong affine or residual source: " + std::to_string(skip_error));
+    std::cout << "NEXT_ATTENTION_SKIP_MAX_ERROR=" << skip_error << '\n';
     std::vector<double> q(next.tokens * hera::QueryWidth(next));
     std::vector<double> k(next.tokens * hera::KeyWidth(next));
     std::vector<double> expected_value(next.tokens * hera::ValueWidth(next));
@@ -687,13 +774,13 @@ void TestCrossLayerRuntime()
 
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
     try {
         TestPlannerAndGraph();
         TestCrossLayerPlanner();
         TestLastLayerRuntime();
-        TestCrossLayerRuntime();
+        TestCrossLayerRuntime(argc == 2 && std::string(argv[1]) == "--normalized-next");
         std::cout << "BLOCK5_BRIDGE_STATUS=PASS\n";
         return 0;
     } catch (const std::exception &error) {

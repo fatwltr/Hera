@@ -11,7 +11,7 @@
         "qk_head_width": 64,
         "value_head_width": 64,
         "ffn_width": 1024,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_causal",
         "qkv_bias": true,
@@ -19,7 +19,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       }
     ]
@@ -51,24 +51,13 @@
     }
   },
   "he_parameter_profiles": {
-    "block1_ln_statistics": {
-      "polynomial_degree": 16384,
-      "coefficient_modulus_bits": [60, 60, 60, 60, 60],
-      "default_scale_bits": 38,
-      "input_scale_bits": 38,
-      "output_scale_bits": 38,
-      "declared_depth": 4,
-      "terminal_prime_count": 1,
-      "require_exact_terminal_level": true,
-      "security_level": "none"
-    },
     "block2_attention_main": {
       "polynomial_degree": 32768,
-      "coefficient_modulus_bits": [60, 35, 60, 60, 60, 60, 60, 60, 60, 60],
+      "coefficient_modulus_bits": [60, 35, 60, 60, 60, 60, 60],
       "default_scale_bits": 44,
       "input_scale_bits": 44,
       "output_scale_bits": 44,
-      "declared_depth": 9,
+      "declared_depth": 6,
       "terminal_prime_count": 1,
       "require_exact_terminal_level": true,
       "security_level": "none"
@@ -86,11 +75,11 @@
     },
     "block5_ffn": {
       "polynomial_degree": 32768,
-      "coefficient_modulus_bits": [60, 60, 46, 46, 46, 46, 60, 60],
+      "coefficient_modulus_bits": [60, 60, 46, 46, 46, 60],
       "default_scale_bits": 45,
       "input_scale_bits": 45,
       "output_scale_bits": 46,
-      "declared_depth": 6,
+      "declared_depth": 5,
       "terminal_prime_count": 1,
       "require_exact_terminal_level": true,
       "security_level": "none"
@@ -101,13 +90,13 @@
       "id": "layer0",
       "he_regions": {
         "region1": {
-          "profile": "block1_ln_statistics",
+          "profile": "block5_ffn",
           "input_layout": "spatial",
           "output_layout": "reduction"
         },
         "region2": {
           "profile": "block2_attention_main",
-          "input_layout": "spatial",
+          "input_layout": "strict_column",
           "output_layout": "attention_output"
         },
         "region3": {

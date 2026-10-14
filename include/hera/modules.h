@@ -10,6 +10,7 @@ struct LayerNormBuildConfig {
     HeRegionId statistics_region{HeRegionId::kRegion1};
     HeRegionId finish_region{HeRegionId::kRegion2};
     double epsilon{1e-5};
+    std::optional<int> statistics_scale_bits{};
 };
 
 struct AttentionProjectionOutputs {
@@ -29,7 +30,8 @@ public:
     // Builds mean/variance in HE, converts only the nonlinear rsqrt portion to
     // MPC, refreshes live centered values, and returns normalized HE data.
     static Result<TensorId> Build(GraphBuilder &graph, TensorId input,
-                                  const LayerNormBuildConfig &config);
+                                  const LayerNormBuildConfig &config,
+                                  TensorId *normalized_residual = nullptr);
 };
 
 class AttentionGraphModule {

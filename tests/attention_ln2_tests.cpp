@@ -1,14 +1,18 @@
 #include "hera/attention_ln2.h"
+#include "hera/detail/packing_utils.h"
+#include "hera/detail/parallel_ranges.h"
 
 #include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdlib>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
+#include <utility>
 
 namespace {
 
@@ -197,6 +201,21 @@ void TestPackingAndLevels()
     for (const auto &locations : av.value().probability_packing.logical_locations)
         Require(locations.size() == 1,
                 "Softmax A physical mapping is not bijective");
+    const auto &a_real = av.value().probability_packing.Locations(0).front();
+    const auto &a_imag = av.value().probability_packing.Locations(1).front();
+    Require(a_real.ciphertext == a_imag.ciphertext &&
+                a_real.slot == a_imag.slot &&
+                a_real.component == hera::ComplexLane::kReal &&
+                a_imag.component == hera::ComplexLane::kImaginary,
+            "consecutive A diagonals are not complex-paired");
+    const auto &assignment = av.value().probability_slot_map.assignments[
+        a_real.ciphertext * profile.polynomial_degree / 2 + a_real.slot];
+    Require(assignment.real_logical_index == 0 &&
+                assignment.imaginary_logical_index == 1 &&
+                std::find(av.value().required_rotation_steps.begin(),
+                          av.value().required_rotation_steps.end(), 0) !=
+                    av.value().required_rotation_steps.end(),
+            "A conversion map or conjugation key is missing");
     for (const auto kv_heads : {std::size_t{2}, std::size_t{1}}) {
         auto variant = layer;
         variant.tokens = 3;
@@ -210,11 +229,11 @@ void TestPackingAndLevels()
         Require(variant_plan.value().probability_packing.Validate().ok() &&
                     variant_plan.value().output_packing.Validate().ok(),
                 "MHA/GQA tail A*V packing is invalid");
-        // 32 slots / (3 tokens * 2 heads) gives five value lanes. Dimension
-        // five must therefore be carried by the imaginary component paired
+        // Padded token stride is four, giving four physical lanes. Dimension
+        // four must therefore be carried by the imaginary component paired
         // with real dimension zero, exactly as softmax_vh complex_pairs does.
         const auto &real = variant_plan.value().output_packing.Locations(0);
-        const auto &imag = variant_plan.value().output_packing.Locations(5);
+        const auto &imag = variant_plan.value().output_packing.Locations(4);
         Require(!real.empty() && !imag.empty() &&
                     real.front().ciphertext == imag.front().ciphertext &&
                     real.front().slot == imag.front().slot &&
@@ -233,6 +252,208 @@ void TestPackingAndLevels()
     Require(tiled_plan.ok() &&
                 tiled_plan.value().probability_packing.ciphertext_count > 1,
             "head-tiled A*V packing was not generated");
+
+    auto bert = layer;
+    bert.tokens = 128;
+    bert.model_width = 768;
+    bert.q_heads = bert.kv_heads = 12;
+    bert.qk_head_width = bert.value_head_width = 64;
+    bert.ffn_width = 3072;
+    auto bert_av = hera::AttentionLn2PackingPlanner::AttentionValue(bert, 16384);
+    auto bert_v = hera::MultiHeadPackingPlan::ProjectionOutput(
+        bert, hera::Layout::kMultiHeadV, 16384);
+    auto bert_q = hera::MultiHeadPackingPlan::ProjectionOutput(
+        bert, hera::Layout::kMultiHeadQ, 16384);
+    Require(bert_av.ok() && bert_v.ok() && bert_q.ok(),
+            "BERT-base power-of-two packing failed");
+    Require(bert_av.value().probability_packing.ciphertext_count == 8 &&
+                bert_v.value().ciphertext_count == 4 &&
+                bert_av.value().output_packing.ciphertext_count == 4,
+            "BERT-base did not use eight A and four V/output ciphertexts");
+    const auto &v8 = bert_v.value().Locations(8).front();
+    const auto &o8 = bert_av.value().output_packing.Locations(8).front();
+    Require(v8.slot == 0 && v8.component == hera::ComplexLane::kImaginary &&
+                o8.slot == 0 && o8.component == hera::ComplexLane::kImaginary &&
+                bert_v.value().Locations(16).front().ciphertext == 1 &&
+                bert_av.value().probability_packing.Locations(16)
+                    .front().ciphertext == 1,
+            "BERT-base A/V boundaries do not match eight lanes");
+    Require(bert_q.value().ciphertext_count == 3 &&
+                bert_q.value().Locations(8).front().slot == 8 * 128 * 8 &&
+                bert_q.value().Locations(16).front().component == hera::ComplexLane::kImaginary &&
+                bert_q.value().Locations(32).front().ciphertext == 1 &&
+                bert_q.value().Locations(8 * 64).front().ciphertext == 2,
+            "Q/K 8+4 policy drifted from the independent twelve-head V policy");
+    const auto &bert_rotations = bert_av.value().required_rotation_steps;
+    Require(bert_rotations.size() == 37,
+            "BERT-base A*V did not request exactly 36 rotations and conjugation");
+    for (const int step : {-6144, -3072, 3072, 6144})
+        Require(std::find(bert_rotations.begin(), bert_rotations.end(), step)
+                    != bert_rotations.end(),
+                "BERT-base is missing a directional replication key");
+    // The old first=6 alignment requested +6B, canonicalized to -7168.
+    Require(std::find(bert_rotations.begin(), bert_rotations.end(), -7168)
+                == bert_rotations.end(),
+            "BERT-base still requests the obsolete seed-alignment key");
+    for (const auto *packing : {&bert_av.value().probability_packing,
+                               &bert_v.value(), &bert_av.value().output_packing})
+        for (const auto &locations : packing->logical_locations)
+            for (const auto &location : locations)
+                Require(location.slot < 8 * 128 * 12,
+                        "BERT-base A/V packing used a lane beyond capacity eight");
+}
+
+void TestComplexProbabilityInputs(bool terminal_suffix = false)
+{
+    auto config = MakeConfig();
+    auto &profile = config.he_parameter_profiles.at("shared");
+    profile.coefficient_modulus_bits = {60, 60, 60, 60};
+    profile.declared_depth = 3;
+    const std::size_t av_input_level = terminal_suffix ? 3 : 0;
+    if (terminal_suffix) {
+        profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
+        profile.declared_depth = 6;
+    }
+    hera::HeContextRegistry client;
+    Require(client.CreateClientProfiles(config).ok(),
+            "complex A client context failed");
+    // Exercise paired replication, one-lane fallback, partial physical blocks,
+    // unpaired diagonal tails, multiple giant groups, and head tiles.
+    for (const auto shape : {std::pair<std::size_t, std::size_t>{1, 2}, {3, 2},
+                             {8, 4},
+                             {3, 300}, {5, 300}, {5, 600},
+                             {13, 31}, {16, 12}, {40, 5}, {128, 1}}) {
+        auto layer = config.layers.front();
+        layer.tokens = shape.first;
+        layer.q_heads = shape.second;
+        layer.kv_heads = layer.q_heads == 2 ? 2 :
+                         (layer.q_heads == 4 ? 2 : 1);
+        layer.value_head_width = (layer.tokens == 128 || layer.q_heads == 12) ? 64 :
+                                 (layer.tokens == 40 ? 24 : 4);
+        auto a_plan = hera::AttentionLn2PackingPlanner::AttentionValue(
+            layer, profile.polynomial_degree / 2);
+        auto v_plan = hera::MultiHeadPackingPlan::ProjectionOutput(
+            layer, hera::Layout::kMultiHeadV, profile.polynomial_degree / 2);
+        Require(a_plan.ok() && v_plan.ok(), "complex A packing failed");
+        Require(client.CompileRotationKeys(
+                    "shared", a_plan.value().required_rotation_steps).ok(),
+                "complex A Galois keys failed");
+        auto bundle = client.ExportPublicBundle();
+        Require(bundle.ok(), bundle.status().message());
+        hera::HeContextRegistry server;
+        Require(server.CreateServerProfiles(config, bundle.value()).ok(),
+                "complex A server context failed");
+        const auto &client_context = client.Require(
+            "shared", hera::PartyRole::kClient);
+        const auto &server_context = server.Require(
+            "shared", hera::PartyRole::kServer);
+        std::vector<double> a(layer.tokens * layer.q_heads * layer.tokens);
+        std::vector<double> v(
+            layer.tokens * layer.kv_heads * layer.value_head_width);
+        std::vector<double> expected(
+            layer.tokens * layer.q_heads * layer.value_head_width, 0.0);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            v[i] = std::sin(static_cast<double>(i + 1) * 0.7) * 0.2;
+        for (std::size_t row = 0; row < layer.tokens; ++row)
+            for (std::size_t head = 0; head < layer.q_heads; ++head) {
+                const auto offset = (row * layer.q_heads + head) * layer.tokens;
+                double sum = 0.0;
+                for (std::size_t column = 0; column < layer.tokens; ++column) {
+                    a[offset + column] = 1.0 +
+                        ((row * 3 + head * 2 + column * 5) % 11);
+                    sum += a[offset + column];
+                }
+                for (std::size_t column = 0; column < layer.tokens; ++column) {
+                    a[offset + column] /= sum;
+                    for (std::size_t d = 0; d < layer.value_head_width; ++d)
+                        expected[(row * layer.q_heads + head) *
+                                     layer.value_head_width + d] +=
+                            a[offset + column] *
+                            v[(column * layer.kv_heads +
+                               head / (layer.q_heads / layer.kv_heads)) *
+                                  layer.value_head_width + d];
+                }
+            }
+        auto a_ct = Encrypt(a, a_plan.value().probability_packing,
+                            client_context, av_input_level, hera::HeRegionId::kRegion2);
+        auto v_ct = Encrypt(v, v_plan.value(), client_context, av_input_level,
+                            hera::HeRegionId::kRegion2);
+        Require(MaxError(Decrypt(a_ct, client_context), a) < 1e-5,
+                "complex A input packing lost a probability component");
+        hera::AttentionLn2ExecutionReport report;
+        auto output = hera::MultiHeadAttentionValueKernel::Evaluate(
+            a_ct, v_ct, layer, server_context, &report, 2);
+        Require(output.ok(), output.status().message());
+        Require(MaxError(Decrypt(output.value(), client_context), expected) <
+                    1e-4,
+                "complex A extraction/replication differs from plain A*V");
+        Require(ActualLevel(client_context,
+                    output.value().ciphertexts.front().parms_id()) == av_input_level + 3,
+                "complex A extraction consumed an extra CKKS level");
+        hera::SealPlainParameterStore prepared;
+        prepared.BeginPlaintextPreparation();
+        {
+            hera::ModelPlaintextCacheScope scope(&prepared, layer.id);
+            Require(hera::MultiHeadAttentionValueKernel::Prepare(layer, server_context, av_input_level).ok(),
+                "AV public mask preparation failed");
+        }
+        prepared.FreezePlaintextCache();
+        const auto mask_count = prepared.encoded_plaintext_count();
+        {
+            hera::ModelPlaintextCacheScope scope(&prepared, layer.id);
+            hera::AttentionLn2ExecutionReport warm;
+            auto cached = hera::MultiHeadAttentionValueKernel::Evaluate(a_ct, v_ct, layer, server_context, &warm, 2);
+            Require(cached.ok(), cached.status().message());
+            Require(MaxError(Decrypt(cached.value(), client_context), expected) < 1e-4 &&
+                        prepared.encoded_plaintext_count() == mask_count &&
+                        warm.attention_value_plaintext_encodings == 0,
+                "prepared AV changed numerics or encoded masks online");
+        }
+        const auto tiles = (layer.q_heads +
+                            client_context.slot_count() / hera::detail::TokenColumnStride(layer.tokens) - 1) /
+                           (client_context.slot_count() / hera::detail::TokenColumnStride(layer.tokens));
+        Require(report.conjugations == ((layer.tokens + 1) / 2) * tiles,
+                "prepared A did not share conjugation across diagonal pairs");
+        Require(report.rotations == report.attention_probability_rotations +
+                    report.attention_value_rotations +
+                    report.attention_recovery_rotations,
+                "A*V stage rotation counts do not sum to the kernel total");
+        if (layer.tokens == 40) {
+            // T=40 pads to stride=64. Capacity 2048/(64*5)=6
+            // rounds down to four lanes, with five eight-diagonal groups.
+            Require(a_ct.ciphertexts.size() == 5 &&
+                        v_ct.ciphertexts.size() == 3 &&
+                        report.attention_probability_rotations == 38 &&
+                        report.attention_value_rotations == 24 &&
+                        report.attention_recovery_rotations == 24 &&
+                        report.conjugations == 20 &&
+                        report.relinearizations == 15 &&
+                        report.ciphertext_multiplications == 120,
+                    "padded four-lane A*V no longer matches the 121-KS plan");
+        }
+        if (layer.tokens == 128) {
+            Require(report.attention_probability_rotations == 166 &&
+                        report.attention_value_rotations == 64 &&
+                        report.attention_recovery_rotations == 12 &&
+                        report.conjugations == 64 &&
+                        report.relinearizations == 8 &&
+                        report.ciphertext_multiplications == 256,
+                    "16-lane THOR schedule no longer matches the 314-KS plan");
+        }
+        if (layer.tokens == 5) {
+            std::size_t real_only_count = 0;
+            const auto max_heads = client_context.slot_count() / hera::detail::TokenColumnStride(layer.tokens);
+            for (std::size_t begin = 0; begin < layer.q_heads;) {
+                const auto heads = std::min(max_heads, layer.q_heads - begin);
+                const auto lanes = hera::detail::FloorPowerOfTwo(
+                    client_context.slot_count() / (hera::detail::TokenColumnStride(layer.tokens) * heads));
+                real_only_count += (layer.tokens + lanes - 1) / lanes;
+                begin += heads;
+            }
+            Require(a_ct.ciphertexts.size() < real_only_count,
+                    "complex A pairing did not reduce ciphertext count");
+        }
+    }
 }
 
 void TestHePath()
@@ -246,7 +467,20 @@ void TestHePath()
     auto steps = hera::SealSciAttentionLn2Executor::RequiredRotationSteps(
         layer, profile);
     Require(steps.ok(), steps.status().message());
-    Require(client.CompileRotationKeys("shared", steps.value()).ok(),
+    std::set<int> all_steps(steps.value().begin(), steps.value().end());
+    // This fixture also runs a different attention geometry. Compile its
+    // exact keys instead of depending on SEAL's rotation decomposition.
+    auto complex_key_layer = layer;
+    complex_key_layer.tokens = 3;
+    complex_key_layer.q_heads = 200;
+    complex_key_layer.kv_heads = 1;
+    complex_key_layer.value_head_width = 8;
+    auto complex_keys = hera::AttentionLn2PackingPlanner::AttentionValue(
+        complex_key_layer, profile.polynomial_degree / 2);
+    Require(complex_keys.ok(), complex_keys.status().message());
+    all_steps.insert(complex_keys.value().required_rotation_steps.begin(),
+                     complex_keys.value().required_rotation_steps.end());
+    Require(client.CompileRotationKeys("shared", {all_steps.begin(), all_steps.end()}).ok(),
             "cannot compile attention/LN2 rotation keys");
     auto bundle = client.ExportPublicBundle();
     Require(bundle.ok(), bundle.status().message());
@@ -353,14 +587,15 @@ void TestHePath()
             "A*V numerical error exceeds tolerance");
 
     // Exercise the actual complex-pair arithmetic, rather than only checking
-    // metadata. With 2048 slots, 3 tokens x 300 heads gives two lanes and two
-    // giant groups (the second one is a one-diagonal tail). Value dimensions
+    // metadata. With 2048 slots, stride=4 and 200 heads give two lanes and two
+    // real-only giant groups; complex BSGS combines them into
+    // one group. Value dimensions
     // 0/1 and 2/3 therefore occupy the real and imaginary components. MQA also
     // verifies that physical query-head replication survives all three BSGS
     // phases.
     auto complex_layer = layer;
     complex_layer.tokens = 3;
-    complex_layer.q_heads = 300;
+    complex_layer.q_heads = 200;
     complex_layer.kv_heads = 1;
     complex_layer.value_head_width = 4;
     auto complex_a_plan = hera::AttentionLn2PackingPlanner::AttentionValue(
@@ -411,7 +646,8 @@ void TestHePath()
     Require(MaxError(complex_actual, complex_expected) < 0.025,
             "complex-pair A*V real/imaginary arithmetic is incorrect");
     Require(complex_report.ciphertext_multiplications == 3 &&
-                complex_report.relinearizations == 2,
+                complex_report.relinearizations == 1 &&
+                complex_report.conjugations == 2,
             "A*V did not lazily accumulate/relinearize once per giant group");
 
     auto parallel_layer = complex_layer;
@@ -545,6 +781,505 @@ void TestHePath()
             "attention/LN2 HE operation report is incomplete");
 }
 
+void TestStatisticsReductionAndCache()
+{
+    auto config = MakeConfig();
+    auto &layer = config.layers.front();
+    layer.tokens = 3;
+    layer.model_width = 1025; // Three real ciphertexts; the final one is a tail.
+    hera::HeContextRegistry client;
+    Require(client.CreateClientProfiles(config).ok(), "cannot create statistics context");
+    const auto &client_context = client.Require("shared", hera::PartyRole::kClient);
+    const std::size_t stride = 4;
+    const auto features = client_context.slot_count() / stride;
+    std::vector<int> steps{0};
+    for (std::size_t step = 1; step < features; step <<= 1U)
+        steps.push_back(static_cast<int>(step * stride));
+    Require(client.CompileRotationKeys("shared", steps).ok(),
+            "cannot compile statistics keys");
+    auto bundle = client.ExportPublicBundle();
+    Require(bundle.ok(), bundle.status().message());
+    hera::HeContextRegistry server;
+    Require(server.CreateServerProfiles(config, bundle.value()).ok(),
+            "cannot create statistics server");
+    const auto &server_context = server.Require("shared", hera::PartyRole::kServer);
+    auto plan = hera::AttentionLn2PackingPlanner::ComplexStrictColumns(
+        {{layer.tokens, layer.model_width}}, client_context.slot_count());
+    Require(plan.ok(), plan.status().message());
+    std::vector<double> values(layer.tokens * layer.model_width);
+    for (std::size_t f = 0; f < layer.model_width; ++f) {
+        values[f] = -2.0 + 0.4 * std::sin(0.1 * static_cast<double>(f));
+        values[layer.model_width + f] = 2.5; // Zero variance before epsilon.
+        values[2 * layer.model_width + f] = 10.0 + (f % 2 ? 0.001 : -0.001);
+    }
+    auto encrypted = Encrypt(values, plan.value(), client_context, 6,
+                             hera::HeRegionId::kRegion4);
+    auto realified = hera::ComplexRealifyKernel::Evaluate(
+        encrypted, layer, server_context);
+    Require(realified.ok(), realified.status().message());
+    auto input = realified.take_value();
+    Require(input.ciphertexts.size() == 3 &&
+                input.ciphertexts[0].scale() != input.ciphertexts[1].scale(),
+            "statistics fixture does not cover mixed scales and a tail");
+    // Deliberately dirty every padding slot. Both reductions must mask it.
+    seal::CKKSEncoder encoder(*client_context.context);
+    seal::Evaluator evaluator(*client_context.context);
+    for (std::size_t i = 0; i < input.ciphertexts.size(); ++i) {
+        std::vector<double> padding(client_context.slot_count(), 9.0);
+        for (const auto &locations : input.physical_packing.logical_locations)
+            if (locations.front().ciphertext == i) padding[locations.front().slot] = 0.0;
+        seal::Plaintext plain;
+        encoder.encode(padding, input.ciphertexts[i].parms_id(),
+                       input.ciphertexts[i].scale(), plain);
+        evaluator.add_plain_inplace(input.ciphertexts[i], plain);
+    }
+    const auto check = [&](const hera::LayerNormStatisticsOutputs &output,
+                           const hera::TransformerLayerConfig &settings,
+                           double input_factor) {
+        std::vector<double> centered(values.size()), variance(layer.tokens);
+        for (std::size_t token = 0; token < layer.tokens; ++token) {
+            double mean = 0;
+            for (std::size_t f = 0; f < layer.model_width; ++f)
+                mean += values[token * layer.model_width + f] * input_factor;
+            mean /= layer.model_width;
+            for (std::size_t f = 0; f < layer.model_width; ++f) {
+                const auto index = token * layer.model_width + f;
+                centered[index] = values[index] * input_factor - mean;
+                variance[token] += centered[index] * centered[index];
+            }
+            variance[token] = variance[token] / layer.model_width +
+                              settings.attention_norm_epsilon;
+        }
+        const auto actual_variance = Decrypt(output.variance, client_context);
+        Require(MaxError(Decrypt(output.centered, client_context), centered) < 1.0e-3 &&
+                    MaxError(actual_variance, variance) < 1.0e-5 &&
+                    std::abs(actual_variance[1] - settings.attention_norm_epsilon) < 1.0e-7,
+                "statistics reduction differs from plaintext reference");
+    };
+    hera::AttentionLn2ExecutionReport cold;
+    auto serial = hera::LayerNormStatisticsKernel::Evaluate(
+        input, layer, server_context, &cold, 1);
+    Require(serial.ok(), serial.status().message());
+    check(serial.value(), layer, 1.0);
+    Require(cold.layer_norm_plaintext_encodings > 0, "cold plaintext plan was not encoded");
+    hera::AttentionLn2ExecutionReport warm;
+    auto parallel = hera::LayerNormStatisticsKernel::Evaluate(
+        input, layer, server_context, &warm, 32);
+    Require(parallel.ok(), parallel.status().message());
+    check(parallel.value(), layer, 1.0);
+    Require(warm.layer_norm_plaintext_encodings == 0 && warm.layer_norm_workers == 2,
+            "statistics cache or worker cap failed");
+    Require(cold.relinearizations < input.ciphertexts.size() &&
+                cold.relinearizations == warm.relinearizations &&
+                cold.rescales == input.ciphertexts.size() + cold.relinearizations + 1 &&
+                cold.ciphertext_plain_multiplications ==
+                    3 * input.ciphertexts.size() + cold.relinearizations,
+            "lazy statistics did not group full blocks separately from the tail");
+    // LN1 and LN2 alternate profiles. Metadata preparation must preserve both
+    // plans, with no HE operation or encoding on the subsequent original hit.
+    auto alternate_config = MakeConfig();
+    auto alternate_profile = alternate_config.he_parameter_profiles.at("shared");
+    alternate_profile.polynomial_degree = 2048;
+    alternate_profile.coefficient_modulus_bits = {60, 60, 60, 60, 60};
+    alternate_profile.declared_depth = 4;
+    alternate_profile.input_scale_bits = alternate_profile.default_scale_bits =
+        alternate_profile.output_scale_bits = 38;
+    alternate_config.he_parameter_profiles = {{"alternate", alternate_profile}};
+    for (auto &placement : alternate_config.layer_execution.front().regions)
+        placement.second.parameter_profile = "alternate";
+    hera::HeContextRegistry alternate;
+    Require(alternate.CreateClientProfiles(alternate_config, false).ok(),
+            "cannot create alternate statistics context");
+    const auto &alternate_context = alternate.Require("alternate", hera::PartyRole::kClient);
+    auto alternate_plan = hera::AttentionLn2PackingPlanner::RealStrictColumns(
+        input.logical_spec.shape, alternate_context.slot_count());
+    Require(alternate_plan.ok(), alternate_plan.status().message());
+    hera::SealCipherTensor alternate_metadata;
+    alternate_metadata.parameter_profile = "alternate";
+    alternate_metadata.logical_spec = input.logical_spec;
+    alternate_metadata.logical_spec.he_parameter_profile = "alternate";
+    alternate_metadata.logical_spec.planned_level = 1;
+    alternate_metadata.logical_spec.planned_scale_bits = 38;
+    alternate_metadata.physical_packing = alternate_plan.take_value();
+    alternate_metadata.ciphertexts.resize(alternate_metadata.physical_packing.ciphertext_count);
+    for (auto &ct : alternate_metadata.ciphertexts) {
+        ct.parms_id() = LevelId(alternate_context, 1);
+        ct.scale() = std::ldexp(1.0, 38);
+    }
+    hera::AttentionLn2ExecutionReport alternate_cold, original_hit, alternate_hit;
+    Require(hera::LayerNormStatisticsKernel::Prepare(
+                alternate_metadata, layer, alternate_context, &alternate_cold).ok() &&
+                alternate_cold.layer_norm_plaintext_encodings > 0,
+            "alternate statistics metadata preparation failed");
+    Require(hera::LayerNormStatisticsKernel::Prepare(input, layer, server_context, &original_hit).ok() &&
+                hera::LayerNormStatisticsKernel::Prepare(
+                    alternate_metadata, layer, alternate_context, &alternate_hit).ok() &&
+                original_hit.layer_norm_plaintext_encodings == 0 &&
+                alternate_hit.layer_norm_plaintext_encodings == 0,
+            "alternating statistics profiles evicted each other");
+    Require(MaxError(Decrypt(serial.value().centered, client_context),
+                     Decrypt(parallel.value().centered, client_context)) < 1.0e-5 &&
+                MaxError(Decrypt(serial.value().variance, client_context),
+                         Decrypt(parallel.value().variance, client_context)) < 1.0e-7,
+            "serial and parallel statistics differ");
+    auto &pool = hera::detail::HeWorkerPool::Instance();
+    const auto previous_budget = pool.MemoryBudget();
+    pool.SetMemoryBudget(1ULL << 20);
+    hera::AttentionLn2ExecutionReport constrained;
+    auto limited = hera::LayerNormStatisticsKernel::Evaluate(
+        input, layer, server_context, &constrained, 32);
+    pool.SetMemoryBudget(previous_budget);
+    Require(limited.ok(), limited.status().message());
+    Require(constrained.layer_norm_workers == 1, "small memory budget did not disable parallelism");
+    check(limited.value(), layer, 1.0);
+    auto settings = layer;
+    settings.attention_norm_epsilon = 1.0e-3;
+    hera::AttentionLn2ExecutionReport epsilon_changed;
+    auto new_epsilon = hera::LayerNormStatisticsKernel::Evaluate(
+        input, settings, server_context, &epsilon_changed);
+    Require(new_epsilon.ok(), new_epsilon.status().message());
+    Require(epsilon_changed.layer_norm_plaintext_encodings > 0,
+            "epsilon change did not invalidate cached plaintexts");
+    check(new_epsilon.value(), settings, 1.0);
+    auto scaled_input = input;
+    for (auto &ct : scaled_input.ciphertexts) ct.scale() *= 2.0;
+    hera::AttentionLn2ExecutionReport scale_changed;
+    auto new_scale = hera::LayerNormStatisticsKernel::Evaluate(
+        scaled_input, settings, server_context, &scale_changed);
+    Require(new_scale.ok(), new_scale.status().message());
+    Require(scale_changed.layer_norm_plaintext_encodings > 0,
+            "physical scale change did not invalidate cached plaintexts");
+    check(new_scale.value(), settings, 0.5);
+    auto wrong_packing = input;
+    std::swap(wrong_packing.physical_packing.logical_locations[0],
+              wrong_packing.physical_packing.logical_locations[1]);
+    Require(!hera::LayerNormStatisticsKernel::Evaluate(
+                wrong_packing, layer, server_context).ok(),
+            "statistics accepted nonstandard column coordinates");
+    Require(!hera::LayerNormStatisticsKernel::Prepare(
+                wrong_packing, layer, server_context).ok(),
+            "statistics preparation accepted nonstandard column coordinates");
+    for (std::size_t i = 0; i < 9; ++i) {
+        auto unique = layer;
+        unique.attention_norm_epsilon = 0.02 + 0.01 * i;
+        Require(hera::LayerNormStatisticsKernel::Prepare(input, unique, server_context).ok(),
+                "statistics cache eviction preparation failed");
+    }
+    hera::AttentionLn2ExecutionReport evicted;
+    Require(hera::LayerNormStatisticsKernel::Prepare(input, layer, server_context, &evicted).ok() &&
+                evicted.layer_norm_plaintext_encodings > 0,
+            "statistics cache did not enforce its entry limit");
+    Require(MaxError(Decrypt(input, client_context), values) < 1.0e-3 &&
+                ActualLevel(client_context, input.ciphertexts.front().parms_id()) == 6,
+            "statistics modified its input");
+}
+
+
+void TestSevenPrimeDirectResidual()
+{
+    auto config = MakeConfig();
+    auto &layer = config.layers.front();
+    layer.tokens = 16;
+    layer.q_heads = layer.kv_heads = 16;
+    layer.qk_head_width = layer.value_head_width = 8;
+    layer.model_width = 71; // Two real ciphertexts, with a partial final column block.
+    auto &profile = config.he_parameter_profiles.at("shared");
+    profile.polynomial_degree = 2048;
+    profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
+    profile.declared_depth = 6;
+    hera::HeContextRegistry client;
+    Require(client.CreateClientProfiles(config).ok(), "direct-residual context failed");
+    auto rotations = hera::SealSciAttentionLn2Executor::RequiredOutputRotationSteps(layer, profile);
+    Require(rotations.ok(), rotations.status().message());
+    Require(client.CompileRotationKeys("shared", rotations.value()).ok(), "direct-residual keys failed");
+    auto bundle = client.ExportPublicBundle();
+    Require(bundle.ok(), bundle.status().message());
+    hera::HeContextRegistry server;
+    Require(server.CreateServerProfiles(config, bundle.value()).ok(), "direct-residual server failed");
+    const auto &cc = client.Require("shared", hera::PartyRole::kClient);
+    const auto &sc = server.Require("shared", hera::PartyRole::kServer);
+    auto av = hera::AttentionLn2PackingPlanner::AttentionValue(layer, cc.slot_count());
+    auto real = hera::AttentionLn2PackingPlanner::RealStrictColumns(
+        {{layer.tokens, layer.model_width}}, cc.slot_count());
+    Require(av.ok() && real.ok(), "direct-residual packing failed");
+    bool imaginary_source = false;
+    for (const auto &locations : av.value().output_packing.logical_locations)
+        imaginary_source |= locations.front().component == hera::ComplexLane::kImaginary;
+    Require(imaginary_source && real.value().ciphertext_count == 2,
+            "direct-residual fixture must cover complex source and real tail");
+    const auto input_width = layer.q_heads * layer.value_head_width;
+    std::vector<double> values(layer.tokens * input_width);
+    std::vector<double> hidden(layer.tokens * layer.model_width);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        values[i] = 0.1 * std::sin(0.07 * static_cast<double>(i));
+    for (std::size_t i = 0; i < hidden.size(); ++i)
+        hidden[i] = 0.2 * std::cos(0.13 * static_cast<double>(i));
+    hera::DenseMatrixParameter wo{{"Wo", input_width, layer.model_width, true}, {}};
+    wo.row_major.resize(input_width * layer.model_width);
+    for (std::size_t i = 0; i < wo.row_major.size(); ++i)
+        wo.row_major[i] = 0.01 * std::sin(0.11 * static_cast<double>(i));
+    hera::DenseVectorParameter bias{{"bo", layer.model_width}, {}};
+    bias.values.resize(layer.model_width);
+    for (std::size_t f = 0; f < layer.model_width; ++f)
+        bias.values[f] = 0.001 * static_cast<double>(f % 9);
+    auto input = Encrypt(values, av.value().output_packing, cc, 2, hera::HeRegionId::kRegion4);
+    auto residual = Encrypt(hidden, real.value(), cc, 1, hera::HeRegionId::kRegion2);
+    std::vector<double> expected(hidden);
+    for (std::size_t t = 0; t < layer.tokens; ++t)
+        for (std::size_t f = 0; f < layer.model_width; ++f) {
+            auto &y = expected[t * layer.model_width + f];
+            y += bias.values[f];
+            for (std::size_t j = 0; j < input_width; ++j)
+                y += values[t * input_width + j] * wo.row_major[j * layer.model_width + f];
+        }
+    // Compile the real projection through the production preparation/cache path.
+    hera::SealPlainParameterStore parameters;
+    parameters.BeginPlaintextPreparation();
+    {
+        hera::ModelPlaintextCacheScope cache(&parameters, layer.id);
+        auto prepared = hera::AttentionOutputProjectionKernel::EvaluateReal(input, wo, bias, layer, sc);
+        Require(prepared.ok(), prepared.status().message());
+    }
+    parameters.FreezePlaintextCache();
+    hera::AttentionLn2ExecutionReport report;
+    auto projected = [&] {
+        hera::ModelPlaintextCacheScope cache(&parameters, layer.id);
+        return hera::AttentionOutputProjectionKernel::EvaluateReal(input, wo, bias, layer, sc, &report, 2);
+    }();
+    Require(projected.ok(), projected.status().message());
+    Require(projected.value().logical_spec.layout == hera::Layout::kStrictColumn &&
+                ActualLevel(cc, projected.value().ciphertexts.front().parms_id()) == 3,
+            "real Wo output contract mismatch");
+    auto late = Encrypt(hidden, real.value(), cc, 4, hera::HeRegionId::kRegion4);
+    Require(!hera::AttentionResidualKernel::Add(projected.value(), late, sc).ok(),
+            "direct residual accepted a lower-modulus input");
+    auto wrong_scale = residual;
+    for (auto &ct : wrong_scale.ciphertexts) ct.scale() *= 2.0;
+    Require(!hera::AttentionResidualKernel::Add(projected.value(), wrong_scale, sc).ok(),
+            "direct residual accepted mismatched scales");
+    auto combined = hera::AttentionResidualKernel::Add(projected.take_value(), residual, sc, &report);
+    Require(combined.ok(), combined.status().message());
+    Require(MaxError(Decrypt(combined.value(), cc), expected) < 1e-5,
+            "real Wo plus original X differs from plaintext reference");
+    Require(ActualLevel(cc, residual.ciphertexts.front().parms_id()) == 1 &&
+                MaxError(Decrypt(residual, cc), hidden) < 1e-6,
+            "direct residual modified original X");
+    auto statistics = hera::LayerNormStatisticsKernel::Evaluate(combined.value(), layer, sc, &report, 2);
+    Require(statistics.ok(), statistics.status().message());
+    Require(ActualLevel(cc, statistics.value().centered.ciphertexts.front().parms_id()) == 4 &&
+                ActualLevel(cc, statistics.value().variance.ciphertexts.front().parms_id()) == 6,
+            "seven-prime LN statistics did not reach L4/L6");
+    std::vector<double> centered(expected.size()), variance(layer.tokens);
+    for (std::size_t t = 0; t < layer.tokens; ++t) {
+        double mean = 0.0;
+        for (std::size_t f = 0; f < layer.model_width; ++f)
+            mean += expected[t * layer.model_width + f];
+        mean /= layer.model_width;
+        for (std::size_t f = 0; f < layer.model_width; ++f) {
+            const auto i = t * layer.model_width + f;
+            centered[i] = expected[i] - mean;
+            variance[t] += centered[i] * centered[i];
+        }
+        variance[t] = variance[t] / layer.model_width + layer.attention_norm_epsilon;
+    }
+    const auto centered_error = MaxError(Decrypt(statistics.value().centered, cc), centered);
+    const auto variance_error = MaxError(Decrypt(statistics.value().variance, cc), variance);
+    Require(centered_error < 1e-5 && variance_error < 1e-6,
+            "direct-residual LN statistics differs from plaintext reference");
+    std::cout << "DIRECT_RESIDUAL_CENTERED_MAX_ERROR=" << centered_error << '\n'
+              << "DIRECT_RESIDUAL_VARIANCE_MAX_ERROR=" << variance_error << '\n';
+}
+
+
+void TestRealWoBsgsPackingVariants()
+{
+    struct Case { std::size_t heads, kv_heads, width, hidden; };
+    // GQA + partial complex lane/real output, then MQA + a physical head tile tail.
+    for (const auto &settings : {Case{12, 4, 37, 263}, Case{259, 1, 3, 19}}) {
+        auto config = MakeConfig();
+        auto &layer = config.layers.front();
+        layer.tokens = 3;
+        layer.q_heads = settings.heads;
+        layer.kv_heads = settings.kv_heads;
+        layer.value_head_width = settings.width;
+        layer.model_width = settings.hidden;
+        auto &profile = config.he_parameter_profiles.at("shared");
+        profile.polynomial_degree = 2048;
+        profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
+        profile.declared_depth = 6;
+        auto packing = hera::AttentionLn2PackingPlanner::AttentionValue(layer, 1024);
+        auto split = hera::AttentionOutputProjectionKernel::RealColumnBsgs(layer, 1024);
+        auto keys = hera::AttentionOutputProjectionKernel::RequiredRealRotationSteps(layer, 1024);
+        Require(packing.ok() && split.ok() && keys.ok(), "variant Wo planning failed");
+        Require(split.value().baby_steps * split.value().giant_steps ==
+                    split.value().columns_per_ciphertext,
+                "Wo split does not cover the physical column cycle");
+        hera::HeContextRegistry client;
+        Require(client.CreateClientProfiles(config, false).ok(), "variant Wo context failed");
+        Require(client.CompileRotationKeys("shared", keys.value()).ok(), "variant Wo keys failed");
+        auto bundle = client.ExportPublicBundle();
+        Require(bundle.ok(), bundle.status().message());
+        hera::HeContextRegistry server;
+        Require(server.CreateServerProfiles(config, bundle.value()).ok(), "variant Wo server failed");
+        const auto &cc = client.Require("shared", hera::PartyRole::kClient);
+        const auto &sc = server.Require("shared", hera::PartyRole::kServer);
+        const auto width = layer.q_heads * layer.value_head_width;
+        std::vector<double> values(layer.tokens * width);
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = 0.07 * std::sin(0.031 * static_cast<double>(i));
+        auto input = Encrypt(values, packing.value().output_packing, cc, 2, hera::HeRegionId::kRegion4);
+        // Dirty all padding tokens, unused columns and absent complex components.
+        std::vector<std::vector<std::complex<double>>> dirt(input.ciphertexts.size(),
+            std::vector<std::complex<double>>(cc.slot_count(), {0.31, -0.27}));
+        for (const auto &locations : input.physical_packing.logical_locations) {
+            const auto &where = locations.front();
+            auto &slot = dirt[where.ciphertext][where.slot];
+            if (where.component == hera::ComplexLane::kReal) slot.real(0.0);
+            else slot.imag(0.0);
+        }
+        seal::CKKSEncoder encoder(*cc.context);
+        seal::Evaluator evaluator(*cc.context);
+        for (std::size_t ct = 0; ct < input.ciphertexts.size(); ++ct) {
+            seal::Plaintext plain;
+            encoder.encode(dirt[ct], input.ciphertexts[ct].parms_id(), input.ciphertexts[ct].scale(), plain);
+            evaluator.add_plain_inplace(input.ciphertexts[ct], plain);
+        }
+        hera::DenseMatrixParameter wo{{"Wo", width, layer.model_width, true}, {}};
+        wo.row_major.resize(width * layer.model_width);
+        for (std::size_t i = 0; i < wo.row_major.size(); ++i)
+            wo.row_major[i] = 0.013 * std::cos(0.019 * static_cast<double>(i));
+        hera::DenseVectorParameter bias{{"bo", layer.model_width}, {}};
+        bias.values.resize(layer.model_width);
+        for (std::size_t f = 0; f < layer.model_width; ++f)
+            bias.values[f] = 0.001 * static_cast<double>(static_cast<int>(f % 13) - 6);
+        std::vector<double> expected(layer.tokens * layer.model_width);
+        for (std::size_t t = 0; t < layer.tokens; ++t)
+            for (std::size_t f = 0; f < layer.model_width; ++f) {
+                auto &value = expected[t * layer.model_width + f];
+                value = bias.values[f];
+                for (std::size_t row = 0; row < width; ++row)
+                    value += values[t * width + row] * wo.row_major[row * layer.model_width + f];
+            }
+        hera::AttentionLn2ExecutionReport cold;
+        auto serial = hera::AttentionOutputProjectionKernel::EvaluateReal(input, wo, bias, layer, sc, &cold, 1);
+        Require(serial.ok(), serial.status().message());
+        Require(MaxError(Decrypt(serial.value(), cc), expected) < 1e-5,
+                "cold Wo BSGS differs from logical matrix product");
+        hera::SealPlainParameterStore parameters;
+        parameters.BeginPlaintextPreparation();
+        {
+            hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
+            auto metadata = input;
+            for (auto &ct : metadata.ciphertexts) {
+                const auto id = ct.parms_id(); const auto scale = ct.scale();
+                ct = seal::Ciphertext(); ct.parms_id() = id; ct.scale() = scale;
+            }
+            auto prepared = hera::AttentionOutputProjectionKernel::EvaluateReal(metadata, wo, bias, layer, sc);
+            Require(prepared.ok(), prepared.status().message());
+        }
+        parameters.FreezePlaintextCache();
+        auto program = parameters.GetPreparedProjection(
+            layer.id + "/attention/Wo/real.weights.bsgs");
+        Require(program.ok() && program.value()->fixed_phase,
+                "real-weight Wo program has no fixed phase");
+        const auto &phase = *program.value()->fixed_phase;
+        Require(phase.scale() == 1.0 && phase.parms_id() == LevelId(cc, 2),
+                "Wo fixed phase consumes scale or uses the wrong level");
+        std::vector<std::complex<double>> phase_slots;
+        encoder.decode(phase, phase_slots);
+        for (std::size_t slot = 0; slot < phase_slots.size(); ++slot)
+            Require(std::abs(phase_slots[slot] - std::complex<double>{
+                        0.0, slot % 2 == 0 ? 1.0 : -1.0}) < 1e-12,
+                    "Wo fixed phase has the wrong slot signs");
+        std::size_t phase_groups = 0, weight_products = 0;
+        for (const auto &group : program.value()->groups) {
+            phase_groups += !group.phase_terms.empty();
+            for (const auto *terms : {&group.terms, &group.phase_terms})
+                for (const auto &term : *terms) {
+                    ++weight_products;
+                    std::vector<std::complex<double>> slots;
+                    encoder.decode(*term.plaintext, slots);
+                    for (const auto &slot : slots)
+                        Require(std::abs(slot.imag()) < 1e-10,
+                                "Wo weight plaintext contains imaginary data");
+                }
+        }
+        const auto plaintext_count = parameters.encoded_plaintext_count();
+        hera::AttentionLn2ExecutionReport warm;
+        auto parallel = [&] {
+            hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
+            return hera::AttentionOutputProjectionKernel::EvaluateReal(input, wo, bias, layer, sc, &warm, 2);
+        }();
+        Require(parallel.ok(), parallel.status().message());
+        Require(MaxError(Decrypt(parallel.value(), cc), expected) < 1e-5 &&
+                    MaxError(Decrypt(serial.value(), cc), Decrypt(parallel.value(), cc)) < 1e-6,
+                "cached parallel Wo differs from the logical matrix product");
+        Require(parameters.encoded_plaintext_count() == plaintext_count,
+                "frozen Wo BSGS encoded an online model plaintext");
+        Require(warm.rotations == cold.rotations && warm.conjugations == cold.conjugations &&
+                    warm.wo_phase_multiplications == phase_groups &&
+                    warm.ciphertext_plain_multiplications == weight_products + phase_groups &&
+                    warm.wo_baby_rotations + warm.wo_giant_rotations == warm.rotations &&
+                    warm.wo_output_conjugations == warm.conjugations &&
+                    warm.conjugations == parallel.value().ciphertexts.size() &&
+                    warm.rescales == parallel.value().ciphertexts.size() &&
+                    warm.ciphertext_multiplications == 0 && warm.relinearizations == 0 &&
+                    warm.rotations <= split.value().rotation_upper_bound,
+                "Wo BSGS operation accounting/rotation reuse is inconsistent");
+        seal::Decryptor decryptor(*cc.context, *cc.secret_key);
+        for (const auto &ct : parallel.value().ciphertexts) {
+            Require(ct.parms_id() == LevelId(cc, 3) &&
+                        std::abs(ct.scale() / std::ldexp(1.0, 44) - 1.0) < 1e-6,
+                    "variant Wo output level/scale mismatch");
+            seal::Plaintext plain; decryptor.decrypt(ct, plain);
+            std::vector<std::complex<double>> decoded; encoder.decode(plain, decoded);
+            for (const auto &slot : decoded)
+                Require(std::abs(slot.imag()) < 1e-5, "Wo output has a significant imaginary component");
+        }
+        if (layer.q_heads == 12) {
+            // Either channel can be absent in a group; bias remains complete.
+            for (const auto keep : {hera::ComplexLane::kReal, hera::ComplexLane::kImaginary}) {
+                auto single_channel = wo;
+                for (std::size_t row = 0; row < width; ++row)
+                    if (input.physical_packing.Locations(row).front().component != keep)
+                        std::fill_n(single_channel.row_major.begin() + row * layer.model_width,
+                                    layer.model_width, 0.0);
+                auto reference = expected;
+                for (std::size_t t = 0; t < layer.tokens; ++t)
+                    for (std::size_t f = 0; f < layer.model_width; ++f) {
+                        auto &value = reference[t * layer.model_width + f];
+                        value = bias.values[f];
+                        for (std::size_t row = 0; row < width; ++row)
+                            value += values[t * width + row] *
+                                single_channel.row_major[row * layer.model_width + f];
+                    }
+                hera::AttentionLn2ExecutionReport single_report;
+                auto actual = hera::AttentionOutputProjectionKernel::EvaluateReal(
+                    input, single_channel, bias, layer, sc, &single_report, 2);
+                Require(actual.ok(), actual.status().message());
+                Require(MaxError(Decrypt(actual.value(), cc), reference) < 1e-5,
+                        "Wo with one weight channel differs from the logical matrix product");
+                Require((single_report.wo_phase_multiplications == 0) ==
+                            (keep == hera::ComplexLane::kReal),
+                        "Wo applied fixed phase to the wrong channel");
+            }
+        }
+        auto invalid = input;
+        std::swap(invalid.physical_packing.logical_locations[0], invalid.physical_packing.logical_locations[1]);
+        {
+            hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
+            Require(!hera::AttentionOutputProjectionKernel::EvaluateReal(invalid, wo, bias, layer, sc).ok(),
+                    "cached Wo accepted a different physical input mapping");
+        }
+        Require(ActualLevel(cc, input.ciphertexts.front().parms_id()) == 2 &&
+                    MaxError(Decrypt(input, cc), values) < 1e-6,
+                "Wo modified the input ciphertexts");
+        std::cout << "WO_VARIANT_HEADS=" << layer.q_heads
+                  << " MAX_ERROR=" << MaxError(Decrypt(parallel.value(), cc), expected)
+                  << " KS=" << warm.rotations + warm.conjugations << '\n';
+    }
+}
+
 void TestParallelWoProjection()
 {
     auto config = MakeConfig();
@@ -562,7 +1297,7 @@ void TestParallelWoProjection()
     Require(output_plan.value().ciphertext_count == 2,
             "parallel Wo test needs two output groups");
     hera::HeContextRegistry client;
-    Require(client.CreateClientProfiles(config).ok(),
+    Require(client.CreateClientProfiles(config, false).ok(),
             "parallel Wo client context failed");
     // Only feature 0 and feature 512 have nonzero weights. Their source-to-
     // destination rotations for eight tokens are exactly 0 through 7.
@@ -737,9 +1472,9 @@ void RunIntegratedParty(
         residual_spec.domain = hera::Domain::kHeCiphertext;
         residual_spec.layout = hera::Layout::kComplexStrictColumn;
         residual_spec.numeric = {43, 13, true};
-        residual_spec.he_region = hera::HeRegionId::kRegion2;
+        residual_spec.he_region = hera::HeRegionId::kRegion4;
         residual_spec.he_parameter_profile = "shared";
-        residual_spec.planned_level = 0;
+        residual_spec.planned_level = 1;
         residual_spec.planned_scale_bits = 44;
         hera::SealSciAttentionLn2Executor executor(
             config, layer, registry, he_store, parameter_store, mpc_store,
@@ -763,8 +1498,8 @@ void RunIntegratedParty(
         std::copy(inverse.value().local_share.begin(),
                   inverse.value().local_share.end(), packet->inverse);
         if (role == hera::PartyRole::kServer)
-            Require(report.mpc_to_ckks_calls == 1 &&
-                        report.ckks_to_mpc_calls == 2 &&
+            Require(report.mpc_to_ckks_calls == (config.he_parameter_profiles.at("shared").declared_depth >= 9 ? 1U : 2U) &&
+                        report.ckks_to_mpc_calls == (config.he_parameter_profiles.at("shared").declared_depth >= 9 ? 2U : 3U) &&
                         report.reciprocal_square_roots == 2,
                     "integrated operation report is incomplete");
         packet->ok = 1;
@@ -773,19 +1508,32 @@ void RunIntegratedParty(
     }
 }
 
-void TestIntegratedExecutor()
+void TestIntegratedExecutor(bool fused = false)
 {
     auto config = MakeConfig();
+    auto &input_profile = config.he_parameter_profiles.at("shared");
+    input_profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
+    input_profile.declared_depth = 6;
+    if (fused) {
+        input_profile.coefficient_modulus_bits.insert(input_profile.coefficient_modulus_bits.end(), 3, 60);
+        input_profile.declared_depth = 9;
+    }
     const auto &layer = config.layers.front();
     const auto &profile = config.he_parameter_profiles.at("shared");
     hera::HeContextRegistry client_registry;
     Require(client_registry.CreateClientProfiles(config).ok(),
             "cannot create integrated client profiles");
-    auto steps = hera::SealSciAttentionLn2Executor::RequiredRotationSteps(
-        layer, profile);
-    Require(steps.ok() && client_registry.CompileRotationKeys(
-                "shared", steps.value()).ok(),
-            "cannot compile integrated rotation keys");
+    auto av_keys = hera::AttentionLn2PackingPlanner::AttentionValue(
+        layer, profile.polynomial_degree / 2);
+    Require(av_keys.ok(), av_keys.status().message());
+    auto steps = hera::SealSciAttentionLn2Executor::RequiredOutputRotationSteps(layer, profile);
+    Require(steps.ok(), steps.status().message());
+    std::set<int> combined(steps.value().begin(), steps.value().end());
+    combined.insert(av_keys.value().required_rotation_steps.begin(),
+                    av_keys.value().required_rotation_steps.end());
+    Require(client_registry.CompileRotationKeys("shared",
+                std::vector<int>(combined.begin(), combined.end())).ok(),
+            "cannot compile integrated AV/Wo/statistics rotation keys");
     auto bundle = client_registry.ExportSerializedPublicBundle();
     Require(bundle.ok(), bundle.status().message());
     hera::HeContextRegistry server_registry;
@@ -796,9 +1544,10 @@ void TestIntegratedExecutor()
         "shared", hera::PartyRole::kClient);
     auto value_plan = hera::MultiHeadPackingPlan::ProjectionOutput(
         layer, hera::Layout::kMultiHeadV, client_context.slot_count());
+    const auto &output_context = client_context;
     auto residual_plan =
-        hera::AttentionLn2PackingPlanner::ComplexStrictColumns(
-            {{layer.tokens, layer.model_width}}, client_context.slot_count());
+        hera::AttentionLn2PackingPlanner::RealStrictColumns(
+            {{layer.tokens, layer.model_width}}, output_context.slot_count());
     Require(value_plan.ok() && residual_plan.ok(),
             "cannot compile integrated HE packing");
     auto value = Encrypt({1.0, -0.5, 0.25, 2.0}, value_plan.value(),
@@ -807,8 +1556,8 @@ void TestIntegratedExecutor()
         0.10, -0.10, 0.20, -0.20,
         0.05, -0.05, 0.15, -0.15};
     auto residual = Encrypt(residual_values, residual_plan.value(),
-                            client_context, 0,
-                            hera::HeRegionId::kRegion2);
+                            output_context, 1,
+                            hera::HeRegionId::kRegion4);
 
     int pipe_fd[2];
     Require(pipe(pipe_fd) == 0, "cannot create integration result pipe");
@@ -898,15 +1647,75 @@ void TestIntegratedExecutor()
     }
 }
 
+void TestSharedProfileStatistics(bool compact)
+{
+    auto config = MakeConfig();
+    auto &profile = config.he_parameter_profiles.at("shared");
+    profile.coefficient_modulus_bits = {60, 60, 46, 46, 46, 46, 60, 60};
+    profile.input_scale_bits = profile.default_scale_bits = 45;
+    profile.output_scale_bits = 46;
+    profile.declared_depth = 7;
+    if (compact) { profile.coefficient_modulus_bits.pop_back(); profile.declared_depth = 6; }
+    const auto input_level = profile.coefficient_modulus_bits.size() - 4;
+    auto &layer = config.layers.front();
+    layer.tokens = 3;
+    hera::HeContextRegistry client;
+    Require(client.CreateClientProfiles(config).ok(), "shared statistics client failed");
+    std::vector<int> steps;
+    for (std::size_t step = 1; step < profile.polynomial_degree / 2 / 4; step <<= 1U)
+        steps.push_back(static_cast<int>(step * 4));
+    Require(client.CompileRotationKeys("shared", steps).ok(), "statistics keys failed");
+    auto bundle = client.ExportPublicBundle();
+    Require(bundle.ok(), bundle.status().message());
+    hera::HeContextRegistry server;
+    Require(server.CreateServerProfiles(config, bundle.value()).ok(), "shared statistics server failed");
+    const auto &cc = client.Require("shared", hera::PartyRole::kClient);
+    const auto &sc = server.Require("shared", hera::PartyRole::kServer);
+    auto packing = hera::AttentionLn2PackingPlanner::RealStrictColumns({{3, 4}}, cc.slot_count());
+    Require(packing.ok(), packing.status().message());
+    const std::vector<double> values{1.0, 2.0, 3.0, 4.0, 2.5, 2.5, 2.5, 2.5, 1.001, 0.999, 1.001, 0.999};
+    auto input = Encrypt(values, packing.value(), cc, input_level, hera::HeRegionId::kRegion1);
+    // Encrypt's existing fixture uses scale 45. Doubling the encoded value
+    // preserves the value when promoting both physical and declared scale.
+    seal::Evaluator evaluator(*cc.context);
+    for (auto &ct : input.ciphertexts) { evaluator.add_inplace(ct, ct); ct.scale() *= 2.0; }
+    input.logical_spec.planned_scale_bits = 46;
+    Require(hera::LayerNormStatisticsKernel::Prepare(input, layer, sc, nullptr, 46).ok(),
+            "shared statistics preparation failed");
+    hera::AttentionLn2ExecutionReport report;
+    auto output = hera::LayerNormStatisticsKernel::Evaluate(input, layer, sc, &report, 2, 46);
+    Require(output.ok(), output.status().message());
+    const auto variance = Decrypt(output.value().variance, cc);
+    const std::vector<double> expected{1.25 + layer.attention_norm_epsilon,
+        layer.attention_norm_epsilon, 1e-6 + layer.attention_norm_epsilon};
+    Require(MaxError(variance, expected) < 1e-7 && report.layer_norm_plaintext_encodings == 0,
+            "shared scale-46 statistics lost variance precision or missed prepared cache");
+    Require(output.value().centered.logical_spec.planned_level == input_level + 1 &&
+            output.value().variance.logical_spec.planned_level == input_level + 3 &&
+            output.value().variance.logical_spec.planned_scale_bits == 46,
+            "shared statistics output contract is incorrect");
+    Require(!hera::LayerNormStatisticsKernel::Evaluate(input, layer, sc).ok(),
+            "low precision square lift was accepted silently");
+    Require(!hera::LayerNormStatisticsKernel::Prepare(input, layer, sc, nullptr, 40).ok(),
+            "unsupported output scale was accepted");
+}
+
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
     try {
         TestPackingAndLevels();
+        TestComplexProbabilityInputs();
+        TestComplexProbabilityInputs(true);
         TestHePath();
+        TestStatisticsReductionAndCache();
+        TestSharedProfileStatistics(false);
+        TestSharedProfileStatistics(true);
+        TestSevenPrimeDirectResidual();
+        TestRealWoBsgsPackingVariants();
         TestParallelWoProjection();
-        TestIntegratedExecutor();
+        TestIntegratedExecutor(argc == 2 && std::string(argv[1]) == "--fused-attention");
         std::cout << "ATTENTION_LN2_HE_READY=YES\n"
                   << "ATTENTION_LN2_STATUS=PASS\n";
         return EXIT_SUCCESS;

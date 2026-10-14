@@ -34,6 +34,8 @@ struct SoftmaxExecutionReport {
     std::size_t relinearizations{};
     std::size_t rescales{};
     std::size_t rotations{};
+    std::size_t conjugations{};
+    std::size_t phase_multiplications{};
     std::uint64_t mpc_communication_bytes{};
     std::uint64_t mpc_rounds{};
     std::uint64_t conversion_communication_bytes{};
@@ -64,10 +66,15 @@ public:
         const TransformerLayerConfig &layer,
         std::size_t slots_per_ciphertext,
         bool pad_rows_to_power_of_two);
+    // Adjacent real ciphertexts share real/imaginary lanes at a conversion
+    // boundary. The imaginary value carries the public (-1)^slot phase.
+    static Result<PhysicalSlotMap> PairedRealRows(const PhysicalSlotMap &real);
 };
 
 class SoftmaxExponentKernel {
 public:
+    static Result<void> Prepare(const HeContext &context,
+                                const SoftmaxConfig &config);
     // Computes (1 + x / 2^exp_divisor_bits)^(2^exp_squarings) on a
     // real-only CKKS batch. It starts at fresh level zero, reaches the
     // terminal single-prime level, and never decrypts or rotates.
@@ -77,6 +84,26 @@ public:
         const SoftmaxConfig &config,
         SoftmaxExecutionReport *report = nullptr,
         std::size_t he_workers = 1);
+    // Consumes a fresh conversion result instead of copying its ciphertexts.
+    static Result<SealCipherBatch> Evaluate(
+        SealCipherBatch &&shifted_scores, const HeContext &context,
+        const SoftmaxConfig &config,
+        SoftmaxExecutionReport *report = nullptr,
+        std::size_t he_workers = 1);
+    static Result<SealCipherBatch> EvaluatePaired(
+        SealCipherBatch &&shifted_scores, const PhysicalSlotMap &real_map,
+        const HeContext &context, const SoftmaxConfig &config,
+        SoftmaxExecutionReport *report = nullptr, std::size_t he_workers = 1);
+    // Exact ring multiplication by X^(N/2); scale and level are preserved.
+    static Result<SealCipherBatch> PackPaired(
+        SealCipherBatch &&real, const HeContext &context,
+        SoftmaxExecutionReport *report = nullptr, std::size_t he_workers = 1);
+
+private:
+    static Result<SealCipherBatch> EvaluateReal(
+        SealCipherBatch &&shifted_scores, const HeContext &context,
+        const SoftmaxConfig &config, bool doubled_input,
+        SoftmaxExecutionReport *report, std::size_t he_workers);
 };
 
 class MpcSoftmaxRuntime {
@@ -103,6 +130,7 @@ public:
         const SoftmaxConfig &config,
         SoftmaxExecutionReport *report = nullptr);
 
+    // Exponentials are the unit-interval polynomial outputs (up to HE rounding).
     // Secure threshold/mux, local row sum, exact fixed-point reciprocal, and
     // secure fixed multiplication/truncation. No result is reconstructed.
     Result<MpcShareTensor> ClipAndNormalize(
@@ -124,6 +152,10 @@ private:
 // and performs no final MPC-to-CKKS conversion.
 class SealSciSoftmaxExecutor {
 public:
+    static Result<void> Prepare(
+        const TransformerLayerConfig &layer, const HeContext &score_context,
+        const HeContext &exponent_context, const SoftmaxConfig &config,
+        bool prepare_exponent = true);
     SealSciSoftmaxExecutor(
         const HeraConfig &config,
         const TransformerLayerConfig &layer,

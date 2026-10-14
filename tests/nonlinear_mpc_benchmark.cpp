@@ -1,4 +1,5 @@
 #include "hera/ffn_gelu.h"
+#include "hera/mpc_session.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -28,6 +29,7 @@ struct Options {
     std::size_t width{8};
     std::size_t warmup{1};
     std::size_t iterations{1};
+    std::size_t workers{1};
     int port{24900};
 };
 
@@ -59,6 +61,7 @@ Options Parse(int argc, char **argv)
         else if (name == "--width") options.width = number;
         else if (name == "--warmup") options.warmup = number;
         else if (name == "--iterations") options.iterations = number;
+        else if (name == "--workers") options.workers = number;
         else if (name == "--port") options.port = static_cast<int>(number);
         else throw std::invalid_argument("unknown option: " + name);
     }
@@ -67,7 +70,8 @@ Options Parse(int argc, char **argv)
                 options.kernel == "gelu-select", "unsupported --kernel");
     Require(options.tokens && options.heads && options.width &&
                 options.iterations, "dimensions and iterations must be positive");
-    Require(options.port >= 1024 && options.port < 32700,
+    Require(options.workers && options.workers <= 50, "workers must be in [1,50]");
+    Require(options.port >= 1024 && options.port < 32600,
             "port must be in [1024,32700)");
     return options;
 }
@@ -121,12 +125,17 @@ std::vector<double> Expected(const Options &o,
             return std::pow(1.0 + x / 64.0, 64.0);
         };
         for (std::size_t row = 0; row < o.tokens * o.heads; ++row) {
-            double sum = 0;
-            for (std::size_t col = 0; col < o.tokens; ++col)
-                sum += exponent(input[row * o.tokens + col]);
+            std::uint64_t sum = 0;
+            std::vector<std::uint64_t> clipped(o.tokens);
+            for (std::size_t col = 0; col < o.tokens; ++col) {
+                const auto x = input[row * o.tokens + col];
+                clipped[col] = x >= hera::SoftmaxConfig{}.clip_threshold ? Encode(exponent(x)) : 0;
+                sum += clipped[col];
+            }
+            const auto inverse = (std::uint64_t{1} << 26) / sum;
             for (std::size_t col = 0; col < o.tokens; ++col)
                 expected[row * o.tokens + col] =
-                    exponent(input[row * o.tokens + col]) / sum;
+                    Decode((clipped[col] * inverse) >> 13);
         }
     } else {
         const hera::GeluConfig c;
@@ -135,8 +144,8 @@ std::vector<double> Expected(const Options &o,
             const auto common = c.a * std::pow(x, 4) + c.c * x * x + c.e;
             const auto f0 = common - c.b * std::pow(x, 3) + (0.5 - c.d) * x;
             const auto f1 = common + c.b * std::pow(x, 3) + (0.5 + c.d) * x;
-            expected[i] = x < -c.threshold ? 0.0
-                : x < 0.0 ? f0 : x <= c.threshold ? f1 : x;
+            expected[i] = Decode(Encode(x < -c.threshold ? 0.0
+                : x < 0.0 ? f0 : x <= c.threshold ? f1 : x));
         }
     }
     return expected;
@@ -222,8 +231,10 @@ PartyOutput RunParty(const Options &o, hera::PartyRole role)
     std::vector<double> timings;
     std::vector<std::uint64_t> output;
     std::uint64_t bytes = 0, rounds = 0;
+    auto session = std::make_shared<hera::SharedMpcSession>(role, "127.0.0.1", o.port, o.workers);
+    Require(session->Prepare().ok(), "cannot prepare nonlinear MPC workers");
     if (o.kernel == "gelu-select") {
-        hera::MpcGeluRuntime runtime(role, "127.0.0.1", o.port);
+        hera::MpcGeluRuntime runtime(session);
         for (std::size_t i = 0; i < o.warmup + o.iterations; ++i) {
             hera::FfnGeluExecutionReport report;
             const auto start = Clock::now();
@@ -240,7 +251,7 @@ PartyOutput RunParty(const Options &o, hera::PartyRole role)
             output = result.value().local_share;
         }
     } else {
-        hera::MpcSoftmaxRuntime runtime(role, "127.0.0.1", o.port);
+        hera::MpcSoftmaxRuntime runtime(session);
         for (std::size_t i = 0; i < o.warmup + o.iterations; ++i) {
             hera::SoftmaxExecutionReport report;
             const auto start = Clock::now();
@@ -311,7 +322,8 @@ int main(int argc, char **argv)
             const auto actual = Decode(server.shares[i] + client_shares[i]);
             error = std::max(error, std::abs(actual - expected[i]));
         }
-        Require(error < 0.03, "MPC numerical check failed: " +
+        const auto tolerance = options.kernel == "softmax-normalize" ? std::ldexp(2., -13) : 0.;
+        Require(error <= tolerance, "MPC numerical check failed: " +
                                std::to_string(error));
         std::cout << std::fixed << std::setprecision(3)
                   << "HERA_BENCHMARK=" << options.kernel << '\n'
@@ -319,6 +331,7 @@ int main(int argc, char **argv)
                   << "ELEMENTS=" << expected.size() << '\n'
                   << "WARMUP=" << options.warmup << '\n'
                   << "ITERATIONS=" << options.iterations << '\n'
+                  << "MPC_WORKERS=" << options.workers << '\n'
                   << "SERVER_MEAN_MS=" << server.metrics.mean_ms << '\n'
                   << "CLIENT_MEAN_MS=" << client_metrics.mean_ms << '\n'
                   << "ONLINE_WALL_MEAN_MS=" << std::max(

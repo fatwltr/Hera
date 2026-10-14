@@ -1,4 +1,5 @@
 #include "hera/softmax.h"
+#include "hera/mpc_session.h"
 
 #include <seal/seal.h>
 
@@ -93,10 +94,24 @@ void TestExponent(const hera::HeraConfig &config)
     hera::SealCipherBatch batch{
         profile, {ciphertext}, {{1, 1, input.size()}},
         hera::Layout::kSoftmaxRows, map};
+    hera::SealPlainParameterStore cache;
+    cache.BeginPlaintextPreparation();
+    hera::ModelPlaintextCacheScope cache_scope(&cache, "softmax_test");
+    Require(hera::SoftmaxExponentKernel::Prepare(context, config.softmax).ok(),
+            "cannot prepare exponent constants");
+    cache.FreezePlaintextCache();
+    Require(cache.encoded_plaintext_count() == 2, "exponent constants were not cached");
     hera::SoftmaxExecutionReport report;
     auto output = hera::SoftmaxExponentKernel::Evaluate(
         batch, context, config.softmax, &report);
     Require(output.ok(), output.status().message());
+    Require(batch.ciphertexts.front().parms_id() == context.context->first_parms_id(),
+            "const exponent input was consumed");
+    Require(cache.encoded_plaintext_count() == 2, "online exponent encoded constants");
+    auto wrong_config = config.softmax;
+    ++wrong_config.exp_divisor_bits;
+    Require(!hera::SoftmaxExponentKernel::Evaluate(batch, context, wrong_config).ok(),
+            "exponent cache accepted incompatible constants");
     Require(report.ciphertext_plain_multiplications == 1 &&
                 report.ciphertext_multiplications == 6 &&
                 report.relinearizations == 6 && report.rescales == 7 &&
@@ -128,7 +143,7 @@ void TestExponent(const hera::HeraConfig &config)
             context.slot_count() + input.size(), context.slot_count())};
     hera::SoftmaxExecutionReport parallel_report;
     auto parallel_output = hera::SoftmaxExponentKernel::Evaluate(
-        parallel_batch, context, config.softmax, &parallel_report, 2);
+        std::move(parallel_batch), context, config.softmax, &parallel_report, 2);
     Require(parallel_output.ok(), parallel_output.status().message());
     Require(parallel_report.ciphertext_multiplications == 12 &&
                 parallel_report.rescales == 14,
@@ -144,6 +159,89 @@ void TestExponent(const hera::HeraConfig &config)
                 std::uint64_t{1} << config.softmax.exp_squarings);
             Require(std::abs(decoded[i] - expected) < 2e-3,
                     "parallel Block-3 exponent mismatch");
+        }
+    }
+}
+
+void TestPairedExponent(const hera::HeraConfig &config)
+{
+    hera::HeContextRegistry contexts;
+    Require(contexts.CreateClientProfiles(config).ok(), "cannot create paired exponent context");
+    const auto *execution = hera::FindLayerExecution(config, config.layers.front().id);
+    const auto profile = execution->regions.at(hera::HeRegionId::kRegion3).parameter_profile;
+    Require(contexts.CompileRotationKeys(profile, {0}).ok(), "cannot prepare conjugation key");
+    const auto &context = contexts.Require(profile, hera::PartyRole::kClient);
+    const auto slots = context.slot_count();
+    // Two full real ciphertexts plus one partial ciphertext exercise both
+    // slot phases, the odd tail, and padding without another rescale.
+    auto real_map = hera::PhysicalSlotMap::DenseReal(2 * slots + 7, slots);
+    auto paired_map = hera::SoftmaxPackingPlanner::PairedRealRows(real_map);
+    Require(paired_map.ok() && paired_map.value().ciphertext_count == 2,
+            "odd real ciphertext count was not paired correctly");
+    std::vector<std::vector<double>> real(3, std::vector<double>(slots));
+    for (std::size_t ct = 0; ct < real.size(); ++ct)
+        for (std::size_t slot = 0; slot < slots; ++slot)
+            if (ct < 2 || slot < 7) real[ct][slot] = -0.125 * ((slot + 3 * ct) % 17);
+    seal::CKKSEncoder encoder(*context.context);
+    seal::Encryptor encryptor(*context.context, *context.secret_key);
+    seal::Decryptor decryptor(*context.context, *context.secret_key);
+    hera::SealCipherBatch input{profile, {}, {{2 * slots + 7}},
+        hera::Layout::kSoftmaxRows, paired_map.value()};
+    for (std::size_t pair = 0; pair < 2; ++pair) {
+        std::vector<std::complex<double>> values(slots);
+        for (std::size_t slot = 0; slot < slots; ++slot)
+            values[slot] = {real[2 * pair][slot], pair == 0 ?
+                (slot & 1U ? -real[1][slot] : real[1][slot]) : 0.};
+        seal::Plaintext plain;
+        encoder.encode(values, std::ldexp(1., context.parameters.input_scale_bits), plain);
+        input.ciphertexts.emplace_back();
+        encryptor.encrypt_symmetric(plain, input.ciphertexts.back());
+    }
+    hera::SoftmaxExecutionReport report;
+    auto output = hera::SoftmaxExponentKernel::EvaluatePaired(
+        std::move(input), real_map, context, config.softmax, &report, 2);
+    Require(output.ok(), output.status().message());
+    Require(output.value().ciphertexts.size() == 3 && report.conjugations > 0,
+            "paired exponent did not recover real ciphertexts");
+    const auto level = context.context->last_parms_id();
+    const auto expected = [&](std::size_t ct, std::size_t slot) {
+        return std::pow(1. + real[ct][slot] / std::ldexp(1., config.softmax.exp_divisor_bits),
+                        std::ldexp(1., config.softmax.exp_squarings));
+    };
+    for (std::size_t ct = 0; ct < 3; ++ct) {
+        Require(output.value().ciphertexts[ct].parms_id() == level,
+                "paired exponent did not reach the terminal level");
+        seal::Plaintext plain;
+        decryptor.decrypt(output.value().ciphertexts[ct], plain);
+        std::vector<std::complex<double>> actual;
+        encoder.decode(plain, actual);
+        for (std::size_t slot = 0; slot < (ct < 2 ? slots : 7); ++slot)
+            Require(std::abs(actual[slot].real() - expected(ct, slot)) < 0.003 &&
+                        std::abs(actual[slot].imag()) < 0.003,
+                    "real/imaginary lanes were mixed during exponentiation");
+    }
+    const auto rescales = report.rescales;
+    auto packed = hera::SoftmaxExponentKernel::PackPaired(
+        output.take_value(), context, &report, 2);
+    Require(packed.ok(), packed.status().message());
+    Require(packed.value().ciphertexts.size() == 2 && report.rescales == rescales,
+            "terminal packing changed the multiplication depth");
+    for (std::size_t pair = 0; pair < 2; ++pair) {
+        const auto &ct = packed.value().ciphertexts[pair];
+        Require(ct.parms_id() == level && std::abs(std::log2(ct.scale()) -
+                    context.parameters.default_scale_bits) < 1e-6,
+                "terminal packing changed its level or scale");
+        seal::Plaintext plain;
+        decryptor.decrypt(ct, plain);
+        std::vector<std::complex<double>> actual;
+        encoder.decode(plain, actual);
+        for (std::size_t slot = 0; slot < (pair == 0 ? slots : 7); ++slot) {
+            Require(std::abs(actual[slot].real() - expected(2 * pair, slot)) < 0.003,
+                    "terminal real lane is incorrect");
+            const auto imaginary = slot & 1U
+                ? -expected(pair == 0 ? 1 : 2, slot) : expected(pair == 0 ? 1 : 2, slot);
+            Require(std::abs(actual[slot].imag() - imaginary) < 0.003,
+                    "terminal slot phase was not preserved");
         }
     }
 }
@@ -181,6 +279,9 @@ void TestRowPacking(const hera::HeraConfig &root_config)
 struct PartyResult {
     std::unique_ptr<hera::MpcShareTensor> shifted;
     std::unique_ptr<hera::MpcShareTensor> probabilities;
+    std::vector<std::uint64_t> recentered;
+    std::vector<std::uint64_t> causal;
+    bool zero_rejected{};
     std::string error;
 };
 
@@ -193,7 +294,9 @@ void RunMpcParty(hera::PartyRole role, int port,
                  PartyResult *result)
 {
     try {
-        hera::MpcSoftmaxRuntime runtime(role, "127.0.0.1", port);
+        // Five ragged rows split unevenly across three independent streams.
+        auto session = std::make_shared<hera::SharedMpcSession>(role, "127.0.0.1", port, 3);
+        hera::MpcSoftmaxRuntime runtime(session);
         auto shifted = runtime.CenterAndMask(scores, layer, mask, config);
         if (!shifted.ok()) {
             result->error = shifted.status().message();
@@ -207,8 +310,32 @@ void RunMpcParty(hera::PartyRole role, int port,
             result->error = probability.status().message();
             return;
         }
+        Require(probability.value().public_value_bound_bits == 19,
+                "Softmax lost its producer-established narrow-ring bound");
         result->probabilities = std::make_unique<hera::MpcShareTensor>(
             probability.take_value());
+        auto changed_mask = mask;
+        changed_mask.additive_values[0] = -std::numeric_limits<double>::infinity();
+        changed_mask.additive_values[1] = 0.0;
+        auto recentered = runtime.CenterAndMask(scores, layer, changed_mask, config);
+        Require(recentered.ok(), recentered.status().message());
+        result->recentered = std::move(recentered.take_value().local_share);
+        auto causal_layer = layer;
+        causal_layer.attention_mask = hera::AttentionMaskKind::kPublicCausal;
+        hera::PublicAttentionMask causal_mask;
+        causal_mask.kind = causal_layer.attention_mask;
+        auto causal = runtime.CenterAndMask(scores, causal_layer, causal_mask, config);
+        Require(causal.ok(), causal.status().message());
+        result->causal = std::move(causal.take_value().local_share);
+        auto zero_exp = exponentials;
+        // Only the last of five rows is zero: exercise the odd OR-tree carry.
+        std::fill(zero_exp.local_share.end() - layer.tokens,
+                  zero_exp.local_share.end(), 0);
+        auto rejected = runtime.ClipAndNormalize(
+            shifted.value(), zero_exp, layer, mask, config);
+        result->zero_rejected = !rejected.ok() &&
+            rejected.status().message().find("denominator is zero") != std::string::npos;
+        Require(result->zero_rejected, "zero denominator was accepted");
     } catch (const std::exception &error) {
         result->error = error.what();
     }
@@ -217,37 +344,47 @@ void RunMpcParty(hera::PartyRole role, int port,
 void TestMpc(const hera::HeraConfig &root_config)
 {
     auto layer = root_config.layers.front();
-    layer.tokens = 2;
+    layer.tokens = 5;
     layer.q_heads = 1;
     layer.kv_heads = 1;
     layer.attention_mask = hera::AttentionMaskKind::kPublicPadding;
     hera::PublicAttentionMask mask;
     mask.kind = hera::AttentionMaskKind::kPublicPadding;
-    mask.shape = {{2, 2}};
-    mask.additive_values = {
-        0.0, -std::numeric_limits<double>::infinity(), 0.0, 0.0};
+    mask.shape = {{5, 5}};
+    mask.additive_values.resize(25);
     const hera::NumericFormat signed_format{43, 13, true};
     const hera::NumericFormat unsigned_format{43, 13, false};
-    const std::vector<double> clear_scores{1.0, 2.0, -1.0, 1.0};
-    const std::vector<double> clear_shifted{0.0, -14.0, -2.0, 0.0};
-    std::vector<double> clear_exponentials(4);
-    std::vector<std::uint64_t> clear_score_bits(4), clear_exp_bits(4);
-    for (std::size_t i = 0; i < 4; ++i) {
-        clear_score_bits[i] = Encode(clear_scores[i], 13, 43);
-        clear_exponentials[i] = std::pow(
-            1.0 + clear_shifted[i] / 64.0, 64.0);
-        clear_exp_bits[i] = Encode(clear_exponentials[i], 13, 43);
+    std::vector<double> clear_scores(25), clear_shifted(25), clear_exponentials(25);
+    std::vector<std::uint64_t> clear_score_bits(25), clear_exp_bits(25);
+    for (std::size_t row = 0; row < 5; ++row) {
+        for (std::size_t col = 0; col < 5; ++col) {
+            const auto i = row * 5 + col;
+            mask.additive_values[i] = col <= row ? 0.0 :
+                -std::numeric_limits<double>::infinity();
+            double shifted = -2.0 * col;
+            if (row == 4 && col == 1) shifted = -13.0;
+            if (row == 4 && col == 2) shifted = -13.0 - 1.0 / 8192.0;
+            clear_scores[i] = col <= row ? 0.25 * row + shifted : 100.0 + col;
+            clear_shifted[i] = col <= row ? shifted : -14.0;
+            clear_score_bits[i] = Encode(clear_scores[i], 13, 43);
+            clear_exponentials[i] = std::pow(1.0 + clear_shifted[i] / 64.0, 64.0);
+            // Use a nonzero mux payload at both boundary points. The actual
+            // tiny polynomial values quantize to zero and cannot distinguish
+            // an inclusive threshold from an off-by-one comparison here.
+            if (row == 4 && (col == 1 || col == 2)) clear_exponentials[i] = 0.25;
+            clear_exp_bits[i] = Encode(clear_exponentials[i], 13, 43);
+        }
     }
     const auto ring_mask = (std::uint64_t{1} << 43) - 1;
-    std::vector<std::uint64_t> server_score(4), client_score(4);
-    std::vector<std::uint64_t> server_exp(4), client_exp(4);
-    for (std::size_t i = 0; i < 4; ++i) {
+    std::vector<std::uint64_t> server_score(25), client_score(25);
+    std::vector<std::uint64_t> server_exp(25), client_exp(25);
+    for (std::size_t i = 0; i < 25; ++i) {
         server_score[i] = (0x12345 + 97 * i) & ring_mask;
         client_score[i] = (clear_score_bits[i] - server_score[i]) & ring_mask;
         server_exp[i] = (0x54321 + 53 * i) & ring_mask;
         client_exp[i] = (clear_exp_bits[i] - server_exp[i]) & ring_mask;
     }
-    const hera::TensorShape shape{{2, 1, 2}};
+    const hera::TensorShape shape{{5, 1, 5}};
     const hera::MpcShareTensor server_scores{
         server_score, shape, signed_format, hera::ComplexComponent::kReal};
     const hera::MpcShareTensor client_scores{
@@ -259,8 +396,10 @@ void TestMpc(const hera::HeraConfig &root_config)
 
     struct ChildPacket {
         int ok{};
-        std::uint64_t shifted[4]{};
-        std::uint64_t probabilities[4]{};
+        std::uint64_t recentered[25]{};
+        std::uint64_t causal[25]{};
+        std::uint64_t shifted[25]{};
+        std::uint64_t probabilities[25]{};
     };
     int result_pipe[2];
     Require(pipe(result_pipe) == 0, "cannot create MPC result pipe");
@@ -277,6 +416,8 @@ void TestMpc(const hera::HeraConfig &root_config)
         packet.ok = client_result.error.empty() &&
                     client_result.probabilities != nullptr;
         if (packet.ok) {
+            std::copy(client_result.recentered.begin(), client_result.recentered.end(), packet.recentered);
+            std::copy(client_result.causal.begin(), client_result.causal.end(), packet.causal);
             std::copy(client_result.shifted->local_share.begin(),
                       client_result.shifted->local_share.end(),
                       packet.shifted);
@@ -305,7 +446,7 @@ void TestMpc(const hera::HeraConfig &root_config)
             "MPC client failed");
     Require(server_result.probabilities != nullptr,
             "MPC Softmax did not return probability shares");
-    for (std::size_t index = 0; index < 4; ++index) {
+    for (std::size_t index = 0; index < 25; ++index) {
         const auto bits = (server_result.shifted->local_share[index] +
                            packet.shifted[index]) & ring_mask;
         const auto signed_bits = bits >= (std::uint64_t{1} << 42)
@@ -313,36 +454,36 @@ void TestMpc(const hera::HeraConfig &root_config)
             : static_cast<std::int64_t>(bits);
         const double shifted = std::ldexp(
             static_cast<double>(signed_bits), -13);
+        Require(((server_result.causal[index] + packet.causal[index]) & ring_mask) == bits,
+                "ragged causal maximum mismatch");
         Require(std::abs(shifted - clear_shifted[index]) < 1e-6,
                 "MPC Softmax centered value mismatch at index " +
                     std::to_string(index) + ": actual=" +
                     std::to_string(shifted) + ", expected=" +
                     std::to_string(clear_shifted[index]));
     }
-    for (std::size_t row = 0; row < 2; ++row) {
+    Require(((server_result.recentered[0] + packet.recentered[0]) & ring_mask) ==
+                Encode(-14.0, 13, 43) &&
+            ((server_result.recentered[1] + packet.recentered[1]) & ring_mask) == 0,
+            "mutable public mask reused stale cached columns");
+    for (std::size_t row = 0; row < 5; ++row) {
+        std::uint64_t denominator = 0;
+        for (std::size_t col = 0; col < 5; ++col)
+            if (clear_shifted[row * 5 + col] >= -13.0)
+                denominator += clear_exp_bits[row * 5 + col];
+        const auto reciprocal = (std::uint64_t{1} << 26) / denominator;
         double sum = 0.0;
-        const double expected_sum = row == 0
-            ? clear_exponentials[0]
-            : clear_exponentials[2] + clear_exponentials[3];
-        for (std::size_t column = 0; column < 2; ++column) {
-            const auto index = row * 2 + column;
-            const auto bits =
-                (server_result.probabilities->local_share[index] +
-                 packet.probabilities[index]) & ring_mask;
-            const double probability = std::ldexp(
-                static_cast<double>(bits), -13);
-            const double expected = index == 1 ? 0.0
-                : clear_exponentials[index] / expected_sum;
-            Require(probability >= 0.0 && probability <= 1.0 &&
-                        std::abs(probability - expected) < 0.02,
-                    "MPC Softmax probability mismatch at index " +
-                        std::to_string(index) + ": actual=" +
-                        std::to_string(probability) + ", expected=" +
-                        std::to_string(expected));
-            sum += probability;
+        for (std::size_t col = 0; col < 5; ++col) {
+            const auto index = row * 5 + col;
+            const auto actual = (server_result.probabilities->local_share[index] +
+                                 packet.probabilities[index]) & ring_mask;
+            const auto expected = clear_shifted[index] < -13.0 ? 0 :
+                (clear_exp_bits[index] * reciprocal) >> 13;
+            Require(std::abs(static_cast<double>(actual) - expected) <= 2,
+                    "batched reciprocal/clipping differs from integer oracle");
+            sum += std::ldexp(static_cast<double>(actual), -13);
         }
-        Require(std::abs(sum - 1.0) < 0.02,
-                "MPC Softmax probability row sum=" + std::to_string(sum));
+        Require(std::abs(sum - 1.0) < 0.02, "MPC probability row sum mismatch");
     }
 }
 
@@ -473,6 +614,8 @@ void RunExecutorParty(
                     std::string("scores"), std::size_t{2}, 20}}, mask},
             &report);
         Require(result.ok(), result.status().message());
+        Require(converter.stats().public_zero_imaginary_ciphertexts == 0,
+                "Softmax retained a real-only conversion boundary");
         Require(report.ckks_to_mpc_calls == 2 &&
                     report.mpc_to_ckks_calls == 1,
                 "integrated Softmax operation report mismatch");
@@ -504,6 +647,9 @@ void TestIntegratedExecutor()
     hera::HeContextRegistry client_registry;
     Require(client_registry.CreateClientProfiles(config).ok(),
             "cannot create integration client profiles");
+    for (const auto &entry : config.he_parameter_profiles)
+        Require(client_registry.CompileRotationKeys(entry.first, {0}).ok(),
+                "cannot compile Softmax boundary conjugation key");
     auto public_bundle = client_registry.ExportSerializedPublicBundle();
     Require(public_bundle.ok(), public_bundle.status().message());
     hera::HeContextRegistry server_registry;
@@ -593,6 +739,7 @@ int main()
         TestGraph(config.value());
         TestRowPacking(config.value());
         TestExponent(config.value());
+        TestPairedExponent(config.value());
         TestIntegratedExecutor();
         std::cout << "SOFTMAX_TO_MPC_READY=YES\n"
                   << "SOFTMAX_MPC_TO_HE_READY=NO\n"

@@ -136,6 +136,9 @@ printf '%s\n' \
   'HERA_SCI_ABI=3' \
   'SEAL_VERSION=4.4.5' \
   'OT_BACKEND=VOLE_SILENT_OT' \
+  'OT_EXPANSION=UNROLLED_AES_PREFIX_PAD' \
+  'MPC_MEMORY=REUSABLE_SLAB_V1' \
+  'MPC_COMPARISON=CORRELATED_AND_V1' \
   "BLB_COMMIT=$blb_commit" \
   "BOLT_COMMIT=$bolt_commit" \
   "EIGEN_COMMIT=$eigen_commit" \

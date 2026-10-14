@@ -123,8 +123,9 @@ Result<int> OpenSocket(PartyRole role, const std::string &peer, int port,
 class RuntimeCoordinator::Impl {
 public:
     Impl(int socket, std::chrono::milliseconds heartbeat,
-         std::chrono::milliseconds timeout)
+         std::chrono::milliseconds timeout, std::chrono::milliseconds stage_timeout)
         : socket_(socket), heartbeat_(heartbeat), timeout_(timeout),
+          stage_timeout_(stage_timeout.count() == 0 ? timeout : stage_timeout),
           last_receive_(std::chrono::steady_clock::now())
     {}
 
@@ -150,14 +151,15 @@ public:
         if (!Send(Kind::kStage, sequence, layer, stage, Status::Ok(), {}))
             return Fail(Status::Cancelled("coordinator stage send failed"));
         std::unique_lock<std::mutex> lock(state_mutex_);
-        if (!condition_.wait_for(lock, timeout_, [&] {
+        if (!condition_.wait_for(lock, stage_timeout_, [&] {
                 return !peer_status_.ok() ||
                        (peer_sequence_ == sequence && peer_layer_ == layer &&
                         peer_stage_ == stage);
             })) {
             lock.unlock();
             return Fail(Status::DeadlineExceeded(
-                "peer did not complete the matching stage within 30 seconds"));
+                "peer did not complete the matching stage within " +
+                std::to_string(stage_timeout_.count()) + " ms"));
         }
         return peer_status_.ok() ? Result<void>{} : Result<void>{peer_status_};
     }
@@ -181,7 +183,8 @@ public:
             });
             if (!peer_finished_ && peer_status_.ok())
                 peer_status_ = Status::DeadlineExceeded(
-                    "peer did not finish within 30 seconds");
+                    "peer did not finish within " +
+                    std::to_string(timeout_.count()) + " ms");
         }
         running_ = false;
         ::shutdown(socket_, SHUT_RDWR);
@@ -352,7 +355,8 @@ private:
             if (!finished && std::chrono::steady_clock::now() -
                     last_receive_ > timeout_) {
                 FailNoThrow(Status::DeadlineExceeded(
-                    "runtime peer heartbeat timed out after 30 seconds"));
+                    "runtime peer heartbeat timed out after " +
+                    std::to_string(timeout_.count()) + " ms"));
                 break;
             }
         }
@@ -370,6 +374,7 @@ private:
     int socket_{-1};
     std::chrono::milliseconds heartbeat_;
     std::chrono::milliseconds timeout_;
+    std::chrono::milliseconds stage_timeout_;
     std::atomic<bool> running_{false};
     std::atomic<bool> finishing_{false};
     std::atomic<std::uint64_t> next_sequence_{0};
@@ -392,14 +397,15 @@ RuntimeCoordinator::~RuntimeCoordinator() = default;
 
 Result<std::unique_ptr<RuntimeCoordinator>> RuntimeCoordinator::Connect(
     PartyRole role, const std::string &peer_address, int port,
-    std::chrono::milliseconds heartbeat, std::chrono::milliseconds timeout)
+    std::chrono::milliseconds heartbeat, std::chrono::milliseconds timeout,
+    std::chrono::milliseconds stage_timeout)
 {
-    if (heartbeat.count() <= 0 || timeout <= heartbeat)
+    if (heartbeat.count() <= 0 || timeout <= heartbeat || stage_timeout.count() < 0)
         return Status::Invalid("invalid coordinator heartbeat/timeout");
     auto socket = OpenSocket(role, peer_address, port, timeout);
     if (!socket.ok()) return socket.status();
     return std::unique_ptr<RuntimeCoordinator>(new RuntimeCoordinator(
-        std::make_unique<Impl>(socket.value(), heartbeat, timeout)));
+        std::make_unique<Impl>(socket.value(), heartbeat, timeout, stage_timeout)));
 }
 
 void RuntimeCoordinator::SetCancellationCallback(std::function<void()> callback)

@@ -4,6 +4,7 @@
 #include "hera/wide_ring.h"
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace hera::conversion_internal {
@@ -36,6 +37,12 @@ public:
     // coefficient shares. The caller is responsible for the CKKS scale.
     Result<std::vector<WideRingShare>> Encode(
         const SlotSharePair &slot_shares) const;
+
+    // Conservative public bound for the reconstructed coefficient integer
+    // after guard truncation. Includes fixed-root and local rounding error;
+    // subject to the transform's existing statistical truncation contract.
+    std::optional<int> EncodedCoefficientBoundBits(
+        int slot_bound_bits, int guard_bits, int retained_precision_bits) const;
 
     std::size_t degree() const noexcept { return degree_; }
     std::size_t slot_count() const noexcept { return degree_ / 2; }

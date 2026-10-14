@@ -4,11 +4,11 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 @@ -10,7 +10,8 @@ include(CMakeFindDependencyMacro)
  project (SCI)
  set(NAME "SCI")
- 
+
 -add_definitions(-DUSE_VOLE=0)
 +# HERA uses BLB's Ferret/PCG silent-OT path instead of SplitIKNP.
 +add_compile_definitions(USE_VOLE=1)
- 
+
  option(NO_REVEAL_OUTPUT "Only output secret shares after 2PC" OFF)
  message(STATUS "Option: NO_REVEAL_OUTPUT = ${NO_REVEAL_OUTPUT}")
 diff --git a/src/BuildingBlocks/aux-protocols.h b/src/BuildingBlocks/aux-protocols.h
@@ -21,7 +21,7 @@ diff --git a/src/BuildingBlocks/aux-protocols.h b/src/BuildingBlocks/aux-protoco
 +#if !USE_VOLE
  #include "GC/emp-sh2pc.h"
 +#endif
- 
+
  class AuxProtocols {
  public:
 @@ -49,5 +49,9 @@ public:
@@ -60,7 +60,7 @@ diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 +install(DIRECTORY
 +        "${PROJECT_SOURCE_DIR}/deps/emp-ot/emp-ot"
 +        DESTINATION include)
- 
+
  install(FILES
          "${CMAKE_CURRENT_SOURCE_DIR}/utils/cmake/FindGMP.cmake"
          "${CMAKE_CURRENT_SOURCE_DIR}/utils/cmake/source_of_randomness.cmake"
@@ -127,11 +127,11 @@ diff --git a/src/BuildingBlocks/aux-protocols.cpp b/src/BuildingBlocks/aux-proto
        setup_semi_honest<NetIO>(iopack->io_GC, party, batch_size);
 @@ -729,6 +746,7 @@ void AuxProtocols::msnzb_GC(uint64_t *x, uint8_t *one_hot_vector, int32_t bw_x,
    delete prot_exec;
- 
+
    return;
 +#endif
  }
- 
+
  template void AuxProtocols::lookup_table(uint64_t **spec, uint64_t *x,
 diff --git a/src/OT/vole_ot_pack.h b/src/OT/vole_ot_pack.h
 --- a/src/OT/vole_ot_pack.h
@@ -139,7 +139,7 @@ diff --git a/src/OT/vole_ot_pack.h b/src/OT/vole_ot_pack.h
 @@ -55,7 +55,7 @@ public:
    NetIO *ios[1];
 +  NetIO *ios_reversed[1];
- 
+
    OTPack(IOPack *iopack, int party, bool do_setup = false) {
 -    std::cout << "using PCG ot-extension" << std::endl;
      this->party = party;
@@ -148,7 +148,7 @@ diff --git a/src/OT/vole_ot_pack.h b/src/OT/vole_ot_pack.h
 @@ -63,13 +63,11 @@ public:
      ios[0] = iopack->io;
 +    ios_reversed[0] = iopack->io_rev;
- 
+
 -    silent_ot = new cheetah::SilentOT<NetIO>(party, 1, ios, false, true,
 -                                         party == sci::ALICE
 -                                             ? PRE_OT_DATA_REG_SEND_FILE_ALICE
@@ -161,7 +161,7 @@ diff --git a/src/OT/vole_ot_pack.h b/src/OT/vole_ot_pack.h
 -        party == sci::ALICE ? PRE_OT_DATA_REG_RECV_FILE_ALICE
 -                            : PRE_OT_DATA_REG_SEND_FILE_BOB);
 +        3 - party, 1, ios_reversed, false, true, "");
- 
+
      for (int i = 0; i < KKOT_TYPES; i++) {
        kkot[i] = new cheetah::SilentOTN<NetIO>(silent_ot, 1 << (i + 1));
 @@ -144,3 +137,3 @@ public:
@@ -180,7 +180,7 @@ diff --git a/src/OT/ferret/silent_ot.h b/src/OT/ferret/silent_ot.h
  namespace cheetah {
 +using namespace std;
 +using namespace emp;
- 
+
  template <typename IO>
  class SilentOT : public sci::OT<SilentOT<IO>> {
 @@ -36,6 +37,5 @@ public:
@@ -214,7 +214,7 @@ diff --git a/deps/emp-ot/emp-ot/ferret/spcot_sender.h b/deps/emp-ot/emp-ot/ferre
  	}
  };
 +} // namespace emp
- 
+
  #endif
 diff --git a/deps/emp-ot/emp-ot/ferret/spcot_recver.h b/deps/emp-ot/emp-ot/ferret/spcot_recver.h
 --- a/deps/emp-ot/emp-ot/ferret/spcot_recver.h
@@ -244,7 +244,7 @@ diff --git a/deps/emp-ot/emp-ot/ferret/mpcot_reg.h b/deps/emp-ot/emp-ot/ferret/m
 @@ -7,5 +7,5 @@
  #include "emp-ot/ferret/spcot_recver.h"
  #include "emp-ot/ferret/preot.h"
- 
+
 -using namespace emp;
 +namespace emp {
  using std::future;
@@ -260,7 +260,7 @@ diff --git a/deps/emp-ot/emp-ot/ferret/lpn_f2.h b/deps/emp-ot/emp-ot/ferret/lpn_
 -using namespace emp;
 +namespace emp {
 @@ -110,3 +110,4 @@ class LpnF2 { public:
- 
+
  };
 +} // namespace emp
  #endif
@@ -283,14 +283,14 @@ diff --git a/deps/emp-ot/emp-ot/ferret/ferret_cot.h b/deps/emp-ot/emp-ot/ferret/
  	bool is_malicious;
  	bool extend_initialized;
 +	bool persist_preprocessing;
- 
+
 	block one;
 diff --git a/deps/emp-ot/emp-ot/ferret/base_cot.h b/deps/emp-ot/emp-ot/ferret/base_cot.h
 --- a/deps/emp-ot/emp-ot/ferret/base_cot.h
 +++ b/deps/emp-ot/emp-ot/ferret/base_cot.h
 @@ -4,4 +4,5 @@
  #include "emp-ot/ferret/preot.h"
- 
+
 +namespace emp {
  template<typename IO>
  class BaseCot { public:
@@ -298,7 +298,7 @@ diff --git a/deps/emp-ot/emp-ot/ferret/base_cot.h b/deps/emp-ot/emp-ot/ferret/ba
  	}
  };
 +} // namespace emp
- 
+
  #endif
 diff --git a/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp b/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp
 --- a/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp
@@ -326,12 +326,12 @@ diff --git a/deps/emp-ot/emp-ot/ferret/ferret_cot.hpp b/deps/emp-ot/emp-ot/ferre
 -	}
 +	if(persist_preprocessing) pre_ot_filename = pre_file;
 +	else pre_ot_filename.clear();
- 
+
  	ThreadPool pool2(1);
  	auto fut = pool2.enqueue([this](){
  		extend_initialization();
  	});
- 
+
  	ot_pre_data = new block[n_pre];
 -	bool hasfile = file_exists(pre_ot_filename), hasfile2;
 +	bool hasfile = persist_preprocessing && file_exists(pre_ot_filename), hasfile2;
@@ -394,12 +394,12 @@ diff --git a/src/utils/mitccrh.h b/src/utils/mitccrh.h
 +++ b/src/utils/mitccrh.h
 @@ -9,5 +9,8 @@
  #include <string>
- 
+
  namespace cheetah {
 +using emp::block;
 +using emp::AES_opt_key_schedule;
 +using emp::ParaEnc;
- 
+
  /*
 diff --git a/src/utils/net_io_channel.h b/src/utils/net_io_channel.h
 --- a/src/utils/net_io_channel.h
@@ -548,7 +548,7 @@ diff --git a/src/utils/net_io_channel.h b/src/utils/net_io_channel.h
 diff --git a/src/utils/io_pack.h b/src/utils/io_pack.h
 --- a/src/utils/io_pack.h
 +++ b/src/utils/io_pack.h
-@@ -27,6 +27,12 @@ public:
+@@ -27,4 +27,10 @@ public:
 
    uint64_t get_comm() { return io->counter + io_rev->counter + io_GC->counter; }
 
@@ -559,3 +559,711 @@ diff --git a/src/utils/io_pack.h b/src/utils/io_pack.h
 +  }
 +
    ~IOPack() {
+
+diff --git a/src/utils/mitccrh.h b/src/utils/mitccrh.h
+--- a/src/utils/mitccrh.h
++++ b/src/utils/mitccrh.h
+@@ -4,6 +4,7 @@
+ // #define ParaEnc sci::ParaEnc
+ #include <emp-tool/utils/aes_opt.h>
+ #include <stdio.h>
++#include <utility>
+
+ #include <stdexcept>
+ #include <string>
+@@ -14,39 +15,29 @@
+  * With numKeys keys, use each key to encrypt numEncs blocks.
+  */
+ #ifdef __x86_64__
++// Each block index fixes its key at compile time. This preserves the exact
++// AES inputs, round keys and output order, while exposing independent AES-NI
++// instructions instead of variable inner loops to the compiler.
++constexpr std::size_t ExpKeyIndex(std::size_t block_index) {
++  std::size_t key = 0;
++  while ((std::size_t{1} << (key + 1)) <= block_index + 1) ++key;
++  return key;
++}
++
++template <std::size_t... I>
++static inline void ParaEncExpBlocks(block* blks, AES_KEY* keys,
++                                    std::index_sequence<I...>) {
++  ((blks[I] = blks[I] ^ keys[ExpKeyIndex(I)].rd_key[0]), ...);
++  for (unsigned int r = 1; r < 10; ++r)
++    ((blks[I] = _mm_aesenc_si128(blks[I], keys[ExpKeyIndex(I)].rd_key[r])), ...);
++  ((blks[I] = _mm_aesenclast_si128(blks[I], keys[ExpKeyIndex(I)].rd_key[10])), ...);
++}
++
+ template <int numKeys>
+ static inline void ParaEncExp(block* blks, AES_KEY* keys) {
+-  block* first = blks;
+-  for (size_t i = 0; i < numKeys; ++i) {
+-    block K = keys[i].rd_key[0];
+-    int numEncs = 1 << i;
+-    for (size_t j = 0; j < numEncs; ++j) {
+-      *blks = *blks ^ K;
+-      ++blks;
+-    }
+-  }
+-
+-  for (unsigned int r = 1; r < 10; ++r) {
+-    blks = first;
+-    for (size_t i = 0; i < numKeys; ++i) {
+-      block K = keys[i].rd_key[r];
+-      int numEncs = 1 << i;
+-      for (size_t j = 0; j < numEncs; ++j) {
+-        *blks = _mm_aesenc_si128(*blks, K);
+-        ++blks;
+-      }
+-    }
+-  }
+-
+-  blks = first;
+-  for (size_t i = 0; i < numKeys; ++i) {
+-    block K = keys[i].rd_key[10];
+-    int numEncs = 1 << i;
+-    for (size_t j = 0; j < numEncs; ++j) {
+-      *blks = _mm_aesenclast_si128(*blks, K);
+-      ++blks;
+-    }
+-  }
++  static_assert(numKeys >= 1 && numKeys <= 8, "unsupported OT expansion key count");
++  ParaEncExpBlocks(blks, keys,
++      std::make_index_sequence<(std::size_t{1} << numKeys) - 1>{});
+ }
+ #elif __aarch64__
+ template <int numKeys>
+@@ -77,6 +68,22 @@
+ }
+ #endif
+
++// Build the same prefix-dependent XOR pads as the nested per-leaf sum.
++// Every level shares its lower-bit prefix, reducing O(N log N) work to O(N).
++inline void ExpandOtPrefixPads(block* pads, const block* hashes, int logN) {
++  const int N = 1 << logN;
++  pads[0] = emp::zero_block;
++  for (int level = 0; level < logN; ++level) {
++    const int width = 1 << level;
++    const int offset = width - 1;
++    for (int prefix = 0; prefix < width; ++prefix) {
++      const block base = pads[prefix];
++      pads[prefix + width] = base ^ hashes[N - 1 + offset + prefix];
++      pads[prefix] = base ^ hashes[offset + prefix];
++    }
++  }
++}
++
+ /*
+  * [REF] Implementation of "Better Concrete Security for Half-Gates Garbling (in
+  * the Multi-Instance Setting)" https://eprint.iacr.org/2019/1168.pdf
+
+diff --git a/src/OT/ferret/silent_ot.h b/src/OT/ferret/silent_ot.h
+--- a/src/OT/ferret/silent_ot.h
++++ b/src/OT/ferret/silent_ot.h
+@@ -478,18 +478,7 @@
+         mitccrh.renew_ks(rm_data1 + j * logN, logN);
+         mitccrh.hash_exp(hash_out + N - 1, hash_in1, logN);
+
+-        for (int64_t k = 0; k < N; k++) {
+-          idx = 0;
+-          for (int64_t s = 0; s < logN; s++) {
+-            int mask = (1 << s) - 1;
+-            int pref = k & mask;
+-            if ((k & (1 << s)) == 0)
+-              pad[(j - i) * N + k] ^= hash_out[idx + pref];
+-            else
+-              pad[(j - i) * N + k] ^= hash_out[idx + N - 1 + pref];
+-            idx += 1 << s;
+-          }
+-        }
++        ExpandOtPrefixPads(pad + (j - i) * N, hash_out, logN);
+       }
+
+       corrected_y_size = (uint32_t)std::ceil((std::min(ot_bsize, length - i) * N * l) /
+
+diff --git a/src/Millionaire/millionaire.h b/src/Millionaire/millionaire.h
+--- a/src/Millionaire/millionaire.h
++++ b/src/Millionaire/millionaire.h
+@@ -26,9 +26,46 @@
+ #include "utils/emp-tool.h"
+ #include <cmath>
+ #include <omp.h>
++#include <vector>
++#include <stdexcept>
+
+ #define MILL_PARAM 4
+ #define WAN_EXEC
++
++// Only scratch storage is retained. PRG/OT state and every random mask stay
++// fresh. No class layout or wire-message order is changed.
++namespace hera_sci_detail {
++struct CompareScratch {
++  std::vector<uint64_t> extended;
++  std::vector<uint8_t> digits, cmp, eq, table, choice, ei, fi, e, f;
++  std::vector<uint8_t*> rows;
++  bool busy = false;
++  void trim() {
++    const auto bytes = extended.capacity()*sizeof(uint64_t) + rows.capacity()*sizeof(uint8_t*) +
++      digits.capacity()+cmp.capacity()+eq.capacity()+table.capacity()+choice.capacity()+
++      ei.capacity()+fi.capacity()+e.capacity()+f.capacity();
++    if (bytes > (64ULL << 20)) {
++      CompareScratch empty;
++      extended.swap(empty.extended); rows.swap(empty.rows);
++      digits.swap(empty.digits); cmp.swap(empty.cmp); eq.swap(empty.eq);
++      table.swap(empty.table); choice.swap(empty.choice);
++      ei.swap(empty.ei); fi.swap(empty.fi); e.swap(empty.e); f.swap(empty.f);
++    }
++  }
++};
++inline CompareScratch& comparison_scratch() {
++  static thread_local CompareScratch scratch;
++  return scratch;
++}
++struct CompareScratchLease {
++  CompareScratch &scratch;
++  explicit CompareScratchLease(CompareScratch &value) : scratch(value) {
++    if (scratch.busy) throw std::logic_error("SCI comparison is not reentrant");
++    scratch.busy = true;
++  }
++  ~CompareScratchLease() { scratch.busy = false; scratch.trim(); }
++};
++}
+
+ class MillionaireProtocol {
+ public:
+@@ -77,6 +114,8 @@
+                bool greater_than = true, bool equality = false,
+                int radix_base = MILL_PARAM) {
+     configure(bitlength, radix_base);
++    auto &scratch = hera_sci_detail::comparison_scratch();
++    hera_sci_detail::CompareScratchLease lease(scratch);
+
+     if (bitlength <= beta) {
+       uint8_t N = 1 << bitlength;
+@@ -84,10 +123,12 @@
+       if (party == sci::ALICE) {
+         sci::PRG128 prg;
+         prg.random_data(res, num_cmps * sizeof(uint8_t));
+-        uint8_t **leaf_messages = new uint8_t *[num_cmps];
++        scratch.rows.resize(num_cmps);
++        scratch.table.resize(std::size_t(num_cmps)*N);
++        auto leaf_messages = scratch.rows.data();
+         for (int i = 0; i < num_cmps; i++) {
+           res[i] &= 1;
+-          leaf_messages[i] = new uint8_t[N];
++          leaf_messages[i] = scratch.table.data() + std::size_t(i)*N;
+           for (int j = 0; j < N; j++) {
+             if (greater_than) {
+               leaf_messages[i][j] = ((uint8_t(data[i] & mask) > j) ^ res[i]);
+@@ -102,11 +143,10 @@
+           otpack->iknp_straight->send(leaf_messages, num_cmps, 1);
+         }
+
+-        for (int i = 0; i < num_cmps; i++)
+-          delete[] leaf_messages[i];
+-        delete[] leaf_messages;
++
+       } else { // party == BOB
+-        uint8_t *choice = new uint8_t[num_cmps];
++        scratch.choice.resize(num_cmps);
++        auto choice = scratch.choice.data();
+         for (int i = 0; i < num_cmps; i++) {
+           choice[i] = data[i] & mask;
+         }
+@@ -116,7 +156,7 @@
+           otpack->iknp_straight->recv(res, choice, num_cmps, 1);
+         }
+
+-        delete[] choice;
++
+       }
+       return;
+     }
+@@ -129,7 +169,8 @@
+     if (old_num_cmps == num_cmps)
+       data_ext = data;
+     else {
+-      data_ext = new uint64_t[num_cmps];
++      scratch.extended.resize(num_cmps);
++      data_ext = scratch.extended.data();
+       memcpy(data_ext, data, old_num_cmps * sizeof(uint64_t));
+       memset(data_ext + old_num_cmps, 0,
+              (num_cmps - old_num_cmps) * sizeof(uint64_t));
+@@ -139,9 +180,11 @@
+     uint8_t *leaf_res_cmp; // num_digits * num_cmps
+     uint8_t *leaf_res_eq;  // num_digits * num_cmps
+
+-    digits = new uint8_t[num_digits * num_cmps];
+-    leaf_res_cmp = new uint8_t[num_digits * num_cmps];
+-    leaf_res_eq = new uint8_t[num_digits * num_cmps];
++    const auto leaves = std::size_t(num_digits)*num_cmps;
++    scratch.digits.resize(leaves); scratch.cmp.resize(leaves); scratch.eq.resize(leaves);
++    digits = scratch.digits.data();
++    leaf_res_cmp = scratch.cmp.data();
++    leaf_res_eq = scratch.eq.data();
+
+     // Extract radix-digits from data
+     for (int i = 0; i < num_digits; i++) // Stored from LSB to MSB
+@@ -156,9 +199,10 @@
+     if (party == sci::ALICE) {
+       uint8_t *
+           *leaf_ot_messages; // (num_digits * num_cmps) X beta_pow (=2^beta)
+-      leaf_ot_messages = new uint8_t *[num_digits * num_cmps];
+-      for (int i = 0; i < num_digits * num_cmps; i++)
+-        leaf_ot_messages[i] = new uint8_t[beta_pow];
++      scratch.rows.resize(leaves); scratch.table.resize(leaves*beta_pow);
++      leaf_ot_messages = scratch.rows.data();
++      for (std::size_t i = 0; i < leaves; i++)
++        leaf_ot_messages[i] = scratch.table.data() + i*beta_pow;
+
+       // Set Leaf OT messages
+       triple_gen->prg->random_bool((bool *)leaf_res_cmp, num_digits * num_cmps);
+@@ -221,9 +265,7 @@
+       }
+ #endif
+       // Cleanup
+-      for (int i = 0; i < num_digits * num_cmps; i++)
+-        delete[] leaf_ot_messages[i];
+-      delete[] leaf_ot_messages;
++
+     } else // party = sci::BOB
+     {
+       // Perform Leaf OTs
+@@ -272,11 +314,7 @@
+       res[i] = leaf_res_cmp[i];
+
+     // Cleanup
+-    if (old_num_cmps != num_cmps)
+-      delete[] data_ext;
+-    delete[] digits;
+-    delete[] leaf_res_cmp;
+-    delete[] leaf_res_eq;
++
+   }
+
+   void set_leaf_ot_messages(uint8_t *ot_messages, uint8_t digit, int N,
+@@ -320,10 +358,11 @@
+     int counter_std = 0, old_counter_std = 0;
+     int counter_corr = 0, old_counter_corr = 0;
+     int counter_combined = 0, old_counter_combined = 0;
+-    uint8_t *ei = new uint8_t[(num_triples * num_cmps) / 8];
+-    uint8_t *fi = new uint8_t[(num_triples * num_cmps) / 8];
+-    uint8_t *e = new uint8_t[(num_triples * num_cmps) / 8];
+-    uint8_t *f = new uint8_t[(num_triples * num_cmps) / 8];
++    auto &scratch = hera_sci_detail::comparison_scratch();
++    const auto bytes = (std::size_t(num_triples)*num_cmps)/8;
++    scratch.ei.resize(bytes); scratch.fi.resize(bytes); scratch.e.resize(bytes); scratch.f.resize(bytes);
++    auto ei = scratch.ei.data(); auto fi = scratch.fi.data();
++    auto e = scratch.e.data(); auto f = scratch.f.data();
+
+     for (int i = 1; i < num_digits; i *= 2) {
+       for (int j = 0; j < num_digits and j + i < num_digits; j += 2 * i) {
+@@ -519,10 +558,10 @@
+ #endif
+
+     // cleanup
+-    delete[] ei;
+-    delete[] fi;
+-    delete[] e;
+-    delete[] f;
++
++
++
++
+   }
+
+   void AND_step_1(uint8_t *ei, // evaluates batch of 8 ANDs
+
+diff --git a/src/BuildingBlocks/aux-protocols.cpp b/src/BuildingBlocks/aux-protocols.cpp
+--- a/src/BuildingBlocks/aux-protocols.cpp
++++ b/src/BuildingBlocks/aux-protocols.cpp
+@@ -228,12 +228,17 @@
+ void AuxProtocols::MSB_to_Wrap(uint64_t *x, uint8_t *msb_x, uint8_t *wrap_x,
+                                int32_t size, int32_t bw_x) {
+   assert(bw_x <= 64);
++  // Per-thread scratch is safe because each protocol session is serialized.
++  // Keep all wrap masks freshly sampled; retain only table storage.
++  static thread_local std::vector<uint8_t> table, choices;
++  static thread_local std::vector<uint8_t*> rows;
+   if (party == sci::ALICE) {
+     PRG128 prg;
+     prg.random_bool((bool *)wrap_x, size);
+-    uint8_t **spec = new uint8_t *[size];
+-    for (int i = 0; i < size; i++) {
+-      spec[i] = new uint8_t[4];
++    rows.resize(size); table.resize(std::size_t(size)*4);
++    auto spec = rows.data();
++    for (int i = 0; i < size; i++) {
++      spec[i] = table.data() + std::size_t(i)*4;
+       uint8_t msb_xb = (x[i] >> (bw_x - 1)) & 1;
+       for (int j = 0; j < 4; j++) {
+         uint8_t bits_j[2]; // j0 || j1 (LSB to MSB)
+@@ -243,19 +248,22 @@
+                      1;
+       }
+     }
+-    lookup_table<uint8_t>(spec, nullptr, nullptr, size, 2, 1);
+-
+-    for (int i = 0; i < size; i++)
+-      delete[] spec[i];
+-    delete[] spec;
++    otpack->kkot[1]->send(spec, size, 1);
++
++
+   } else { // party == sci::BOB
+-    uint8_t *lut_in = new uint8_t[size];
++    choices.resize(size);
++    auto lut_in = choices.data();
+     for (int i = 0; i < size; i++) {
+       lut_in[i] = (((x[i] >> (bw_x - 1)) & 1) << 1) | msb_x[i];
+     }
+-    lookup_table<uint8_t>(nullptr, lut_in, wrap_x, size, 2, 1);
+-
+-    delete[] lut_in;
++    otpack->kkot[1]->recv(wrap_x, lut_in, size, 1);
++
++
++  }
++  if (table.capacity() + choices.capacity() + rows.capacity()*sizeof(uint8_t*) > (64ULL << 20)) {
++    std::vector<uint8_t>().swap(table); std::vector<uint8_t>().swap(choices);
++    std::vector<uint8_t*>().swap(rows);
+   }
+ }
+
+diff --git a/src/Millionaire/millionaire.h b/src/Millionaire/millionaire.h
+--- a/src/Millionaire/millionaire.h
++++ b/src/Millionaire/millionaire.h
+@@ -28,6 +28,7 @@
+ #include <omp.h>
+ #include <vector>
+ #include <stdexcept>
++#include <memory>
+
+ #define MILL_PARAM 4
+ #define WAN_EXEC
+@@ -110,9 +111,27 @@
+
+   ~MillionaireProtocol() { delete triple_gen; }
+
++  // Existing public entry keeps the original independent-triple protocol.
+   void compare(uint8_t *res, uint64_t *data, int num_cmps, int bitlength,
+                bool greater_than = true, bool equality = false,
+                int radix_base = MILL_PARAM) {
++    compare_impl<false>(res, data, num_cmps, bitlength, greater_than, equality, radix_base);
++  }
++
++  // Conversion callers may use SCI's correlated-AND tree. Narrow inputs
++  // retain the existing leaf path, avoiding empty correlated-triple batches.
++  void compare_correlated(uint8_t *res, uint64_t *data, int num_cmps, int bitlength,
++               bool greater_than = true, bool equality = false,
++               int radix_base = MILL_PARAM) {
++    if (bitlength <= 4 * radix_base)
++      compare(res, data, num_cmps, bitlength, greater_than, equality, radix_base);
++    else
++      compare_impl<true>(res, data, num_cmps, bitlength, greater_than, equality, radix_base);
++  }
++
++  template<bool Correlated>
++  void compare_impl(uint8_t *res, uint64_t *data, int num_cmps, int bitlength,
++               bool greater_than, bool equality, int radix_base) {
+     configure(bitlength, radix_base);
+     auto &scratch = hera_sci_detail::comparison_scratch();
+     hera_sci_detail::CompareScratchLease lease(scratch);
+@@ -215,17 +234,17 @@
+                                  leaf_res_cmp[i * num_cmps + j], 0,
+                                  greater_than, false);
+           } else if (i == (num_digits - 1) && (r > 0)) {
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+             set_leaf_ot_messages(leaf_ot_messages[i * num_cmps + j],
+                                  digits[i * num_cmps + j], beta_pow,
+                                  leaf_res_cmp[i * num_cmps + j],
+                                  leaf_res_eq[i * num_cmps + j], greater_than);
+-#else
++} else {
+             set_leaf_ot_messages(leaf_ot_messages[i * num_cmps + j],
+                                  digits[i * num_cmps + j], 1 << r,
+                                  leaf_res_cmp[i * num_cmps + j],
+                                  leaf_res_eq[i * num_cmps + j], greater_than);
+-#endif
++}
+           } else {
+             set_leaf_ot_messages(leaf_ot_messages[i * num_cmps + j],
+                                  digits[i * num_cmps + j], beta_pow,
+@@ -236,11 +255,11 @@
+       }
+
+       // Perform Leaf OTs
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+       // otpack->kkot_beta->send(leaf_ot_messages, num_cmps*(num_digits), 2);
+       otpack->kkot[beta - 1]->send(leaf_ot_messages, num_cmps * (num_digits),
+                                    2);
+-#else
++} else {
+       // otpack->kkot_beta->send(leaf_ot_messages, num_cmps, 1);
+       otpack->kkot[beta - 1]->send(leaf_ot_messages, num_cmps, 1);
+       if (r == 1) {
+@@ -263,18 +282,18 @@
+         otpack->kkot[beta - 1]->send(leaf_ot_messages + num_cmps,
+                                      num_cmps * (num_digits - 1), 2);
+       }
+-#endif
++}
+       // Cleanup
+
+     } else // party = sci::BOB
+     {
+       // Perform Leaf OTs
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+       // otpack->kkot_beta->recv(leaf_res_cmp, digits, num_cmps*(num_digits),
+       // 2);
+       otpack->kkot[beta - 1]->recv(leaf_res_cmp, digits,
+                                    num_cmps * (num_digits), 2);
+-#else
++} else {
+       // otpack->kkot_beta->recv(leaf_res_cmp, digits, num_cmps, 1);
+       otpack->kkot[beta - 1]->recv(leaf_res_cmp, digits, num_cmps, 1);
+       if (r == 1) {
+@@ -299,7 +318,7 @@
+         otpack->kkot[beta - 1]->recv(leaf_res_cmp + num_cmps, digits + num_cmps,
+                                      num_cmps * (num_digits - 1), 2);
+       }
+-#endif
++}
+
+       // Extract equality result from leaf_res_cmp
+       for (int i = num_cmps; i < num_digits * num_cmps; i++) {
+@@ -308,7 +327,7 @@
+       }
+     }
+
+-    traverse_and_compute_ANDs(num_cmps, leaf_res_eq, leaf_res_cmp);
++    traverse_impl<Correlated>(num_cmps, leaf_res_eq, leaf_res_cmp);
+
+     for (int i = 0; i < old_num_cmps; i++)
+       res[i] = leaf_res_cmp[i];
+@@ -338,20 +357,23 @@
+
+   void traverse_and_compute_ANDs(int num_cmps, uint8_t *leaf_res_eq,
+                                  uint8_t *leaf_res_cmp) {
+-#ifdef WAN_EXEC
+-    Triple triples_std((num_triples)*num_cmps, true);
+-#else
+-    Triple triples_corr(num_triples_corr * num_cmps, true, num_cmps);
+-    Triple triples_std(num_triples_std * num_cmps, true);
+-#endif
++    traverse_impl<false>(num_cmps, leaf_res_eq, leaf_res_cmp);
++  }
++
++  template<bool Correlated>
++  void traverse_impl(int num_cmps, uint8_t *leaf_res_eq, uint8_t *leaf_res_cmp) {
++    std::unique_ptr<Triple> triples_corr;
++    if constexpr (Correlated)
++      triples_corr = std::make_unique<Triple>(num_triples_corr * num_cmps, true, num_cmps);
++    Triple triples_std((Correlated ? num_triples_std : num_triples) * num_cmps, true);
+     // Generate required Bit-Triples
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+     // std::cout<<"Running on WAN_EXEC; Skipping correlated triples"<<std::endl;
+     triple_gen->generate(party, &triples_std, _16KKOT_to_4OT);
+-#else
+-    triple_gen->generate(party, &triples_corr, _8KKOT);
++} else {
++    triple_gen->generate(party, triples_corr.get(), _8KKOT);
+     triple_gen->generate(party, &triples_std, _16KKOT_to_4OT);
+-#endif
++}
+     // std::cout << "Bit Triples Generated" << std::endl;
+
+     // Combine leaf OT results in a bottom-up fashion
+@@ -367,7 +389,7 @@
+     for (int i = 1; i < num_digits; i *= 2) {
+       for (int j = 0; j < num_digits and j + i < num_digits; j += 2 * i) {
+         if (j == 0) {
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+           AND_step_1(
+               ei + (counter_std * num_cmps) / 8,
+               fi + (counter_std * num_cmps) / 8, leaf_res_cmp + j * num_cmps,
+@@ -376,7 +398,7 @@
+               (triples_std.bi) + (counter_combined * num_cmps) / 8, num_cmps);
+           counter_std++;
+           counter_combined++;
+-#else
++} else {
+           AND_step_1(ei + (counter_std * num_cmps) / 8,
+                      fi + (counter_std * num_cmps) / 8,
+                      leaf_res_cmp + j * num_cmps,
+@@ -384,9 +406,9 @@
+                      (triples_std.ai) + (counter_std * num_cmps) / 8,
+                      (triples_std.bi) + (counter_std * num_cmps) / 8, num_cmps);
+           counter_std++;
+-#endif
++}
+         } else {
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+           AND_step_1(
+               ei + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+               fi + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+@@ -402,22 +424,22 @@
+               (triples_std.bi) + (counter_combined * num_cmps) / 8, num_cmps);
+           counter_combined++;
+           counter_corr++;
+-#else
++} else {
+           AND_step_1(
+               ei + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+               fi + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+-              leaf_res_cmp + j * num_cmps, leaf_res_eq + (j + i) * num_cmps,
+-              (triples_corr.ai) + (2 * counter_corr * num_cmps) / 8,
+-              (triples_corr.bi) + (2 * counter_corr * num_cmps) / 8, num_cmps);
++              leaf_res_eq + (j + i) * num_cmps, leaf_res_cmp + j * num_cmps,
++              (triples_corr->ai) + (2 * counter_corr * num_cmps) / 8,
++              (triples_corr->bi) + (2 * counter_corr * num_cmps) / 8, num_cmps);
+           AND_step_1(
+               ei + ((num_triples_std + (2 * counter_corr + 1)) * num_cmps) / 8,
+               fi + ((num_triples_std + (2 * counter_corr + 1)) * num_cmps) / 8,
+-              leaf_res_eq + j * num_cmps, leaf_res_eq + (j + i) * num_cmps,
+-              (triples_corr.ai) + ((2 * counter_corr + 1) * num_cmps) / 8,
+-              (triples_corr.bi) + ((2 * counter_corr + 1) * num_cmps) / 8,
++              leaf_res_eq + (j + i) * num_cmps, leaf_res_eq + j * num_cmps,
++              (triples_corr->ai) + ((2 * counter_corr + 1) * num_cmps) / 8,
++              (triples_corr->bi) + ((2 * counter_corr + 1) * num_cmps) / 8,
+               num_cmps);
+           counter_corr++;
+-#endif
++}
+         }
+       }
+       int offset_std = (old_counter_std * num_cmps) / 8;
+@@ -465,12 +487,12 @@
+
+       counter_std = old_counter_std;
+       counter_corr = old_counter_corr;
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+       counter_combined = old_counter_combined;
+-#endif
++}
+       for (int j = 0; j < num_digits and j + i < num_digits; j += 2 * i) {
+         if (j == 0) {
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+           AND_step_2(
+               leaf_res_cmp + j * num_cmps, e + (counter_std * num_cmps) / 8,
+               f + (counter_std * num_cmps) / 8,
+@@ -480,7 +502,7 @@
+               (triples_std.bi) + (counter_combined * num_cmps) / 8,
+               (triples_std.ci) + (counter_combined * num_cmps) / 8, num_cmps);
+           counter_combined++;
+-#else
++} else {
+           AND_step_2(leaf_res_cmp + j * num_cmps,
+                      e + (counter_std * num_cmps) / 8,
+                      f + (counter_std * num_cmps) / 8,
+@@ -489,13 +511,13 @@
+                      (triples_std.ai) + (counter_std * num_cmps) / 8,
+                      (triples_std.bi) + (counter_std * num_cmps) / 8,
+                      (triples_std.ci) + (counter_std * num_cmps) / 8, num_cmps);
+-#endif
++}
+           for (int k = 0; k < num_cmps; k++)
+             leaf_res_cmp[j * num_cmps + k] ^=
+                 leaf_res_cmp[(j + i) * num_cmps + k];
+           counter_std++;
+         } else {
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+           AND_step_2(leaf_res_cmp + j * num_cmps,
+                      e + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+                      f + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+@@ -516,15 +538,15 @@
+               (triples_std.bi) + (counter_combined * num_cmps) / 8,
+               (triples_std.ci) + (counter_combined * num_cmps) / 8, num_cmps);
+           counter_combined++;
+-#else
++} else {
+           AND_step_2(leaf_res_cmp + j * num_cmps,
+                      e + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+                      f + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+                      ei + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+                      fi + ((num_triples_std + 2 * counter_corr) * num_cmps) / 8,
+-                     (triples_corr.ai) + (2 * counter_corr * num_cmps) / 8,
+-                     (triples_corr.bi) + (2 * counter_corr * num_cmps) / 8,
+-                     (triples_corr.ci) + (2 * counter_corr * num_cmps) / 8,
++                     (triples_corr->ai) + (2 * counter_corr * num_cmps) / 8,
++                     (triples_corr->bi) + (2 * counter_corr * num_cmps) / 8,
++                     (triples_corr->ci) + (2 * counter_corr * num_cmps) / 8,
+                      num_cmps);
+           AND_step_2(
+               leaf_res_eq + j * num_cmps,
+@@ -532,11 +554,11 @@
+               f + ((num_triples_std + (2 * counter_corr + 1)) * num_cmps) / 8,
+               ei + ((num_triples_std + (2 * counter_corr + 1)) * num_cmps) / 8,
+               fi + ((num_triples_std + (2 * counter_corr + 1)) * num_cmps) / 8,
+-              (triples_corr.ai) + ((2 * counter_corr + 1) * num_cmps) / 8,
+-              (triples_corr.bi) + ((2 * counter_corr + 1) * num_cmps) / 8,
+-              (triples_corr.ci) + ((2 * counter_corr + 1) * num_cmps) / 8,
++              (triples_corr->ai) + ((2 * counter_corr + 1) * num_cmps) / 8,
++              (triples_corr->bi) + ((2 * counter_corr + 1) * num_cmps) / 8,
++              (triples_corr->ci) + ((2 * counter_corr + 1) * num_cmps) / 8,
+               num_cmps);
+-#endif
++}
+           for (int k = 0; k < num_cmps; k++)
+             leaf_res_cmp[j * num_cmps + k] ^=
+                 leaf_res_cmp[(j + i) * num_cmps + k];
+@@ -545,17 +567,17 @@
+       }
+       old_counter_std = counter_std;
+       old_counter_corr = counter_corr;
+-#ifdef WAN_EXEC
++if constexpr (!Correlated) {
+       old_counter_combined = counter_combined;
+-#endif
+-    }
+-
+-#ifdef WAN_EXEC
++}
++    }
++
++if constexpr (!Correlated) {
+     assert(counter_combined == num_triples);
+-#else
++} else {
+     assert(counter_std == num_triples_std);
+     assert(2 * counter_corr == num_triples_corr);
+-#endif
++}
+
+     // cleanup
+
+diff --git a/src/Millionaire/millionaire_with_equality.h b/src/Millionaire/millionaire_with_equality.h
+--- a/src/Millionaire/millionaire_with_equality.h
++++ b/src/Millionaire/millionaire_with_equality.h
+@@ -283,19 +283,19 @@
+       for (int j = 0; j < num_digits and j + i < num_digits;
+            j += 2 * i) { // j=0 is LSD and j=num_digits-1 is MSD
+
+-        // CMP_j: Use 1 triple for opening e = a + cmp_j and f = b + eq_j+i.
++        // CMP_j: Use 1 triple for opening e = a + eq_j+i and f = b + cmp_j.
+         this->mill->AND_step_1(
+             ei + (2 * counter_triples_used * num_cmps) / 8,
+             fi + (2 * counter_triples_used * num_cmps) / 8,
+-            leaf_res_cmp + j * num_cmps, leaf_res_eq + (j + i) * num_cmps,
++            leaf_res_eq + (j + i) * num_cmps, leaf_res_cmp + j * num_cmps,
+             (triples_corr.ai) + (2 * counter_triples_used * num_cmps) / 8,
+             (triples_corr.bi) + (2 * counter_triples_used * num_cmps) / 8,
+             num_cmps);
+-        // EQ_j: Use 1 triple for opening e = a + eq_j and f = b + eq_j+i.
++        // EQ_j: Use 1 triple for opening e = a + eq_j+i and f = b + eq_j.
+         this->mill->AND_step_1(
+             ei + ((2 * counter_triples_used + 1) * num_cmps) / 8,
+             fi + ((2 * counter_triples_used + 1) * num_cmps) / 8,
+-            leaf_res_eq + j * num_cmps, leaf_res_eq + (j + i) * num_cmps,
++            leaf_res_eq + (j + i) * num_cmps, leaf_res_eq + j * num_cmps,
+             (triples_corr.ai) + ((2 * counter_triples_used + 1) * num_cmps) / 8,
+             (triples_corr.bi) + ((2 * counter_triples_used + 1) * num_cmps) / 8,
+             num_cmps);

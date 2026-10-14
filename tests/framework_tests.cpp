@@ -1,5 +1,6 @@
 #include "hera/private_transformer.h"
 #include "hera/detail/parallel_ranges.h"
+#include "hera/detail/nonlinear_contracts.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -75,6 +76,37 @@ void TestTwoLayers(hera::HeraConfig config)
             "two-layer output is not HE");
 }
 
+void TestNormalizedResidualGraph(hera::HeraConfig config)
+{
+    config.layers.front().norm = hera::NormPlacement::kNormalizedResidual;
+    auto graph = hera::BuildTransformerGraph(config);
+    Require(graph.ok(), graph.status().message());
+    const auto prefix = config.layers.front().id;
+    const auto node = [&](const std::string &name) -> const hera::GraphNode & {
+        for (const auto &candidate : graph.value().nodes())
+            if (candidate.name == name) return candidate;
+        throw std::runtime_error("missing normalized residual graph node: " + name);
+    };
+    const auto &ln1 = node(prefix + ".ln1.beta");
+    const auto &attention_add = node(prefix + ".attention_output.residual_add");
+    Require(attention_add.inputs.back() == ln1.output,
+            "Wo residual does not originate at complete LN1 output");
+    const auto &ln2 = node(prefix + ".ln2.residual_beta");
+    const bool shared_ffn = config.layer_execution.front().regions.at(hera::HeRegionId::kRegion1).parameter_profile ==
+        config.layer_execution.front().regions.at(hera::HeRegionId::kRegion5).parameter_profile;
+    const auto &consumer = node(prefix + (shared_ffn ? ".ffn.residual_add" : ".ffn.residual.he_to_mpc"));
+    Require((shared_ffn ? consumer.inputs.back() : consumer.inputs.front()) == ln2.output &&
+                graph.value().FindTensor(ln2.output)->layout == hera::Layout::kStrictColumn &&
+                graph.value().FindTensor(ln2.output)->planned_level ==
+                    graph.value().FindTensor(node(prefix + ".ln2.beta").output)->planned_level,
+            "Wd residual does not use original LN2 affine at the existing tail level");
+    Require(hera::ToString(config.layers.front().norm) == "normalized_residual",
+            "normalized residual mode is not explicit in configuration");
+    config.layers.front().ffn_residual = false;
+    auto without_skip = hera::BuildTransformerGraph(config);
+    Require(without_skip.ok(), "disabling the normalized FFN residual invalidated the graph");
+}
+
 void TestPostNorm(hera::HeraConfig config)
 {
     config.layers[0].norm = hera::NormPlacement::kPostNorm;
@@ -137,12 +169,25 @@ void TestBlock2GraphContract(hera::HeraConfig config)
     bool gamma = false;
     bool beta = false;
     bool qk = false;
+    std::size_t projections = 0;
     bool obsolete_scale = false;
     for (const auto &node : graph.value().nodes()) {
+        if (node.name == "layer0.attention.Wq" ||
+            node.name == "layer0.attention.Wk" ||
+            node.name == "layer0.attention.Wv") {
+            const auto *spec = graph.value().FindTensor(node.output);
+            Require(spec && spec->planned_level == 2,
+                    "Q/K/V projections do not share the L1 input boundary");
+            const auto *source = graph.value().FindTensor(node.inputs.front());
+            Require(source && source->layout == hera::Layout::kStrictColumn,
+                    "Q/K/V projection input lost its feature-column layout");
+            ++projections;
+        }
         if (node.name == "layer0.ln1.gamma") {
             gamma = node.kind == hera::OpKind::kElementwiseMultiplyPlain;
             const auto *spec = graph.value().FindTensor(node.output);
             Require(spec && spec->planned_level == 1 &&
+                        spec->layout == hera::Layout::kStrictColumn &&
                         spec->planned_scale_bits == 44,
                     "LayerNorm gamma has the wrong Block-2 contract");
         }
@@ -151,13 +196,13 @@ void TestBlock2GraphContract(hera::HeraConfig config)
         if (node.name == "layer0.attention.qk") {
             qk = true;
             const auto *spec = graph.value().FindTensor(node.output);
-            Require(spec && spec->planned_level == 9 &&
+            Require(spec && spec->planned_level == 6 &&
                         spec->planned_scale_bits == 44,
                     "QK has the wrong terminal contract");
         }
         if (node.name == "layer0.attention.scale") obsolete_scale = true;
     }
-    Require(gamma && beta && qk,
+    Require(gamma && beta && qk && projections == 3,
             "Block-2 typed nodes are missing from the Transformer graph");
     Require(!obsolete_scale,
             "QK scale was not folded into the Wq plaintext plan");
@@ -167,6 +212,9 @@ void TestFfnGeluGraphContract(hera::HeraConfig config)
 {
     auto graph = hera::BuildTransformerGraph(config);
     Require(graph.ok(), graph.status().message());
+    const auto &profile = config.he_parameter_profiles.at(config.layer_execution.front().regions.at(hera::HeRegionId::kRegion5).parameter_profile);
+    const auto terminal = profile.coefficient_modulus_bits.size() - profile.terminal_prime_count;
+    const auto start = terminal - hera::kFfnSuffixDepth;
     bool ln2_complex = false;
     bool wu = false;
     bool realify = false;
@@ -180,21 +228,21 @@ void TestFfnGeluGraphContract(hera::HeraConfig config)
         if (node.name == "layer0.ln2.gamma") {
             ln2_complex = spec &&
                 spec->layout == hera::Layout::kComplexStrictColumn &&
-                spec->planned_level == 2 &&
+                spec->planned_level == start + 1 &&
                 spec->planned_scale_bits == 60;
         } else if (node.name == "layer0.ffn.Wu") {
             const auto *attributes =
                 std::get_if<hera::MatMulAttributes>(&node.attributes);
             wu = attributes &&
                 attributes->kernel == hera::HeKernelKind::kFfnUpProjection &&
-                spec && spec->planned_level == 3;
+                spec && spec->planned_level == start + 2 &&
+                spec->layout == hera::Layout::kStrictColumn &&
+                spec->planned_scale_bits == 46;
         } else if (node.name == "layer0.ffn.activation.realify") {
-            realify = node.kind == hera::OpKind::kHeRealifyComplex &&
-                      spec && spec->planned_level == 4 &&
-                      spec->planned_scale_bits == 46;
+            realify = true;
         } else if (node.name == "layer0.ffn.activation.F0") {
             f0 = node.kind == hera::OpKind::kPolynomial &&
-                 spec && spec->planned_level == 7;
+                 spec && spec->planned_level == terminal;
         } else if (node.name == "layer0.ffn.activation.F1") {
             f1 = node.kind == hera::OpKind::kPolynomial;
         } else if (node.kind == hera::OpKind::kBooleanXor ||
@@ -207,9 +255,60 @@ void TestFfnGeluGraphContract(hera::HeraConfig config)
             wd_boundary = node.kind == hera::OpKind::kMpcToHe;
         }
     }
-    Require(ln2_complex && wu && realify && f0 && f1 && boolean_logic &&
+    Require(ln2_complex && wu && !realify && f0 && f1 && boolean_logic &&
                 output_share && wd_boundary,
             "typed LN2/Wu/GeLU/Wd boundary is incomplete");
+}
+
+
+void TestRejectIndependentAttentionOutput(hera::HeraConfig config)
+{
+    auto &regions = config.layer_execution.front().regions;
+    const auto &attention = regions.at(hera::HeRegionId::kRegion2).parameter_profile;
+    // Equal parameters under a different profile still mean different keys.
+    config.he_parameter_profiles.emplace("independent_output",
+        config.he_parameter_profiles.at(attention));
+    regions.at(hera::HeRegionId::kRegion4).parameter_profile = "independent_output";
+    auto valid = hera::ValidateHeraConfig(config);
+    Require(!valid.ok() && valid.status().message().find("same parameter profile") !=
+                std::string::npos,
+            "independent Region 4 was not rejected during config validation");
+    Require(!hera::BuildTransformerGraph(config).ok(),
+            "independent Region 4 unexpectedly built a graph");
+}
+
+
+void TestSharedAttentionOutput(hera::HeraConfig config)
+{
+    auto &regions = config.layer_execution.front().regions;
+    regions.at(hera::HeRegionId::kRegion4).parameter_profile =
+        regions.at(hera::HeRegionId::kRegion2).parameter_profile;
+    auto graph = hera::BuildTransformerGraph(config);
+    Require(graph.ok(), graph.status().message());
+    const auto wd_level = config.layers.front().norm == hera::NormPlacement::kNormalizedResidual &&
+        regions.at(hera::HeRegionId::kRegion1).parameter_profile == regions.at(hera::HeRegionId::kRegion5).parameter_profile
+            ? config.he_parameter_profiles.at(regions.at(hera::HeRegionId::kRegion5).parameter_profile).coefficient_modulus_bits.size() - 4 : 3;
+    bool refreshed = false, wo = false, wd = false;
+    for (const auto &node : graph.value().nodes()) {
+        const auto *spec = graph.value().FindTensor(node.output);
+        if (node.name == "layer0.attention_output.attention_value_output_region.bridge.mpc_to_he")
+            refreshed = spec && spec->planned_level == 2;
+        if (node.name == "layer0.attention_output.Wo")
+            wo = spec && spec->planned_level == 3 && spec->layout == hera::Layout::kStrictColumn;
+        if (node.name == "layer0.ffn.Wd")
+            wd = spec && spec->planned_level == wd_level && spec->layout == hera::Layout::kStrictColumn;
+        Require(node.name != "layer0.attention_output.realify_complex" &&
+                    node.name != "layer0.ffn.realify_complex",
+                "shared real residual graph retained a separate realification");
+    }
+    const auto *output = graph.value().FindTensor(graph.value().output());
+    Require(refreshed && wo && wd && output && output->planned_level ==
+                (config.layers.front().norm == hera::NormPlacement::kNormalizedResidual &&
+                 config.layer_execution.front().regions.at(hera::HeRegionId::kRegion1).parameter_profile ==
+                 config.layer_execution.front().regions.at(hera::HeRegionId::kRegion5).parameter_profile
+                    ? config.he_parameter_profiles.at(regions.at(hera::HeRegionId::kRegion5).parameter_profile).coefficient_modulus_bits.size() - 4 : 3) &&
+                output->layout == hera::Layout::kStrictColumn,
+            "shared Region-2/4 graph contract is incomplete");
 }
 
 void TestUnavailableBackend(hera::HeraConfig config)
@@ -229,9 +328,9 @@ void TestUnavailableBackend(hera::HeraConfig config)
     Require(!result.ok(), "unavailable backend unexpectedly executed");
     Require(result.status().code() == hera::StatusCode::kKernelUnavailable,
             "unavailable backend returned the wrong status code");
-    Require(result.status().message().find("layer0.ln1.sum") !=
-                std::string::npos,
-            "unavailable error lacks node context");
+    Require(result.status().message().find(
+                context.value()->graph().nodes().front().name) != std::string::npos,
+            "unavailable error lacks the first node's context");
 }
 
 void TestConversionWorkspaceValidation(hera::HeraConfig config)
@@ -246,6 +345,7 @@ void TestConversionWorkspaceValidation(hera::HeraConfig config)
 
 void TestLayerNormRsqrtWidthValidation(hera::HeraConfig config)
 {
+    const auto baseline = config;
     config.layers.front().attention_norm_rsqrt_bits =
         config.mpc_numeric.scale_bits + 1;
     Require(!hera::ValidateHeraConfig(config).ok(),
@@ -260,6 +360,34 @@ void TestLayerNormRsqrtWidthValidation(hera::HeraConfig config)
         config.mpc_numeric.ring_bits;
     Require(hera::ValidateHeraConfig(config).ok(),
             "full-width rsqrt working ring was rejected");
+    config.layers.front().attention_norm_variance_scale_bits = 0;
+    Require(!hera::ValidateHeraConfig(config).ok(), "zero variance precision was accepted");
+    config.layers.front().attention_norm_variance_scale_bits = config.mpc_numeric.ring_bits;
+    Require(!hera::ValidateHeraConfig(config).ok(), "variance precision outside the ring was accepted");
+    config.layers.front().attention_norm_variance_scale_bits = 24;
+    config.layers.front().attention_norm_epsilon = 1e-8;
+    Require(!hera::ValidateHeraConfig(config).ok(), "epsilon below the variance precision envelope was accepted");
+
+    config = baseline;
+    config.mpc_numeric.scale_bits = 20; // BLB's CKKS Transformer example.
+    config.layers.front().attention_norm_rsqrt_bits = 27;
+    Require(hera::ValidateHeraConfig(config).ok(), "BLB scale20 rsqrt configuration was rejected");
+    for (int scale : {29, 30, 31}) {
+        config = baseline;
+        config.mpc_numeric.scale_bits = scale;
+        config.layers.front().attention_norm_rsqrt_bits = scale + 3;
+        auto rejected = hera::ValidateHeraConfig(config);
+        Require(!rejected.ok() && rejected.status().message().find("LUT capacity") != std::string::npos,
+                "unsupported SCI sqrt LUT was not rejected during config validation");
+    }
+    Require(hera::detail::PlanLayerNormRsqrt(63, 28, 40, 28).ok(),
+            "SCI's supported scale28 LUT boundary was rejected");
+    Require(!hera::detail::PlanLayerNormRsqrt(43, 28, 32, 28).ok(),
+            "rsqrt output wider than the sharing ring was accepted");
+    Require(!hera::detail::SoftmaxAccumulatorBits(128, 63, 28).ok(),
+            "Softmax product wider than the 64-bit backend was accepted");
+    Require(hera::detail::SoftmaxAccumulatorBits(2, 63, 28).ok(),
+            "supported high-precision Softmax workspace was rejected");
 }
 
 void TestHeWorkerBudgetAndReuse()
@@ -290,10 +418,13 @@ int main()
         Require(config.ok(), config.status().message());
         TestShapeVariants(config.value());
         TestTwoLayers(config.value());
+        TestNormalizedResidualGraph(config.value());
         TestPostNorm(config.value());
         TestRecordingExecution(config.value());
         TestBlock2GraphContract(config.value());
         TestFfnGeluGraphContract(config.value());
+        TestRejectIndependentAttentionOutput(config.value());
+        TestSharedAttentionOutput(config.value());
         TestUnavailableBackend(config.value());
         TestConversionWorkspaceValidation(config.value());
         TestLayerNormRsqrtWidthValidation(config.value());

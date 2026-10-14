@@ -1,4 +1,6 @@
 #include "hera/ffn_gelu.h"
+#include "hera/detail/he_level.h"
+#include "hera/detail/he_packing.h"
 #include "hera/detail/mpc_session_internal.h"
 #include "hera/detail/parallel_ranges.h"
 
@@ -7,10 +9,14 @@
 #include <OT/emp-ot.h>
 #include <utils/emp-tool.h>
 
+#include <seal/util/ntt.h>
+
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <list>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -39,34 +45,11 @@ std::uint64_t RingMask(int bits)
                       : (std::uint64_t{1} << bits) - 1;
 }
 
-Result<std::size_t> LevelOf(const HeContext &context,
-                            seal::parms_id_type id)
-{
-    std::size_t level = 0;
-    for (auto data = context.context->first_context_data(); data;
-         data = data->next_context_data(), ++level)
-        if (data->parms_id() == id) return level;
-    return Status::Invalid("ciphertext parms_id is outside the HE profile");
-}
+using detail::LevelOf;
 
-Result<seal::parms_id_type> LevelId(const HeContext &context,
-                                    std::size_t target)
-{
-    auto data = context.context->first_context_data();
-    for (std::size_t level = 0; level < target && data; ++level)
-        data = data->next_context_data();
-    if (!data) return Status::FailedPrecondition("HE level is absent");
-    return data->parms_id();
-}
+using detail::LevelId;
 
-double DroppedPrime(const HeContext &context, seal::parms_id_type id)
-{
-    const auto data = context.context->get_context_data(id);
-    if (!data || !data->next_context_data())
-        throw std::invalid_argument("cannot rescale the terminal level");
-    const auto &moduli = data->parms().coeff_modulus();
-    return static_cast<double>(moduli.back().value());
-}
+using detail::DroppedPrime;
 
 bool CloseScale(double left, double right)
 {
@@ -95,55 +78,12 @@ const PlainParameterHandle *FindPlain(const LayerWeightHandles &weights,
     return nullptr;
 }
 
-Result<void> SamePacking(const HePackingPlan &left,
-                         const HePackingPlan &right)
+Result<void> SamePacking(const HePackingPlan &left, const HePackingPlan &right)
 {
-    if (left.logical_shape != right.logical_shape ||
-        left.slot_count != right.slot_count ||
-        left.ciphertext_count != right.ciphertext_count ||
-        left.logical_locations.size() != right.logical_locations.size())
-        return Status::Invalid("ciphertext packing plans differ");
-    for (std::size_t i = 0; i < left.logical_locations.size(); ++i) {
-        const auto &a = left.logical_locations[i];
-        const auto &b = right.logical_locations[i];
-        if (a.size() != b.size())
-            return Status::Invalid("ciphertext packing replicas differ");
-        for (std::size_t j = 0; j < a.size(); ++j)
-            if (a[j].ciphertext != b[j].ciphertext ||
-                a[j].slot != b[j].slot ||
-                a[j].component != b[j].component)
-                return Status::Invalid("ciphertext coordinates differ");
-    }
-    return {};
+    return detail::RequireSamePacking(left, right);
 }
 
-Result<PhysicalSlotMap> ToConversionMap(const HePackingPlan &packing)
-{
-    PhysicalSlotMap map;
-    map.ciphertext_count = packing.ciphertext_count;
-    map.slots_per_ciphertext = packing.slot_count;
-    map.logical_element_count = packing.logical_locations.size();
-    map.assignments.resize(map.ciphertext_count * map.slots_per_ciphertext);
-    for (std::size_t logical = 0;
-         logical < packing.logical_locations.size(); ++logical) {
-        const auto &locations = packing.logical_locations[logical];
-        if (locations.size() != 1)
-            return Status::Invalid(
-                "conversion packing requires one lane per logical element");
-        const auto &location = locations.front();
-        auto &assignment = map.assignments[
-            location.ciphertext * map.slots_per_ciphertext + location.slot];
-        auto &index = location.component == ComplexLane::kReal
-            ? assignment.real_logical_index
-            : assignment.imaginary_logical_index;
-        if (index != kUnusedLogicalIndex)
-            return Status::Invalid("conversion packing lane collision");
-        index = logical;
-    }
-    auto valid = map.Validate();
-    if (!valid.ok()) return valid.status();
-    return map;
-}
+using detail::ToConversionMap;
 
 Result<ComplexMpcSharePair> Scatter(
     const MpcShareTensor &logical, const HePackingPlan &packing)
@@ -188,21 +128,11 @@ Result<ComplexMpcSharePair> ScatterInverse(
          ComplexComponent::kImaginary}};
 }
 
-PhysicalSlotMap DensePhysicalRealMap(std::size_t slots)
-{
-    PhysicalSlotMap map;
-    map.ciphertext_count = 1;
-    map.slots_per_ciphertext = slots;
-    map.logical_element_count = slots;
-    map.assignments.resize(slots);
-    for (std::size_t slot = 0; slot < slots; ++slot)
-        map.assignments[slot].real_logical_index = slot;
-    return map;
-}
-
 Result<MpcShareTensor> CompactSegment(
     const ComplexMpcSharePair &physical, const HePackingPlan &packing,
-    std::size_t ciphertext_offset, TensorShape shape)
+    std::size_t ciphertext_offset, TensorShape shape,
+    std::optional<ComplexLane> component_override = std::nullopt,
+    bool compensate_phase = false)
 {
     std::vector<std::uint64_t> output(packing.logical_locations.size());
     for (std::size_t logical = 0; logical < output.size(); ++logical) {
@@ -210,9 +140,13 @@ Result<MpcShareTensor> CompactSegment(
         const auto physical_index =
             (ciphertext_offset + location.ciphertext) * packing.slot_count +
             location.slot;
-        output[logical] = location.component == ComplexLane::kReal
+        const auto lane = component_override.value_or(location.component);
+        auto value = lane == ComplexLane::kReal
             ? physical.real.local_share[physical_index]
             : physical.imag.local_share[physical_index];
+        if (compensate_phase && lane == ComplexLane::kImaginary && (location.slot & 1))
+            value = (std::uint64_t{0} - value) & RingMask(physical.real.numeric.ring_bits);
+        output[logical] = value;
     }
     return MpcShareTensor{std::move(output), std::move(shape),
                           physical.real.numeric, ComplexComponent::kReal};
@@ -223,7 +157,7 @@ int CanonicalRotation(long long value, std::size_t slots)
     long long result = value % static_cast<long long>(slots);
     if (result > static_cast<long long>(slots / 2))
         result -= static_cast<long long>(slots);
-    if (result < -static_cast<long long>(slots / 2))
+    if (result <= -static_cast<long long>(slots / 2))
         result += static_cast<long long>(slots);
     return static_cast<int>(result);
 }
@@ -300,65 +234,89 @@ Result<FfnGeluPackingPlan> FfnGeluPackingPlanner::Build(
     auto centered = ComplexColumns({{layer.tokens, layer.model_width}},
                                    slot_count, Layout::kComplexStrictColumn);
     if (!centered.ok()) return centered.status();
-    auto projected = ComplexColumns({{layer.tokens, layer.ffn_width}},
-                                    slot_count, Layout::kFfn);
+    auto projected = RealColumns(
+        {{layer.tokens, layer.ffn_width}}, slot_count, Layout::kStrictColumn);
     if (!projected.ok()) return projected.status();
     const auto stride = NextPowerOfTwo(layer.tokens);
     const auto columns = slot_count / stride;
-    HePackingPlan inverse;
-    inverse.layout = Layout::kReduction;
-    inverse.logical_shape = {{layer.tokens, 1}};
-    inverse.slot_count = slot_count;
-    inverse.ciphertext_count = 1;
-    inverse.logical_locations.resize(layer.tokens);
-    for (std::size_t token = 0; token < layer.tokens; ++token)
-        for (std::size_t column = 0; column < columns; ++column)
-            inverse.logical_locations[token].push_back(
-                {0, column * stride + token, ComplexLane::kReal,
-                 std::nullopt});
-    auto inverse_valid = inverse.Validate();
-    if (!inverse_valid.ok()) return inverse_valid.status();
+    auto inverse_plan = MultiHeadPackingPlan::TokenInverseBroadcast(layer.tokens, slot_count);
+    if (!inverse_plan.ok()) return inverse_plan.status();
+    auto inverse = inverse_plan.take_value();
 
-    auto real = RealColumns({{layer.tokens, layer.ffn_width}}, slot_count,
-                            Layout::kStrictColumn);
-    if (!real.ok()) return real.status();
     return FfnGeluPackingPlan{centered.take_value(), std::move(inverse),
-                              projected.take_value(), real.take_value(),
+                              projected.take_value(),
                               stride, columns};
 }
 
-Result<void> FfnGeluLevelPlanner::Validate(
-    const HeParameterConfig &parameters)
+Result<std::shared_ptr<const FfnGeluPackingPlan>> FfnGeluPackingPlanner::GetShared(
+    const TransformerLayerConfig &layer, std::size_t slot_count)
 {
-    if (parameters.coefficient_modulus_bits.size() < 8 ||
-        parameters.declared_depth < 6)
-        return Status::FailedPrecondition(
-            "FFN/GeLU needs eight configured primes and depth six");
+    using Key = std::tuple<std::size_t, std::size_t, std::size_t, std::size_t>;
+    struct Entry { Key key; std::shared_ptr<const FfnGeluPackingPlan> plan; std::size_t bytes; };
+    thread_local std::list<Entry> entries;
+    thread_local std::size_t resident_bytes = 0;
+    const Key key{layer.tokens, layer.model_width, layer.ffn_width, slot_count};
+    for (auto it = entries.begin(); it != entries.end(); ++it)
+        if (it->key == key) {
+            auto plan = it->plan;
+            entries.splice(entries.begin(), entries, it);
+            return plan;
+        }
+    auto built = Build(layer, slot_count);
+    if (!built.ok()) return built.status();
+    auto plan = std::make_shared<const FfnGeluPackingPlan>(built.take_value());
+    std::size_t bytes = sizeof(FfnGeluPackingPlan);
+    for (const auto *packing : {&plan->centered, &plan->inverse_broadcast,
+                                &plan->projected}) {
+        bytes += packing->logical_locations.capacity() * sizeof(packing->logical_locations.front());
+        for (const auto &locations : packing->logical_locations)
+            bytes += locations.capacity() * sizeof(locations.front());
+    }
+    constexpr std::size_t kBudget = 128U * 1024U * 1024U;
+    if (bytes <= kBudget) {
+        while (!entries.empty() && (entries.size() >= 8 || resident_bytes + bytes > kBudget)) {
+            resident_bytes -= entries.back().bytes;
+            entries.pop_back();
+        }
+        entries.push_front({key, plan, bytes});
+        resident_bytes += bytes;
+    }
+    return plan;
+}
+
+Result<void> FfnGeluLevelPlanner::Validate(const HeParameterConfig &parameters)
+{
+    const std::size_t depth = kFfnSuffixDepth;
+    if (parameters.coefficient_modulus_bits.size() < depth + 1 || parameters.declared_depth < depth)
+        return Status::FailedPrecondition("FFN/GeLU profile is shorter than the five-level real-Wu suffix");
     if (parameters.terminal_prime_count != 1)
-        return Status::FailedPrecondition(
-            "FFN/GeLU conversion needs a single-prime terminal level");
-    if (parameters.input_scale_bits != 45 ||
-        parameters.default_scale_bits != 45 ||
-        parameters.output_scale_bits != 46)
-        return Status::FailedPrecondition(
-            "FFN/GeLU currently requires input/default/output scales 45/45/46");
+        return Status::FailedPrecondition("FFN/GeLU conversion needs a single-prime terminal level");
+    if (parameters.input_scale_bits != 45 || parameters.default_scale_bits != 45 || parameters.output_scale_bits != 46)
+        return Status::FailedPrecondition("FFN/GeLU requires input/default/output scales 45/45/46");
     const auto &bits = parameters.coefficient_modulus_bits;
-    // The converter enters at terminal-depth (L1 for the default profile).
-    // From there the useful suffix drops 60 bits for LN, four consecutive
-    // 46-bit primes for Wu/realify and the two ct-ct GeLU stages, then a
-    // 60-bit prime for coefficient products. The leading 60-bit prime is
-    // intentionally outside the online suffix and only bounds CKKS special
-    // prime construction.
-    if (bits[bits.size() - 1] < 58 || bits[bits.size() - 2] < 58 ||
-        std::abs(bits[bits.size() - 3] - 46) > 1 ||
-        std::abs(bits[bits.size() - 4] - 46) > 1 ||
-        std::abs(bits[bits.size() - 5] - 46) > 1 ||
-        std::abs(bits[bits.size() - 6] - 46) > 1 ||
-        bits[bits.size() - 7] < 58)
-        return Status::FailedPrecondition(
-            "FFN/GeLU suffix must drop 60,46,46,46,46,60 bits");
+    if (bits[0] < 58 || bits[1] < 58 || bits[depth] < 58)
+        return Status::FailedPrecondition("FFN/GeLU terminal/coefficient/LN primes must have at least 58 bits");
+    for (std::size_t i = 2; i < depth; ++i)
+        if (std::abs(bits[i] - 46) > 1)
+            return Status::FailedPrecondition("FFN/GeLU polynomial/projection suffix primes must be 46 bits");
     return {};
 }
+
+namespace {
+
+struct PreparedFfnAffine final : PreparedBlock2Program {
+    std::string profile;
+    seal::parms_id_type input_id{};
+    double input_scale{}, output_scale{}, residual_scale{};
+    struct Channel {
+        std::shared_ptr<const seal::Plaintext> plus, minus, bias;
+    };
+    std::vector<Channel> channels;
+    std::vector<double> gamma, beta, residual_gamma, residual_beta;
+    std::vector<std::shared_ptr<const seal::Plaintext>> residual_gains, residual_biases;
+};
+
+} // namespace
 
 Result<SealCipherTensor> FfnLayerNormTailKernel::Evaluate(
     const SealCipherTensor &centered,
@@ -367,8 +325,16 @@ Result<SealCipherTensor> FfnLayerNormTailKernel::Evaluate(
     const DenseVectorParameter &beta,
     const TransformerLayerConfig &layer,
     const HeContext &context,
-    FfnGeluExecutionReport *report)
+    FfnGeluExecutionReport *report,
+    std::size_t he_workers,
+    const GammaFusedLayerNormParameters *original_affine,
+    SealCipherTensor *normalized_residual)
 {
+    if ((original_affine == nullptr) != (normalized_residual == nullptr))
+        return Status::Invalid("LN2 residual requires original affine and output together");
+    if (original_affine && (original_affine->gamma.values.size() != layer.model_width ||
+                            original_affine->beta.values.size() != layer.model_width))
+        return Status::Invalid("LN2 original affine size mismatch");
     auto centered_valid = centered.Validate(context);
     if (!centered_valid.ok()) return centered_valid.status();
     auto inverse_valid = inverse_stddev.Validate(context);
@@ -381,20 +347,22 @@ Result<SealCipherTensor> FfnLayerNormTailKernel::Evaluate(
         gamma.values.size() != layer.model_width ||
         beta.values.size() != layer.model_width)
         return Status::Invalid("FFN LayerNorm tail contract mismatch");
-    auto plan = FfnGeluPackingPlanner::Build(layer, context.slot_count());
+    auto plan = FfnGeluPackingPlanner::GetShared(layer, context.slot_count());
     if (!plan.ok()) return plan.status();
     auto same = SamePacking(centered.physical_packing,
-                            plan.value().centered);
+                            plan.value()->centered);
+    if (!same.ok()) return same.status();
+    same = SamePacking(inverse_stddev.physical_packing, plan.value()->inverse_broadcast);
     if (!same.ok()) return same.status();
     const double input_scale = std::ldexp(
         1.0, context.parameters.input_scale_bits);
     const auto terminal_level =
         context.parameters.coefficient_modulus_bits.size() -
         context.parameters.terminal_prime_count;
-    constexpr std::size_t kFfnGeluDepth = 6;
+    const auto kFfnGeluDepth = kFfnSuffixDepth;
     if (terminal_level < kFfnGeluDepth)
         return Status::FailedPrecondition(
-            "FFN/GeLU suffix needs six remaining CKKS levels");
+            "FFN/GeLU suffix needs five remaining CKKS levels");
     const auto input_level = terminal_level - kFfnGeluDepth;
     for (const auto &ct : centered.ciphertexts) {
         const auto level = LevelOf(context, ct.parms_id());
@@ -413,162 +381,280 @@ Result<SealCipherTensor> FfnLayerNormTailKernel::Evaluate(
             "FFN inverse-stddev must begin at the same suffix level");
 
     const auto cache = ModelPlaintextCacheScope::Current();
-    if (cache.first && cache.first->preparing_plaintexts()) {
-        const auto input_id = centered.ciphertexts.front().parms_id();
-        const auto next = context.context->get_context_data(input_id)
-                              ->next_context_data();
-        if (!next)
-            return Status::FailedPrecondition(
-                "FFN LayerNorm preparation has no next level");
+    const auto key = cache.second + "/ffn/ln2/" + layer.id;
+    const auto input_id = centered.ciphertexts.front().parms_id();
+    const auto next = context.context->get_context_data(input_id)->next_context_data();
+    if (!next) return Status::FailedPrecondition("FFN LayerNorm has no next level");
+    const int affine_bits = context.parameters.default_scale_bits + 15;
+    const double target = std::ldexp(1.0, affine_bits);
+    const int residual_bits = context.parameters.output_scale_bits;
+    const double residual_target = std::ldexp(1.0, residual_bits);
+    std::optional<HePackingPlan> residual_plan;
+    if (normalized_residual) {
+        auto built = FfnGeluPackingPlanner::RealColumns(
+            {{layer.tokens, layer.model_width}}, context.slot_count(), Layout::kStrictColumn);
+        if (!built.ok()) return built.status();
+        residual_plan = built.take_value();
+    }
+    std::shared_ptr<const PreparedFfnAffine> program;
+    if (cache.first && !cache.first->preparing_plaintexts()) {
+        auto loaded = cache.first->GetPreparedBlock2Program(key);
+        if (!loaded.ok()) return loaded.status();
+        program = std::dynamic_pointer_cast<const PreparedFfnAffine>(loaded.value());
+        if (!program || program->profile != context.profile || program->input_id != input_id ||
+            !CloseScale(program->input_scale, input_scale) || program->output_scale != target ||
+            program->channels.size() != centered.ciphertexts.size() ||
+            program->gamma != gamma.values || program->beta != beta.values ||
+            program->residual_scale != residual_target ||
+            program->residual_gamma != (original_affine ? original_affine->gamma.values : std::vector<double>{}) ||
+            program->residual_beta != (original_affine ? original_affine->beta.values : std::vector<double>{}))
+            return Status::FailedPrecondition("prepared FFN LayerNorm contract mismatch");
+    } else {
+        auto compiled = std::make_shared<PreparedFfnAffine>();
+        compiled->profile = context.profile;
+        compiled->input_id = input_id;
+        compiled->input_scale = input_scale;
+        compiled->output_scale = target;
+        compiled->residual_scale = residual_target;
+        compiled->channels.resize(centered.ciphertexts.size());
+        compiled->gamma = gamma.values;
+        compiled->beta = beta.values;
         seal::CKKSEncoder encoder(*context.context);
-        const int affine_bits = context.parameters.default_scale_bits + 15;
-        const double target = std::ldexp(1.0, affine_bits);
         const double plain_scale = target * DroppedPrime(context, input_id) /
-            (input_scale * input_scale);
+                                   (input_scale * input_scale);
         if (!std::isfinite(plain_scale) || plain_scale < 2.0)
-            return Status::FailedPrecondition(
-                "LayerNorm gamma plaintext scale is too small");
-        const auto columns = plan.value().columns_per_component;
-        for (std::size_t group = 0;
-             group < centered.ciphertexts.size(); ++group) {
-            std::vector<double> plus(context.slot_count());
-            std::vector<double> minus(context.slot_count());
-            std::vector<Complex> bias_slots(context.slot_count());
+            return Status::FailedPrecondition("LayerNorm gamma plaintext scale is too small");
+        const auto columns = plan.value()->columns_per_component;
+        std::vector<Complex> plus(context.slot_count()), minus(context.slot_count()),
+            bias_slots(context.slot_count());
+        for (std::size_t group = 0; group < compiled->channels.size(); ++group) {
+            std::fill(plus.begin(), plus.end(), Complex{});
+            std::fill(minus.begin(), minus.end(), Complex{});
+            std::fill(bias_slots.begin(), bias_slots.end(), Complex{});
+            bool needs_conjugate = false;
             for (std::size_t token = 0; token < layer.tokens; ++token)
                 for (std::size_t local = 0; local < columns; ++local) {
-                    const auto slot = local * plan.value().token_stride + token;
-                    const auto real_feature = group * 2 * columns + local;
-                    const auto imag_feature = real_feature + columns;
-                    const double gr = real_feature < layer.model_width
-                        ? gamma.values[real_feature] : 0.0;
-                    const double gi = imag_feature < layer.model_width
-                        ? gamma.values[imag_feature] : 0.0;
+                    const auto slot = local * plan.value()->token_stride + token;
+                    const auto rf = group * 2 * columns + local, im = rf + columns;
+                    if (rf >= layer.model_width) continue;
+                    const double gr = gamma.values[rf];
+                    // An unused imaginary channel can use the real gain: its
+                    // padding is never consumed by Wu, so no split is needed.
+                    const double gi = im < layer.model_width ? gamma.values[im] : gr;
                     plus[slot] = 0.5 * (gr + gi);
                     minus[slot] = 0.5 * (gr - gi);
-                    if (real_feature < layer.model_width)
-                        bias_slots[slot].real(beta.values[real_feature]);
-                    if (imag_feature < layer.model_width)
-                        bias_slots[slot].imag(beta.values[imag_feature]);
+                    needs_conjugate |= gr != gi;
+                    bias_slots[slot].real(beta.values[rf]);
+                    if (im < layer.model_width) bias_slots[slot].imag(beta.values[im]);
                 }
-            auto plus_plain = EncodeModelPlaintext(
-                encoder, plus, input_id, plain_scale,
-                "ffn.ln2.gamma.plus");
-            if (!plus_plain.ok()) return plus_plain.status();
-            auto minus_plain = EncodeModelPlaintext(
-                encoder, minus, input_id, plain_scale,
-                "ffn.ln2.gamma.minus");
-            if (!minus_plain.ok()) return minus_plain.status();
-            auto bias_plain = EncodeModelPlaintext(
-                encoder, bias_slots, next->parms_id(), target,
-                "ffn.ln2.beta");
-            if (!bias_plain.ok()) return bias_plain.status();
+            auto &channel = compiled->channels[group];
+            auto encoded = CompileModelPlaintext(encoder, plus, input_id, plain_scale,
+                                                  "ffn.ln2.gamma.plus");
+            if (!encoded.ok()) return encoded.status();
+            channel.plus = encoded.take_value();
+            if (needs_conjugate) {
+                encoded = CompileModelPlaintext(encoder, minus, input_id, plain_scale,
+                                                "ffn.ln2.gamma.minus");
+                if (!encoded.ok()) return encoded.status();
+                channel.minus = encoded.take_value();
+            }
+            encoded = CompileModelPlaintext(encoder, bias_slots, next->parms_id(), target,
+                                            "ffn.ln2.beta");
+            if (!encoded.ok()) return encoded.status();
+            channel.bias = encoded.take_value();
         }
-        auto result = centered;
-        for (auto &ct : result.ciphertexts) {
-            ct.parms_id() = next->parms_id();
-            ct.scale() = target;
-        }
-        result.logical_spec.he_region = HeRegionId::kRegion5;
-        result.logical_spec.he_parameter_profile = context.profile;
-        result.logical_spec.planned_level = input_level + 1;
-        result.logical_spec.planned_scale_bits = affine_bits;
-        return result;
-    }
-
-    seal::Evaluator evaluator(*context.context);
-    seal::CKKSEncoder encoder(*context.context);
-    // A 45+45 ciphertext product followed by one 60-bit rescale would leave
-    // only a 15-bit gamma plaintext if the output were forced immediately
-    // back to 2^45. Keep a truthful 2^60 intermediate instead; Wu consumes it
-    // with a 2^45 plaintext and returns to 2^45 at its own rescale. This keeps
-    // the one-level lazy schedule while preserving model-parameter precision.
-    const int affine_scale_bits =
-        context.parameters.default_scale_bits + 15;
-    const double target = std::ldexp(1.0, affine_scale_bits);
-    SealCipherTensor result = centered;
-    const auto columns = plan.value().columns_per_component;
-    for (std::size_t group = 0; group < result.ciphertexts.size(); ++group) {
-        auto &value = result.ciphertexts[group];
-        evaluator.multiply_inplace(value, inverse_ct);
-        evaluator.relinearize_inplace(value, context.relinearization_keys);
-        if (report) {
-            ++report->ciphertext_multiplications;
-            ++report->relinearizations;
-        }
-        seal::Ciphertext conjugated;
-        evaluator.complex_conjugate(value, context.galois_keys, conjugated);
-        if (report) ++report->conjugations;
-        std::vector<double> plus(context.slot_count(), 0.0);
-        std::vector<double> minus(context.slot_count(), 0.0);
-        std::vector<Complex> bias_slots(context.slot_count());
-        for (std::size_t token = 0; token < layer.tokens; ++token) {
-            for (std::size_t local = 0; local < columns; ++local) {
-                const auto slot = local * plan.value().token_stride + token;
-                const auto real_feature = group * 2 * columns + local;
-                const auto imag_feature = real_feature + columns;
-                const double gr = real_feature < layer.model_width
-                    ? gamma.values[real_feature] : 0.0;
-                const double gi = imag_feature < layer.model_width
-                    ? gamma.values[imag_feature] : 0.0;
-                plus[slot] = 0.5 * (gr + gi);
-                minus[slot] = 0.5 * (gr - gi);
-                if (real_feature < layer.model_width)
-                    bias_slots[slot].real(beta.values[real_feature]);
-                if (imag_feature < layer.model_width)
-                    bias_slots[slot].imag(beta.values[imag_feature]);
+        if (original_affine) {
+            compiled->residual_gamma = original_affine->gamma.values;
+            compiled->residual_beta = original_affine->beta.values;
+            const double residual_scale = residual_target * DroppedPrime(context, input_id) /
+                                          (input_scale * input_scale);
+            for (std::size_t ct = 0; ct < residual_plan->ciphertext_count; ++ct) {
+                std::fill(plus.begin(), plus.end(), Complex{});
+                std::fill(bias_slots.begin(), bias_slots.end(), Complex{});
+                bool nonzero = false;
+                for (std::size_t local = 0; local < columns; ++local) {
+                    const auto feature = ct * columns + local;
+                    if (feature >= layer.model_width) break;
+                    const auto gain = original_affine->gamma.values[feature];
+                    nonzero |= gain != 0.0;
+                    for (std::size_t token = 0; token < layer.tokens; ++token) {
+                        const auto slot = local * plan.value()->token_stride + token;
+                        // Extract a or b and apply original gamma before the
+                        // same rescale as the fused Wu branch. No extra level.
+                        plus[slot] = ct % 2 == 0 ? Complex{0.5 * gain, 0.0}
+                                                : Complex{0.0, -0.5 * gain};
+                        bias_slots[slot] = original_affine->beta.values[feature];
+                    }
+                }
+                std::shared_ptr<const seal::Plaintext> gain;
+                if (nonzero) {
+                    auto encoded = CompileModelPlaintext(encoder, plus, input_id,
+                        residual_scale, "ffn.ln2.residual.gamma");
+                    if (!encoded.ok()) return encoded.status();
+                    gain = encoded.take_value();
+                }
+                compiled->residual_gains.push_back(std::move(gain));
+                auto encoded = CompileModelPlaintext(encoder, bias_slots, next->parms_id(),
+                    residual_target, "ffn.ln2.residual.beta");
+                if (!encoded.ok()) return encoded.status();
+                compiled->residual_biases.push_back(encoded.take_value());
             }
         }
-        const double plain_scale = target * DroppedPrime(context,
-            value.parms_id()) / value.scale();
-        if (!std::isfinite(plain_scale) || plain_scale < 2.0)
-            return Status::FailedPrecondition(
-                "LayerNorm gamma plaintext scale is too small");
-        auto encoded_plus = EncodeModelPlaintext(
-            encoder, plus, value.parms_id(), plain_scale,
-            "ffn.ln2.gamma.plus");
-        if (!encoded_plus.ok()) return encoded_plus.status();
-        auto plus_plain = encoded_plus.take_value();
-        auto encoded_minus = EncodeModelPlaintext(
-            encoder, minus, value.parms_id(), plain_scale,
-            "ffn.ln2.gamma.minus");
-        if (!encoded_minus.ok()) return encoded_minus.status();
-        auto minus_plain = encoded_minus.take_value();
-        evaluator.multiply_plain_inplace(value, plus_plain);
-        evaluator.multiply_plain_inplace(conjugated, minus_plain);
-        evaluator.add_inplace(value, conjugated);
-        if (report) report->ciphertext_plain_multiplications += 2;
-        evaluator.rescale_to_next_inplace(value);
-        auto normalized = NormalizeScale(value, target);
-        if (!normalized.ok()) return normalized.status();
-        if (report) ++report->rescales;
-        auto encoded_bias = EncodeModelPlaintext(
-            encoder, bias_slots, value.parms_id(), target,
-            "ffn.ln2.beta");
-        if (!encoded_bias.ok()) return encoded_bias.status();
-        auto bias_plain = encoded_bias.take_value();
-        evaluator.add_plain_inplace(value, bias_plain);
+        program = compiled;
+        if (cache.first) {
+            auto stored = cache.first->PutPreparedBlock2Program(key, compiled);
+            if (!stored.ok()) return stored.status();
+        }
+    }
+    SealCipherTensor result;
+    result.parameter_profile = context.profile;
+    result.logical_spec = centered.logical_spec;
+    result.physical_packing = centered.physical_packing;
+    result.ciphertexts.resize(centered.ciphertexts.size());
+    if (normalized_residual) {
+        normalized_residual->parameter_profile = context.profile;
+        normalized_residual->logical_spec = centered.logical_spec;
+        normalized_residual->logical_spec.layout = Layout::kStrictColumn;
+        normalized_residual->logical_spec.he_region = HeRegionId::kRegion5;
+        normalized_residual->logical_spec.planned_level = input_level + 1;
+        normalized_residual->logical_spec.planned_scale_bits = residual_bits;
+        normalized_residual->physical_packing = *residual_plan;
+        normalized_residual->ciphertexts.resize(residual_plan->ciphertext_count);
+    }
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        for (auto &ct : result.ciphertexts) { ct.parms_id() = next->parms_id(); ct.scale() = target; }
+        if (normalized_residual) for (auto &ct : normalized_residual->ciphertexts) {
+            ct.parms_id() = next->parms_id(); ct.scale() = residual_target;
+        }
+    } else {
+        std::vector<FfnGeluExecutionReport> reports(result.ciphertexts.size());
+        auto evaluated = detail::ParallelRanges(result.ciphertexts.size(),
+            he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator evaluator(*context.context);
+                for (std::size_t group = begin; group < end; ++group) {
+                    auto &value = result.ciphertexts[group];
+                    auto &counts = reports[group];
+                    evaluator.multiply(centered.ciphertexts[group], inverse_ct, value);
+                    evaluator.relinearize_inplace(value, context.relinearization_keys);
+                    ++counts.ciphertext_multiplications;
+                    ++counts.relinearizations;
+                    const auto &channel = program->channels[group];
+                    seal::Ciphertext conjugated;
+                    if (channel.minus || normalized_residual) {
+                        evaluator.complex_conjugate(value, context.galois_keys, conjugated);
+                        ++counts.conjugations;
+                    }
+                    if (normalized_residual) {
+                        for (std::size_t component = 0; component < 2; ++component) {
+                            const auto ct = 2 * group + component;
+                            if (ct >= normalized_residual->ciphertexts.size()) break;
+                            auto &output = normalized_residual->ciphertexts[ct];
+                            if (program->residual_gains[ct]) {
+                                if (component == 0) evaluator.add(value, conjugated, output);
+                                else evaluator.sub(value, conjugated, output);
+                                evaluator.multiply_plain_inplace(output, *program->residual_gains[ct]);
+                                ++counts.ciphertext_plain_multiplications;
+                            } else {
+                                seal::Encryptor encryptor(*context.context, context.public_key);
+                                encryptor.encrypt_zero(input_id, output);
+                                output.scale() = residual_target * DroppedPrime(context, input_id);
+                            }
+                            evaluator.rescale_to_next_inplace(output);
+                            auto normalized = NormalizeScale(output, residual_target);
+                            if (!normalized.ok()) return normalized.status();
+                            evaluator.add_plain_inplace(output, *program->residual_biases[ct]);
+                            ++counts.rescales;
+                        }
+                    }
+                    if (channel.minus) {
+                        evaluator.multiply_plain_inplace(conjugated, *channel.minus);
+                        evaluator.multiply_plain_inplace(value, *channel.plus);
+                        evaluator.add_inplace(value, conjugated);
+                        counts.ciphertext_plain_multiplications += 2;
+                    } else {
+                        evaluator.multiply_plain_inplace(value, *channel.plus);
+                        ++counts.ciphertext_plain_multiplications;
+                    }
+                    evaluator.rescale_to_next_inplace(value);
+                    auto normalized = NormalizeScale(value, target);
+                    if (!normalized.ok()) return normalized.status();
+                    ++counts.rescales;
+                    evaluator.add_plain_inplace(value, *channel.bias);
+                }
+                return {};
+            }, detail::EstimatedHeWorkerBytes(context.parameters.polynomial_degree,
+                context.parameters.coefficient_modulus_bits.size(), 8));
+        if (!evaluated.ok()) return evaluated.status();
+        if (report) for (const auto &counts : reports) {
+            report->ciphertext_multiplications += counts.ciphertext_multiplications;
+            report->relinearizations += counts.relinearizations;
+            report->ciphertext_plain_multiplications += counts.ciphertext_plain_multiplications;
+            report->conjugations += counts.conjugations;
+            report->rescales += counts.rescales;
+        }
     }
     result.logical_spec.he_region = HeRegionId::kRegion5;
     result.logical_spec.he_parameter_profile = context.profile;
     result.logical_spec.planned_level = input_level + 1;
-    result.logical_spec.planned_scale_bits = affine_scale_bits;
+    result.logical_spec.planned_scale_bits = affine_bits;
     return result;
 }
 
 namespace {
 
-struct ProjectionKey {
-    std::size_t source_ct{};
-    std::size_t target_ct{};
-    ComplexLane source_component{ComplexLane::kReal};
-    int rotation{};
-    bool operator<(const ProjectionKey &other) const noexcept
-    {
-        return std::tie(source_ct, target_ct, source_component, rotation) <
-               std::tie(other.source_ct, other.target_ct,
-                        other.source_component, other.rotation);
-    }
+struct ColumnBsgsSplit {
+    std::size_t baby{}, giant{}, stride{}, columns{};
+    bool raw_complex{};
 };
+
+Result<ColumnBsgsSplit> ColumnSplit(const HePackingPlan &input,
+                                   const HePackingPlan &output)
+{
+    if (input.logical_shape.dimensions.size() != 2 ||
+        output.logical_shape.dimensions.size() != 2 ||
+        input.logical_shape.dimensions[0] != output.logical_shape.dimensions[0] ||
+        input.slot_count != output.slot_count)
+        return Status::Invalid("column BSGS packing shapes differ");
+    const auto check = [](const HePackingPlan &plan) -> Result<bool> {
+        bool real = true;
+        for (const auto &locations : plan.logical_locations) {
+            if (locations.size() != 1)
+                return Status::Invalid("column BSGS requires one physical lane");
+            real &= locations.front().component == ComplexLane::kReal;
+        }
+        auto expected = real
+            ? FfnGeluPackingPlanner::RealColumns(plan.logical_shape, plan.slot_count, plan.layout)
+            : FfnGeluPackingPlanner::ComplexColumns(plan.logical_shape, plan.slot_count, plan.layout);
+        if (!expected.ok()) return expected.status();
+        auto same = SamePacking(plan, expected.value());
+        if (!same.ok()) return same.status();
+        // A complex layout can have no logical imaginary features in its
+        // tail; those unused lanes still must be excluded from the product.
+        return real && plan.layout == Layout::kStrictColumn;
+    };
+    auto in_real = check(input), out_real = check(output);
+    if (!in_real.ok()) return in_real.status();
+    if (!out_real.ok()) return out_real.status();
+    const auto stride = NextPowerOfTwo(input.logical_shape.dimensions[0]);
+    const auto columns = input.slot_count / stride;
+    const bool raw = !in_real.value() && out_real.value();
+    std::vector<bool> used_bases(2 * input.ciphertext_count);
+    for (std::size_t feature = 0; feature < input.logical_shape.dimensions[1]; ++feature) {
+        const auto &loc = input.Locations(feature).front();
+        used_bases[2 * loc.ciphertext + (raw || loc.component == ComplexLane::kReal ? 0 : 1)] = true;
+    }
+    const auto bases = static_cast<std::size_t>(std::count(used_bases.begin(), used_bases.end(), true));
+    std::size_t best = 1;
+    double cost = std::numeric_limits<double>::infinity();
+    for (std::size_t baby = 1; baby <= columns; baby <<= 1U) {
+        const auto candidate = ProjectionBsgsCost(bases, output.ciphertext_count, columns,
+            baby, input.slot_count, raw, !in_real.value() && !raw);
+        if (candidate < cost) { cost = candidate; best = baby; }
+    }
+    if (!std::isfinite(cost)) return Status::Invalid("column projection baby override must divide its columns");
+    return ColumnBsgsSplit{best, columns / best, stride, columns, raw};
+}
 
 Complex ExtractionFactor(ComplexLane component)
 {
@@ -632,7 +718,7 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
                 "prepared column projection output contract mismatch");
         PreparedProjectionCounts prepared_counts;
         auto ciphertexts = EvaluatePreparedProjection(
-            *prepared.value(), input, context, &prepared_counts);
+            *prepared.value(), input, context, &prepared_counts, nullptr, he_workers);
         if (!ciphertexts.ok()) return ciphertexts.status();
         if (counts) {
             counts->rotations += prepared_counts.rotations;
@@ -658,257 +744,164 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
         result.physical_packing = prepared.value()->output_packing;
         return result;
     }
-    std::map<ProjectionKey, std::vector<Complex>> masks;
-    for (std::size_t token = 0; token < tokens; ++token) {
-        for (std::size_t output = 0; output < output_width; ++output) {
-            const auto &destination = output_packing.Locations(
-                token * output_width + output).front();
-            for (std::size_t feature = 0; feature < input_width;
-                 ++feature) {
-                const auto coefficient =
-                    weights.row_major[feature * output_width + output];
-                if (coefficient == 0.0) continue;
-                const auto &source = input.physical_packing.Locations(
-                    token * input_width + feature).front();
-                const int rotation = CanonicalRotation(
-                    static_cast<long long>(source.slot) -
-                    static_cast<long long>(destination.slot),
-                    context.slot_count());
-                ProjectionKey key{source.ciphertext, destination.ciphertext,
-                                  source.component, rotation};
-                auto inserted = masks.try_emplace(
-                    key, context.slot_count(), Complex{});
-                inserted.first->second[destination.slot] +=
-                    coefficient *
-                    ExtractionFactor(source.component) *
-                    DestinationFactor(destination.component);
-            }
-        }
-    }
-    if (cache.first && cache.first->preparing_plaintexts()) {
-        const auto input_id = input.ciphertexts.front().parms_id();
-        const auto next = context.context->get_context_data(input_id)
-                              ->next_context_data();
-        if (!next)
-            return Status::FailedPrecondition(
-                "column projection preparation has no next level");
-        const double target = std::ldexp(1.0, output_scale_bits);
-        const double plain_scale = target * DroppedPrime(context, input_id) /
-            input.ciphertexts.front().scale();
-        seal::CKKSEncoder encoder(*context.context);
-        auto prepared = std::make_shared<PreparedProjectionPlan>();
-        prepared->profile = context.profile;
-        prepared->input_parms_id = input_id;
-        prepared->input_scale = input.ciphertexts.front().scale();
-        prepared->input_packing = input.physical_packing;
-        prepared->output_packing = output_packing;
-        prepared->bias_plaintexts.resize(output_packing.ciphertext_count);
-        prepared->output_scale_bits = output_scale_bits;
-        prepared->scale_tolerance = 1e-5;
-        std::vector<bool> initialized(output_packing.ciphertext_count);
-        for (const auto &entry : masks) {
-            auto encoded = CompileModelPlaintext(
-                encoder, entry.second, input_id, plain_scale,
-                "ffn.projection.diagonal");
-            if (!encoded.ok()) return encoded.status();
-            const auto &key = entry.first;
-            prepared->groups.push_back({
-                key.target_ct, 0,
-                {{key.source_ct, key.source_component, key.rotation,
-                  encoded.take_value()}}});
-            initialized[key.target_ct] = true;
-        }
-        for (std::size_t ct = 0; ct < initialized.size(); ++ct) {
-            if (!initialized[ct])
-                return Status::Internal(
-                    "projection produced an empty ciphertext group");
-            if (!bias) continue;
-            std::vector<Complex> slots(context.slot_count());
-            for (std::size_t logical = 0;
-                 logical < output_packing.logical_locations.size(); ++logical) {
-                const auto &location =
-                    output_packing.Locations(logical).front();
-                if (location.ciphertext != ct) continue;
-                const double value = bias->values[logical % output_width];
-                if (location.component == ComplexLane::kReal)
-                    slots[location.slot].real(value);
-                else
-                    slots[location.slot].imag(value);
-            }
-            auto encoded = CompileModelPlaintext(
-                encoder, slots, input_id,
-                input.ciphertexts.front().scale() * plain_scale,
-                "ffn.projection.bias");
-            if (!encoded.ok()) return encoded.status();
-            prepared->bias_plaintexts[ct] = encoded.take_value();
-        }
-        auto stored = cache.first->PutPreparedProjection(
-            prepared_key, std::move(prepared));
-        if (!stored.ok()) return stored.status();
-        SealCipherTensor result;
-        result.parameter_profile = context.profile;
-        result.ciphertexts.resize(output_packing.ciphertext_count);
-        for (auto &ct : result.ciphertexts) {
-            ct.parms_id() = next->parms_id();
-            ct.scale() = target;
-        }
-        result.logical_spec.shape = output_packing.logical_shape;
-        result.logical_spec.domain = Domain::kHeCiphertext;
-        result.logical_spec.layout = output_packing.layout;
-        result.logical_spec.numeric = input.logical_spec.numeric;
-        result.logical_spec.he_region = output_region;
-        result.logical_spec.he_parameter_profile = context.profile;
-        auto input_level = LevelOf(context, input_id);
-        if (!input_level.ok()) return input_level.status();
-        result.logical_spec.planned_level = input_level.value() + 1;
-        result.logical_spec.planned_scale_bits = output_scale_bits;
-        result.physical_packing = output_packing;
-        return result;
-    }
-    std::vector<seal::Ciphertext> output(
-        output_packing.ciphertext_count);
-    std::map<std::pair<std::size_t, ComplexLane>, seal::Ciphertext> extracted;
+    auto split_result = ColumnSplit(input.physical_packing, output_packing);
+    if (!split_result.ok()) return split_result.status();
+    const auto split = split_result.value();
+    const auto input_id = input.ciphertexts.front().parms_id();
+    const auto data = context.context->get_context_data(input_id);
+    const auto next = data->next_context_data();
+    if (!next) return Status::FailedPrecondition("column projection has no next level");
     const double target = std::ldexp(1.0, output_scale_bits);
-    seal::Evaluator extraction_evaluator(*context.context);
-    for (const auto &entry : masks) {
-        const auto base_key = std::make_pair(entry.first.source_ct,
-                                             entry.first.source_component);
-        auto base = extracted.find(base_key);
-        if (base == extracted.end()) {
-            const auto &source = input.ciphertexts[entry.first.source_ct];
-            seal::Ciphertext conjugated;
-            extraction_evaluator.complex_conjugate(
-                source, context.galois_keys, conjugated);
-            seal::Ciphertext component;
-            if (entry.first.source_component == ComplexLane::kReal)
-                extraction_evaluator.add(source, conjugated, component);
-            else
-                extraction_evaluator.sub(source, conjugated, component);
-            base = extracted.emplace(base_key, std::move(component)).first;
-            if (counts) ++counts->conjugations;
+    const double plain_scale = target * DroppedPrime(context, input_id) /
+                               input.ciphertexts.front().scale();
+    auto prepared = std::make_shared<PreparedProjectionPlan>();
+    prepared->profile = context.profile;
+    prepared->input_parms_id = input_id;
+    prepared->input_scale = input.ciphertexts.front().scale();
+    prepared->input_packing = input.physical_packing;
+    prepared->output_packing = output_packing;
+    prepared->output_scale_bits = output_scale_bits;
+    prepared->scale_tolerance = 1e-5;
+    prepared->reuse_baby_rotations = true;
+    prepared->raw_complex_input = split.raw_complex;
+    prepared->realify_output = split.raw_complex;
+    prepared->bias_after_rescale = true;
+    prepared->bias_plaintexts.resize(output_packing.ciphertext_count);
+    prepared->real_input = input.logical_spec.layout == Layout::kStrictColumn &&
+        std::all_of(input.physical_packing.logical_locations.begin(),
+        input.physical_packing.logical_locations.end(), [](const auto &locations) {
+            return locations.front().component == ComplexLane::kReal;
+        });
+    if (split.raw_complex) {
+        // Exact scale-1 phase: both Wd weight channels stay real-only.
+        const auto degree = data->parms().poly_modulus_degree();
+        const auto primes = data->parms().coeff_modulus().size();
+        seal::Plaintext phase(degree * primes);
+        std::fill_n(phase.data(), phase.coeff_count(), std::uint64_t{0});
+        for (std::size_t rns = 0; rns < primes; ++rns) {
+            phase[rns * degree + degree / 2] = 1;
+            seal::util::ntt_negacyclic_harvey(
+                phase.data() + rns * degree, data->small_ntt_tables()[rns]);
         }
+        phase.parms_id() = input_id;
+        phase.scale() = 1.0;
+        prepared->fixed_phase = std::make_shared<const seal::Plaintext>(std::move(phase));
     }
-    using MaskIterator = decltype(masks)::const_iterator;
-    std::vector<std::vector<MaskIterator>> entries(output.size());
-    for (auto entry = masks.cbegin(); entry != masks.cend(); ++entry)
-        entries[entry->first.target_ct].push_back(entry);
-    std::vector<HeKernelOperationCounts> per_output(output.size());
-    std::shared_ptr<PreparedProjectionPlan> prepared;
-    std::vector<std::vector<PreparedProjectionGroup>> per_output_plan;
-    if (cache.first) {
-        prepared = std::make_shared<PreparedProjectionPlan>();
-        prepared->profile = context.profile;
-        prepared->input_parms_id = input.ciphertexts.front().parms_id();
-        prepared->input_scale = input.ciphertexts.front().scale();
-        prepared->input_packing = input.physical_packing;
-        prepared->output_packing = output_packing;
-        prepared->bias_plaintexts.resize(output.size());
-        prepared->output_scale_bits = output_scale_bits;
-        prepared->scale_tolerance = 1e-5;
-        per_output_plan.resize(output.size());
+    const auto absent = std::numeric_limits<std::size_t>::max();
+    using Columns = std::vector<std::size_t>;
+    std::vector<std::array<Columns, 2>> sources(input.ciphertexts.size()),
+        destinations(output_packing.ciphertext_count);
+    for (auto *table : {&sources, &destinations})
+        for (auto &ct : *table) for (auto &lane : ct) lane.assign(split.columns, absent);
+    for (std::size_t feature = 0; feature < input_width; ++feature) {
+        const auto &loc = input.physical_packing.Locations(feature).front();
+        sources[loc.ciphertext][loc.component == ComplexLane::kReal ? 0 : 1]
+            [loc.slot / split.stride] = feature;
     }
-    auto projected = detail::ParallelRanges(
-        output.size(), std::min<std::size_t>(he_workers, 2), 1,
-        [&](std::size_t begin, std::size_t end) -> Result<void> {
-            std::optional<ModelPlaintextCacheScope> cache_scope;
-            if (cache.first) cache_scope.emplace(cache.first, cache.second);
-            seal::Evaluator evaluator(*context.context);
-            seal::CKKSEncoder encoder(*context.context);
-            for (std::size_t ct = begin; ct < end; ++ct) {
-                auto &local_counts = per_output[ct];
-                bool initialized = false;
-                for (const auto &entry : entries[ct]) {
-                    const auto base_key = std::make_pair(
-                        entry->first.source_ct, entry->first.source_component);
-                    auto rotated = extracted.at(base_key);
-                    if (entry->first.rotation != 0) {
-                        evaluator.rotate_vector_inplace(
-                            rotated, entry->first.rotation, context.galois_keys);
-                        ++local_counts.rotations;
+    for (std::size_t feature = 0; feature < output_width; ++feature) {
+        const auto &loc = output_packing.Locations(feature).front();
+        destinations[loc.ciphertext][loc.component == ComplexLane::kReal ? 0 : 1]
+            [loc.slot / split.stride] = feature;
+    }
+    seal::CKKSEncoder encoder(*context.context);
+    // Stream one diagonal mask at a time. Never materialize all slot vectors.
+    std::vector<Complex> mask(context.slot_count());
+    for (std::size_t out = 0; out < destinations.size(); ++out) {
+        for (std::size_t giant = 0; giant < split.giant; ++giant) {
+            const auto giant_columns = giant * split.baby;
+            PreparedProjectionGroup group{out, CanonicalRotation(
+                giant_columns * split.stride, context.slot_count()), {}};
+            for (std::size_t source = 0; source < sources.size(); ++source)
+                for (std::size_t component = 0; component < 2; ++component)
+                    for (std::size_t baby = 0; baby < split.baby; ++baby) {
+                        std::fill(mask.begin(), mask.end(), Complex{});
+                        bool nonzero = false;
+                        for (std::size_t column = 0; column < split.columns; ++column) {
+                            const auto feature = sources[source][component]
+                                [(column + giant_columns + baby) % split.columns];
+                            if (feature == absent) continue;
+                            for (std::size_t lane = 0; lane < 2; ++lane) {
+                                const auto destination = destinations[out][lane][column];
+                                if (destination == absent) continue;
+                                const auto weight = weights.row_major[feature * output_width + destination];
+                                if (weight == 0.0) continue;
+                                for (std::size_t token = 0; token < tokens; ++token) {
+                                    const auto slot = ((column + giant_columns) % split.columns) *
+                                                      split.stride + token;
+                                    Complex factor;
+                                    if (split.raw_complex)
+                                        factor = component == 0 ? Complex{0.5, 0.0}
+                                            : Complex{slot % 2 == 0 ? -0.5 : 0.5, 0.0};
+                                    else factor = (prepared->real_input ? Complex{1.0, 0.0}
+                                        : ExtractionFactor(component == 0 ? ComplexLane::kReal : ComplexLane::kImaginary)) *
+                                        DestinationFactor(lane == 0 ? ComplexLane::kReal : ComplexLane::kImaginary);
+                                    mask[slot] += weight * factor;
+                                }
+                                nonzero = true;
+                            }
+                        }
+                        if (!nonzero) continue;
+                        auto encoded = CompileProjectionPlaintext(encoder, mask, input_id,
+                            plain_scale, "ffn.projection.diagonal", context);
+                        if (!encoded.ok()) return encoded.status();
+                        PreparedProjectionTerm term{source,
+                            split.raw_complex || component == 0 ? ComplexLane::kReal : ComplexLane::kImaginary,
+                            CanonicalRotation(baby * split.stride, context.slot_count()), encoded.take_value()};
+                        if (split.raw_complex && component == 1)
+                            group.phase_terms.push_back(std::move(term));
+                        else group.terms.push_back(std::move(term));
                     }
-                    const double plain_scale = target * DroppedPrime(
-                        context, rotated.parms_id()) / rotated.scale();
-                    auto encoded = CompileModelPlaintext(
-                        encoder, entry->second, rotated.parms_id(), plain_scale,
-                        "ffn.projection.diagonal");
-                    if (!encoded.ok()) return encoded.status();
-                    auto plain = encoded.take_value();
-                    if (prepared)
-                        per_output_plan[ct].push_back({
-                            ct, 0, {{entry->first.source_ct,
-                                     entry->first.source_component,
-                                     entry->first.rotation, plain}}});
-                    evaluator.multiply_plain_inplace(rotated, *plain);
-                    ++local_counts.ciphertext_plain_multiplications;
-                    if (!initialized) {
-                        output[ct] = std::move(rotated);
-                        initialized = true;
-                    } else {
-                        evaluator.add_inplace(output[ct], rotated);
-                    }
-                }
-                if (!initialized)
-                    return Status::Internal(
-                        "projection produced an empty ciphertext group");
-                if (bias) {
-                    std::vector<Complex> slots(context.slot_count());
-                    for (std::size_t logical = 0;
-                         logical < output_packing.logical_locations.size();
-                         ++logical) {
-                        const auto &location =
-                            output_packing.Locations(logical).front();
-                        if (location.ciphertext != ct) continue;
-                        const double value = bias->values[logical % output_width];
-                        if (location.component == ComplexLane::kReal)
-                            slots[location.slot].real(value);
-                        else
-                            slots[location.slot].imag(value);
-                    }
-                    auto encoded_bias = CompileModelPlaintext(
-                        encoder, slots, output[ct].parms_id(), output[ct].scale(),
-                        "ffn.projection.bias");
-                    if (!encoded_bias.ok()) return encoded_bias.status();
-                    auto plain = encoded_bias.take_value();
-                    if (prepared) prepared->bias_plaintexts[ct] = plain;
-                    evaluator.add_plain_inplace(output[ct], *plain);
-                }
-                evaluator.rescale_to_next_inplace(output[ct]);
-                auto normalized = NormalizeScale(output[ct], target);
-                if (!normalized.ok()) return normalized.status();
-                ++local_counts.rescales;
-            }
-            return {};
-        }, detail::EstimatedHeWorkerBytes(
-            context.parameters.polynomial_degree,
-            context.parameters.coefficient_modulus_bits.size(), 12));
-    if (!projected.ok()) return projected.status();
-    if (counts)
-        for (const auto &local : per_output) {
-            counts->rotations += local.rotations;
-            counts->ciphertext_plain_multiplications +=
-                local.ciphertext_plain_multiplications;
-            counts->rescales += local.rescales;
-        }
-    if (prepared) {
-        for (auto &groups : per_output_plan)
-            for (auto &group : groups)
+            if (!group.terms.empty() || !group.phase_terms.empty())
                 prepared->groups.push_back(std::move(group));
-        auto stored = cache.first->PutPreparedProjection(
-            prepared_key, std::move(prepared));
+        }
+        if (!bias) continue;
+        std::fill(mask.begin(), mask.end(), Complex{});
+        for (std::size_t lane = 0; lane < 2; ++lane)
+            for (std::size_t column = 0; column < split.columns; ++column) {
+                const auto feature = destinations[out][lane][column];
+                if (feature == absent) continue;
+                for (std::size_t token = 0; token < tokens; ++token)
+                    mask[column * split.stride + token] += bias->values[feature] *
+                        DestinationFactor(lane == 0 ? ComplexLane::kReal : ComplexLane::kImaginary);
+            }
+        auto encoded = CompileModelPlaintext(encoder, mask, next->parms_id(),
+                                              target, "ffn.projection.bias");
+        if (!encoded.ok()) return encoded.status();
+        prepared->bias_plaintexts[out] = encoded.take_value();
+    }
+    const bool preparing = cache.first && cache.first->preparing_plaintexts();
+    std::vector<seal::Ciphertext> output;
+    if (preparing) {
+        output.resize(output_packing.ciphertext_count);
+        for (auto &ct : output) { ct.parms_id() = next->parms_id(); ct.scale() = target; }
+    } else {
+        PreparedProjectionCounts evaluated_counts;
+        auto evaluated = EvaluatePreparedProjection(*prepared, input, context,
+            &evaluated_counts, nullptr, he_workers);
+        if (!evaluated.ok()) return evaluated.status();
+        output = evaluated.take_value();
+        if (counts) {
+            counts->rotations += evaluated_counts.rotations;
+            counts->conjugations += evaluated_counts.conjugations;
+            counts->ciphertext_plain_multiplications += evaluated_counts.ciphertext_plain_multiplications;
+            counts->rescales += evaluated_counts.rescales;
+        }
+    }
+    if (cache.first) {
+        auto stored = cache.first->PutPreparedProjection(prepared_key, prepared);
         if (!stored.ok()) return stored.status();
     }
     SealCipherTensor result;
     result.parameter_profile = context.profile;
     result.ciphertexts = std::move(output);
+    result.logical_spec = input.logical_spec;
     result.logical_spec.shape = output_packing.logical_shape;
-    result.logical_spec.domain = Domain::kHeCiphertext;
     result.logical_spec.layout = output_packing.layout;
-    result.logical_spec.numeric = input.logical_spec.numeric;
     result.logical_spec.he_region = output_region;
     result.logical_spec.he_parameter_profile = context.profile;
-    auto input_level = LevelOf(context, input.ciphertexts.front().parms_id());
-    if (!input_level.ok()) return input_level.status();
-    result.logical_spec.planned_level = input_level.value() + 1;
+    auto level = LevelOf(context, input_id);
+    if (!level.ok()) return level.status();
+    result.logical_spec.planned_level = level.value() + 1;
     result.logical_spec.planned_scale_bits = output_scale_bits;
     result.physical_packing = output_packing;
     return result;
@@ -928,37 +921,29 @@ Result<std::vector<int>> ComplexColumnProjectionKernel::RequiredRotationSteps(
             output_packing.logical_shape.dimensions[0] ||
         input_packing.slot_count != output_packing.slot_count)
         return Status::Invalid("projection rotation plans are incompatible");
-    const auto tokens = input_packing.logical_shape.dimensions[0];
+    auto split = ColumnSplit(input_packing, output_packing);
+    if (!split.ok()) return split.status();
+    std::set<int> steps{0}; // zero requests the conjugation automorphism.
+    // Tail matrices need only the offsets which can contain a coefficient.
+    // Generating all F offsets for tiny widths wastes large Galois keys.
     const auto in_width = input_packing.logical_shape.dimensions[1];
     const auto out_width = output_packing.logical_shape.dimensions[1];
-    const auto slots = input_packing.slot_count;
-    std::vector<unsigned char> required(slots, 0);
-    for (std::size_t token = 0; token < tokens; ++token) {
-        std::vector<std::size_t> sources, destinations;
-        sources.reserve(in_width);
-        destinations.reserve(out_width);
-        for (std::size_t input = 0; input < in_width; ++input)
-            sources.push_back(input_packing.Locations(
-                token * in_width + input).front().slot);
-        for (std::size_t output = 0; output < out_width; ++output)
-            destinations.push_back(output_packing.Locations(
-                token * out_width + output).front().slot);
-        std::sort(sources.begin(), sources.end());
-        sources.erase(std::unique(sources.begin(), sources.end()),
-                      sources.end());
-        std::sort(destinations.begin(), destinations.end());
-        destinations.erase(
-            std::unique(destinations.begin(), destinations.end()),
-            destinations.end());
-        for (const auto source : sources)
-            for (const auto destination : destinations)
-                required[(source + slots - destination) % slots] = 1;
+    std::vector<bool> sources(split.value().columns), destinations(split.value().columns);
+    for (std::size_t i = 0; i < in_width; ++i)
+        sources[input_packing.Locations(i).front().slot / split.value().stride] = true;
+    for (std::size_t i = 0; i < out_width; ++i)
+        destinations[output_packing.Locations(i).front().slot / split.value().stride] = true;
+    for (std::size_t source = 0; source < sources.size(); ++source) {
+        if (!sources[source]) continue;
+        for (std::size_t destination = 0; destination < destinations.size(); ++destination) {
+            if (!destinations[destination]) continue;
+            const auto diagonal = (source + split.value().columns - destination) % split.value().columns;
+            const auto baby = diagonal % split.value().baby;
+            const auto giant = diagonal - baby;
+            if (baby) steps.insert(CanonicalRotation(baby * split.value().stride, input_packing.slot_count));
+            if (giant) steps.insert(CanonicalRotation(giant * split.value().stride, input_packing.slot_count));
+        }
     }
-    std::set<int> steps{0};
-    for (std::size_t residue = 1; residue < slots; ++residue)
-        if (required[residue])
-            steps.insert(CanonicalRotation(
-                static_cast<long long>(residue), slots));
     return std::vector<int>(steps.begin(), steps.end());
 }
 
@@ -975,12 +960,12 @@ Result<SealCipherTensor> FfnUpProjectionKernel::Evaluate(
             TensorShape{{layer.tokens, layer.model_width}} ||
         input.logical_spec.layout != Layout::kComplexStrictColumn)
         return Status::Invalid("Wu projection contract mismatch");
-    auto plans = FfnGeluPackingPlanner::Build(layer, context.slot_count());
+    auto plans = FfnGeluPackingPlanner::GetShared(layer, context.slot_count());
     if (!plans.ok()) return plans.status();
     HeKernelOperationCounts counts;
     auto result = ComplexColumnProjectionKernel::Evaluate(
-        input, weights, bias, plans.value().projected,
-        HeRegionId::kRegion5, context.parameters.default_scale_bits,
+        input, weights, bias, plans.value()->projected,
+        HeRegionId::kRegion5, context.parameters.output_scale_bits,
         context, &counts, he_workers);
     if (report) {
         report->rotations += counts.rotations;
@@ -992,12 +977,22 @@ Result<SealCipherTensor> FfnUpProjectionKernel::Evaluate(
     return result;
 }
 
+namespace {
+struct PreparedRealify final : PreparedBlock2Program {
+    std::string profile;
+    seal::parms_id_type input_id{};
+    double input_scale{}, output_scale{}, residual_scale{};
+    std::shared_ptr<const seal::Plaintext> real, imaginary;
+};
+} // namespace
+
 Result<SealCipherTensor> ComplexColumnRealifyKernel::Evaluate(
     const SealCipherTensor &input,
     const HePackingPlan &real_output_packing,
     int output_scale_bits,
     const HeContext &context,
-    HeKernelOperationCounts *counts)
+    HeKernelOperationCounts *counts,
+    std::size_t he_workers)
 {
     auto valid = input.Validate(context);
     if (!valid.ok()) return valid.status();
@@ -1022,53 +1017,88 @@ Result<SealCipherTensor> ComplexColumnRealifyKernel::Evaluate(
     if (!expected_output.ok()) return expected_output.status();
     same = SamePacking(real_output_packing, expected_output.value());
     if (!same.ok()) return same.status();
-    seal::Evaluator evaluator(*context.context);
-    seal::CKKSEncoder encoder(*context.context);
-    std::vector<seal::Ciphertext> output(real_output_packing.ciphertext_count);
+    const auto input_id = input.ciphertexts.front().parms_id();
+    const auto next = context.context->get_context_data(input_id)->next_context_data();
+    if (!next) return Status::FailedPrecondition("realify has no next CKKS level");
     const double wanted = std::ldexp(1.0, output_scale_bits);
-    for (std::size_t group = 0; group < input.ciphertexts.size(); ++group) {
-        const auto &source = input.ciphertexts[group];
-        seal::Ciphertext conjugated;
-        evaluator.complex_conjugate(source, context.galois_keys, conjugated);
-        seal::Ciphertext real;
-        evaluator.add(source, conjugated, real);
-        const double plain_scale = wanted * DroppedPrime(
-            context, real.parms_id()) / real.scale();
-        std::vector<Complex> real_factor(
-            context.slot_count(), Complex{0.5, 0.0});
-        seal::Plaintext real_plain;
-        encoder.encode(real_factor, real.parms_id(), plain_scale, real_plain);
-        evaluator.multiply_plain_inplace(real, real_plain);
-        evaluator.rescale_to_next_inplace(real);
-        auto normalized = NormalizeScale(real, wanted);
-        if (!normalized.ok()) return normalized.status();
-        const auto real_index = 2 * group;
-        if (real_index < output.size()) output[real_index] = std::move(real);
-        const auto imaginary_begin =
-            (2 * group + 1) * columns;
-        if (imaginary_begin < width) {
-            seal::Ciphertext imaginary;
-            evaluator.sub(source, conjugated, imaginary);
-            std::vector<Complex> factor(
-                context.slot_count(),
-                Complex{0.0, -0.5});
-            seal::Plaintext factor_plain;
-            encoder.encode(factor, imaginary.parms_id(), plain_scale,
-                           factor_plain);
-            evaluator.multiply_plain_inplace(imaginary, factor_plain);
-            evaluator.rescale_to_next_inplace(imaginary);
-            normalized = NormalizeScale(imaginary, wanted);
-            if (!normalized.ok()) return normalized.status();
-            output[real_index + 1] = std::move(imaginary);
-            if (counts) {
-                ++counts->ciphertext_plain_multiplications;
-                ++counts->rescales;
-            }
+    const double source_scale = input.ciphertexts.front().scale();
+    for (const auto &ct : input.ciphertexts)
+        if (ct.parms_id() != input_id || !CloseScale(ct.scale(), source_scale))
+            return Status::FailedPrecondition("realify input level/scale is inconsistent");
+    const auto cache = ModelPlaintextCacheScope::Current();
+    const auto key = cache.second + "/ffn/realify/" + std::to_string(output_scale_bits);
+    std::shared_ptr<const PreparedRealify> program;
+    if (cache.first && !cache.first->preparing_plaintexts()) {
+        auto loaded = cache.first->GetPreparedBlock2Program(key);
+        if (!loaded.ok()) return loaded.status();
+        program = std::dynamic_pointer_cast<const PreparedRealify>(loaded.value());
+        if (!program || program->profile != context.profile || program->input_id != input_id ||
+            !CloseScale(program->input_scale, source_scale) || program->output_scale != wanted)
+            return Status::FailedPrecondition("prepared realify contract mismatch");
+    } else {
+        auto compiled = std::make_shared<PreparedRealify>();
+        compiled->profile = context.profile;
+        compiled->input_id = input_id;
+        compiled->input_scale = source_scale;
+        compiled->output_scale = wanted;
+        seal::CKKSEncoder encoder(*context.context);
+        const double plain_scale = wanted * DroppedPrime(context, input_id) / source_scale;
+        auto encoded = CompileModelPlaintext(encoder,
+            std::vector<Complex>(context.slot_count(), Complex{0.5, 0.0}),
+            input_id, plain_scale, "ffn.realify.constant");
+        if (!encoded.ok()) return encoded.status();
+        compiled->real = encoded.take_value();
+        encoded = CompileModelPlaintext(encoder,
+            std::vector<Complex>(context.slot_count(), Complex{0.0, -0.5}),
+            input_id, plain_scale, "ffn.realify.constant");
+        if (!encoded.ok()) return encoded.status();
+        compiled->imaginary = encoded.take_value();
+        program = compiled;
+        if (cache.first) {
+            auto stored = cache.first->PutPreparedBlock2Program(key, compiled);
+            if (!stored.ok()) return stored.status();
         }
-        if (counts) {
-            ++counts->conjugations;
-            ++counts->ciphertext_plain_multiplications;
-            ++counts->rescales;
+    }
+    std::vector<seal::Ciphertext> output(real_output_packing.ciphertext_count);
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        for (auto &ct : output) { ct.parms_id() = next->parms_id(); ct.scale() = wanted; }
+    } else {
+        std::vector<HeKernelOperationCounts> reports(input.ciphertexts.size());
+        auto evaluated = detail::ParallelRanges(input.ciphertexts.size(),
+            he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator evaluator(*context.context);
+                for (std::size_t group = begin; group < end; ++group) {
+                    const auto &source = input.ciphertexts[group];
+                    seal::Ciphertext conjugated;
+                    evaluator.complex_conjugate(source, context.galois_keys, conjugated);
+                    ++reports[group].conjugations;
+                    auto &real = output[2 * group];
+                    evaluator.add(source, conjugated, real);
+                    evaluator.multiply_plain_inplace(real, *program->real);
+                    evaluator.rescale_to_next_inplace(real);
+                    auto normalized = NormalizeScale(real, wanted);
+                    if (!normalized.ok()) return normalized.status();
+                    ++reports[group].ciphertext_plain_multiplications;
+                    ++reports[group].rescales;
+                    if ((2 * group + 1) * columns >= width) continue;
+                    auto &imaginary = output[2 * group + 1];
+                    evaluator.sub(source, conjugated, imaginary);
+                    evaluator.multiply_plain_inplace(imaginary, *program->imaginary);
+                    evaluator.rescale_to_next_inplace(imaginary);
+                    normalized = NormalizeScale(imaginary, wanted);
+                    if (!normalized.ok()) return normalized.status();
+                    ++reports[group].ciphertext_plain_multiplications;
+                    ++reports[group].rescales;
+                }
+                return {};
+            }, detail::EstimatedHeWorkerBytes(context.parameters.polynomial_degree,
+                context.parameters.coefficient_modulus_bits.size(), 8));
+        if (!evaluated.ok()) return evaluated.status();
+        if (counts) for (const auto &local : reports) {
+            counts->conjugations += local.conjugations;
+            counts->ciphertext_plain_multiplications += local.ciphertext_plain_multiplications;
+            counts->rescales += local.rescales;
         }
     }
     SealCipherTensor result;
@@ -1084,26 +1114,33 @@ Result<SealCipherTensor> ComplexColumnRealifyKernel::Evaluate(
     return result;
 }
 
-Result<SealCipherTensor> FfnRealifyKernel::Evaluate(
-    const SealCipherTensor &input,
-    const TransformerLayerConfig &layer,
-    const HeContext &context,
-    FfnGeluExecutionReport *report)
+namespace {
+
+struct PreparedGeluPolynomial final : PreparedBlock2Program {
+    std::string profile;
+    seal::parms_id_type input_id{};
+    double scale{};
+    std::array<double, 5> coefficients{};
+    // x4, x3, x2, x and final constant, respectively.
+    std::array<std::shared_ptr<const seal::Plaintext>, 5> plaintexts;
+    std::shared_ptr<const seal::Plaintext> conversion_phase;
+};
+
+HePackingPlan GeluBranchPacking(const HePackingPlan &real)
 {
-    auto plans = FfnGeluPackingPlanner::Build(layer, context.slot_count());
-    if (!plans.ok()) return plans.status();
-    HeKernelOperationCounts counts;
-    auto result = ComplexColumnRealifyKernel::Evaluate(
-        input, plans.value().realified,
-        context.parameters.output_scale_bits, context, &counts);
-    if (report) {
-        report->conjugations += counts.conjugations;
-        report->ciphertext_plain_multiplications +=
-            counts.ciphertext_plain_multiplications;
-        report->rescales += counts.rescales;
+    auto result = real;
+    const auto count = real.logical_locations.size();
+    result.logical_shape.dimensions.insert(result.logical_shape.dimensions.begin(), 2);
+    result.layout = Layout::kFfn;
+    result.logical_locations.resize(2 * count);
+    for (std::size_t logical = 0; logical < count; ++logical) {
+        result.logical_locations[count + logical] = real.logical_locations[logical];
+        result.logical_locations[count + logical].front().component = ComplexLane::kImaginary;
     }
     return result;
 }
+
+} // namespace
 
 Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
     const SealCipherTensor &input,
@@ -1114,189 +1151,178 @@ Result<GeluPolynomialOutputs> GeluPolynomialKernel::Evaluate(
 {
     auto valid = input.Validate(context);
     if (!valid.ok()) return valid.status();
-    const double target = std::ldexp(
-        1.0, context.parameters.output_scale_bits);
-    const auto terminal_level =
-        context.parameters.coefficient_modulus_bits.size() -
-        context.parameters.terminal_prime_count;
+    if (input.logical_spec.shape.dimensions.size() != 2 ||
+        std::any_of(input.physical_packing.logical_locations.begin(),
+                    input.physical_packing.logical_locations.end(), [](const auto &locations) {
+            return locations.size() != 1 || locations.front().component != ComplexLane::kReal;
+        })) return Status::Invalid("GeLU polynomial requires real-only input lanes");
+    const double target = std::ldexp(1.0, context.parameters.output_scale_bits);
+    const auto terminal_level = context.parameters.coefficient_modulus_bits.size() -
+                                context.parameters.terminal_prime_count;
     constexpr std::size_t kPolynomialDepth = 3;
     if (terminal_level < kPolynomialDepth)
-        return Status::FailedPrecondition(
-            "GeLU polynomial needs three remaining CKKS levels");
+        return Status::FailedPrecondition("GeLU polynomial needs three remaining CKKS levels");
     const auto polynomial_input_level = terminal_level - kPolynomialDepth;
     for (const auto &ct : input.ciphertexts) {
         auto level = LevelOf(context, ct.parms_id());
         if (!level.ok()) return level.status();
-        if (level.value() != polynomial_input_level ||
-            !CloseScale(ct.scale(), target))
-            return Status::FailedPrecondition(
-                "GeLU polynomial input is not at its suffix start");
+        if (level.value() != polynomial_input_level || !CloseScale(ct.scale(), target))
+            return Status::FailedPrecondition("GeLU polynomial input is not at its suffix start");
     }
-    SealCipherTensor negative = input;
-    SealCipherTensor positive = input;
-    SealCipherTensor terminal_input = input;
     const auto terminal_id = LevelId(context, terminal_level);
+    const auto coefficients_id = LevelId(context, terminal_level - 1);
     if (!terminal_id.ok()) return terminal_id.status();
-
-    std::vector<FfnGeluExecutionReport> per_ciphertext(
-        input.ciphertexts.size());
-    auto parallel = detail::ParallelRanges(
-        input.ciphertexts.size(), std::min<std::size_t>(he_workers, 2), 1,
-        [&](std::size_t begin, std::size_t end) -> Result<void> {
-    seal::Evaluator evaluator(*context.context);
-    seal::CKKSEncoder encoder(*context.context);
-    for (std::size_t i = begin; i < end; ++i) {
-        auto *counts = report ? &per_ciphertext[i] : nullptr;
-        const auto &x = input.ciphertexts[i];
-        seal::Ciphertext x2;
-        evaluator.square(x, x2);
-        evaluator.relinearize_inplace(x2, context.relinearization_keys);
-        evaluator.rescale_to_next_inplace(x2);
-        auto scale_status = NormalizeScale(x2, target);
-        if (!scale_status.ok()) return scale_status.status();
-        if (counts) {
-            ++counts->ciphertext_multiplications;
-            ++counts->relinearizations;
-            ++counts->rescales;
+    if (!coefficients_id.ok()) return coefficients_id.status();
+    const auto cache = ModelPlaintextCacheScope::Current();
+    const auto key = cache.second + "/ffn/gelu";
+    const std::array<double, 5> coefficients{config.a, config.b, config.c, config.d, config.e};
+    for (const auto coefficient : coefficients)
+        if (!std::isfinite(coefficient)) return Status::Invalid("GeLU coefficients must be finite");
+    std::shared_ptr<const PreparedGeluPolynomial> program;
+    if (cache.first && !cache.first->preparing_plaintexts()) {
+        auto loaded = cache.first->GetPreparedBlock2Program(key);
+        if (!loaded.ok()) return loaded.status();
+        program = std::dynamic_pointer_cast<const PreparedGeluPolynomial>(loaded.value());
+        if (!program || program->profile != context.profile || program->scale != target ||
+            program->input_id != input.ciphertexts.front().parms_id() || program->coefficients != coefficients)
+            return Status::FailedPrecondition("prepared GeLU polynomial contract mismatch");
+    } else {
+        auto compiled = std::make_shared<PreparedGeluPolynomial>();
+        compiled->profile = context.profile;
+        compiled->input_id = input.ciphertexts.front().parms_id();
+        compiled->scale = target;
+        compiled->coefficients = coefficients;
+        const std::array<Complex, 5> packed{
+            Complex{config.a, config.a}, Complex{-config.b, config.b},
+            Complex{config.c, config.c}, Complex{0.5 - config.d, 0.5 + config.d},
+            Complex{config.e, config.e}};
+        seal::CKKSEncoder encoder(*context.context);
+        for (std::size_t i = 0; i < packed.size(); ++i) {
+            const auto id = i == 4 ? terminal_id.value() : coefficients_id.value();
+            const double scale = i == 4 ? target : DroppedPrime(context, coefficients_id.value());
+            auto encoded = CompileModelPlaintext(encoder,
+                std::vector<Complex>(context.slot_count(), packed[i]), id, scale,
+                "ffn.gelu.constant");
+            if (!encoded.ok()) return encoded.status();
+            compiled->plaintexts[i] = encoded.take_value();
         }
-
-        seal::Ciphertext x_at3 = x;
-        evaluator.mod_switch_to_inplace(x_at3, x2.parms_id());
-        seal::Ciphertext x3;
-        evaluator.multiply(x2, x_at3, x3);
-        evaluator.relinearize_inplace(x3, context.relinearization_keys);
-        evaluator.rescale_to_next_inplace(x3);
-        scale_status = NormalizeScale(x3, target);
-        if (!scale_status.ok()) return scale_status.status();
-        seal::Ciphertext x4;
-        evaluator.square(x2, x4);
-        evaluator.relinearize_inplace(x4, context.relinearization_keys);
-        evaluator.rescale_to_next_inplace(x4);
-        scale_status = NormalizeScale(x4, target);
-        if (!scale_status.ok()) return scale_status.status();
-        if (counts) {
-            counts->ciphertext_multiplications += 2;
-            counts->relinearizations += 2;
-            counts->rescales += 2;
-            ++counts->modulus_switches;
+        auto phase = detail::MakeRealPairPhase(context, terminal_id.value());
+        if (!phase.ok()) return phase.status();
+        compiled->conversion_phase = std::make_shared<seal::Plaintext>(phase.take_value());
+        program = compiled;
+        if (cache.first) {
+            auto stored = cache.first->PutPreparedBlock2Program(key, compiled);
+            if (!stored.ok()) return stored.status();
         }
-
-        seal::Ciphertext x_at4 = x_at3;
-        seal::Ciphertext x2_at4 = x2;
-        evaluator.mod_switch_to_inplace(x_at4, x3.parms_id());
-        evaluator.mod_switch_to_inplace(x2_at4, x3.parms_id());
-        if (counts) counts->modulus_switches += 2;
-
-        auto coefficient_term = [&](seal::Ciphertext value,
-                                    double coefficient)
-            -> Result<seal::Ciphertext> {
-            const double plain_scale = target * DroppedPrime(
-                context, value.parms_id()) / value.scale();
-            seal::Plaintext plain;
-            encoder.encode(coefficient, value.parms_id(), plain_scale, plain);
-            evaluator.multiply_plain_inplace(value, plain);
-            evaluator.rescale_to_next_inplace(value);
-            auto normalized = NormalizeScale(value, target);
-            if (!normalized.ok()) return normalized.status();
-            if (counts) {
-                ++counts->ciphertext_plain_multiplications;
-                ++counts->rescales;
-            }
-            return value;
-        };
-
-        auto t4 = coefficient_term(x4, config.a);
-        auto t2 = coefficient_term(x2_at4, config.c);
-        auto n3 = coefficient_term(x3, -config.b);
-        auto p3 = coefficient_term(x3, config.b);
-        auto n1 = coefficient_term(x_at4, 0.5 - config.d);
-        auto p1 = coefficient_term(x_at4, 0.5 + config.d);
-        if (!t4.ok()) return t4.status();
-        if (!t2.ok()) return t2.status();
-        if (!n3.ok()) return n3.status();
-        if (!p3.ok()) return p3.status();
-        if (!n1.ok()) return n1.status();
-        if (!p1.ok()) return p1.status();
-
-        seal::Ciphertext f0 = t4.value();
-        evaluator.add_inplace(f0, t2.value());
-        evaluator.add_inplace(f0, n3.value());
-        evaluator.add_inplace(f0, n1.value());
-        seal::Ciphertext f1 = t4.take_value();
-        evaluator.add_inplace(f1, t2.take_value());
-        evaluator.add_inplace(f1, p3.take_value());
-        evaluator.add_inplace(f1, p1.take_value());
-        seal::Plaintext constant;
-        encoder.encode(config.e, f0.parms_id(), target, constant);
-        evaluator.add_plain_inplace(f0, constant);
-        evaluator.add_plain_inplace(f1, constant);
-        if (f0.parms_id() != terminal_id.value()) {
-            evaluator.mod_switch_to_inplace(f0, terminal_id.value());
-            evaluator.mod_switch_to_inplace(f1, terminal_id.value());
-            if (counts) counts->modulus_switches += 2;
-        }
-        negative.ciphertexts[i] = std::move(f0);
-        positive.ciphertexts[i] = std::move(f1);
-        evaluator.mod_switch_to_inplace(
-            terminal_input.ciphertexts[i], terminal_id.value());
-        if (counts) ++counts->modulus_switches;
     }
-    return {};
-    }, detail::EstimatedHeWorkerBytes(
-        context.parameters.polynomial_degree,
-        context.parameters.coefficient_modulus_bits.size(), 16));
-    if (!parallel.ok()) return parallel.status();
-    if (report) {
-        for (const auto &counts : per_ciphertext) {
-            report->ciphertext_plain_multiplications +=
-                counts.ciphertext_plain_multiplications;
-            report->ciphertext_multiplications +=
-                counts.ciphertext_multiplications;
+    SealCipherTensor branches, terminal_input;
+    branches.parameter_profile = terminal_input.parameter_profile = context.profile;
+    terminal_input.logical_spec = branches.logical_spec = input.logical_spec;
+    terminal_input.physical_packing = input.physical_packing;
+    branches.physical_packing = GeluBranchPacking(input.physical_packing);
+    branches.logical_spec.shape = branches.physical_packing.logical_shape;
+    branches.logical_spec.layout = branches.physical_packing.layout;
+    branches.ciphertexts.resize(input.ciphertexts.size());
+    terminal_input.ciphertexts.resize(input.ciphertexts.size());
+    if (cache.first && cache.first->preparing_plaintexts()) {
+        for (auto *tensor : {&branches, &terminal_input})
+            for (auto &ct : tensor->ciphertexts) { ct.parms_id() = terminal_id.value(); ct.scale() = target; }
+    } else {
+        std::vector<FfnGeluExecutionReport> reports(input.ciphertexts.size());
+        auto evaluated = detail::ParallelRanges(input.ciphertexts.size(),
+            he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator evaluator(*context.context);
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto &counts = reports[i];
+                    const auto &x = input.ciphertexts[i];
+                    seal::Ciphertext x2, x3, x4;
+                    const auto finish_product = [&](seal::Ciphertext &value) -> Result<void> {
+                        evaluator.relinearize_inplace(value, context.relinearization_keys);
+                        evaluator.rescale_to_next_inplace(value);
+                        ++counts.ciphertext_multiplications;
+                        ++counts.relinearizations;
+                        ++counts.rescales;
+                        return NormalizeScale(value, target);
+                    };
+                    evaluator.square(x, x2);
+                    auto normalized = finish_product(x2);
+                    if (!normalized.ok()) return normalized.status();
+                    auto x_aligned = x;
+                    evaluator.mod_switch_to_inplace(x_aligned, x2.parms_id());
+                    evaluator.multiply(x2, x_aligned, x3);
+                    normalized = finish_product(x3);
+                    if (!normalized.ok()) return normalized.status();
+                    evaluator.square(x2, x4);
+                    normalized = finish_product(x4);
+                    if (!normalized.ok()) return normalized.status();
+                    evaluator.mod_switch_to_inplace(x_aligned, x3.parms_id());
+                    evaluator.mod_switch_to_inplace(x2, x3.parms_id());
+                    counts.modulus_switches += 3;
+                    // Four products share one high scale; sum before rescale.
+                    const std::array<const seal::Ciphertext *, 4> powers{&x4, &x3, &x2, &x_aligned};
+                    auto &packed = branches.ciphertexts[i];
+                    for (std::size_t power = 0; power < powers.size(); ++power) {
+                        seal::Ciphertext term;
+                        evaluator.multiply_plain(*powers[power], *program->plaintexts[power], term);
+                        ++counts.ciphertext_plain_multiplications;
+                        if (power == 0) packed = std::move(term);
+                        else evaluator.add_inplace(packed, term);
+                    }
+                    evaluator.rescale_to_next_inplace(packed);
+                    normalized = NormalizeScale(packed, target);
+                    if (!normalized.ok()) return normalized.status();
+                    ++counts.rescales;
+                    evaluator.add_plain_inplace(packed, *program->plaintexts[4]);
+                    evaluator.mod_switch_to(x, terminal_id.value(), terminal_input.ciphertexts[i]);
+                    ++counts.modulus_switches;
+                }
+                return {};
+            }, detail::EstimatedHeWorkerBytes(context.parameters.polynomial_degree,
+                context.parameters.coefficient_modulus_bits.size(), 12));
+        if (!evaluated.ok()) return evaluated.status();
+        if (report) for (const auto &counts : reports) {
+            report->ciphertext_plain_multiplications += counts.ciphertext_plain_multiplications;
+            report->ciphertext_multiplications += counts.ciphertext_multiplications;
             report->relinearizations += counts.relinearizations;
             report->rescales += counts.rescales;
             report->modulus_switches += counts.modulus_switches;
         }
     }
-    for (auto *tensor : {&terminal_input, &negative, &positive}) {
+    for (auto *tensor : {&terminal_input, &branches}) {
         tensor->logical_spec.planned_level = terminal_level;
-        tensor->logical_spec.planned_scale_bits =
-            context.parameters.output_scale_bits;
+        tensor->logical_spec.planned_scale_bits = context.parameters.output_scale_bits;
     }
-    return GeluPolynomialOutputs{std::move(terminal_input),
-                                 std::move(negative),
-                                 std::move(positive)};
+    return GeluPolynomialOutputs{std::move(terminal_input), std::move(branches), program->conversion_phase};
 }
 
 class MpcGeluRuntime::Impl {
 public:
-    explicit Impl(std::shared_ptr<SharedMpcSession> session)
-        : session_(std::move(session)), native_(session_->Acquire()),
+    explicit Impl(std::shared_ptr<SharedMpcSession> session, std::size_t worker = 0)
+        : session_(std::move(session)), native_(session_->Acquire(worker)),
           party_(native_->party())
     {}
 
-    FixArray Secret(const MpcShareTensor &tensor)
+    FixArray Secret(const MpcShareTensor &tensor, std::size_t begin, std::size_t end)
     {
-        FixArray result(party_, static_cast<int>(tensor.local_share.size()),
+        FixArray result(party_, static_cast<int>(end - begin),
                         tensor.numeric.is_signed, tensor.numeric.ring_bits,
                         tensor.numeric.scale_bits);
         const auto mask = RingMask(tensor.numeric.ring_bits);
-        for (std::size_t i = 0; i < tensor.local_share.size(); ++i)
-            result.data[i] = tensor.local_share[i] & mask;
+        for (std::size_t i = begin; i < end; ++i)
+            result.data[i - begin] = tensor.local_share[i] & mask;
         return result;
     }
 
-    Result<MpcShareTensor> Evaluate(
+    std::vector<std::uint64_t> EvaluateRange(
         const MpcShareTensor &input,
         const MpcShareTensor &negative,
         const MpcShareTensor &positive,
-        double threshold)
+        double threshold, std::size_t begin, std::size_t end)
     {
-        if (input.local_share.empty() || input.local_share.size() >
-                static_cast<std::size_t>(std::numeric_limits<int>::max()))
-            return Status::Invalid("GeLU MPC tensor size is unsupported");
-        auto x = Secret(input);
-        auto f0 = Secret(negative);
-        auto f1 = Secret(positive);
+        auto x = Secret(input, begin, end);
+        auto f0 = Secret(negative, begin, end);
+        auto f1 = Secret(positive, begin, end);
         const auto encode = [&](double value) {
             const auto scaled = static_cast<std::int64_t>(
                 std::llround(std::ldexp(value, input.numeric.scale_bits)));
@@ -1304,28 +1330,76 @@ public:
                    RingMask(input.numeric.ring_bits);
         };
         auto &fix = native_->fix();
-        auto b0 = fix.LT(x, encode(-threshold));
-        auto b1 = fix.LT(x, std::uint64_t{0});
-        auto b2 = fix.GT(x, encode(threshold));
-        auto z0 = fix.bool_op->XOR(b0, b1);
-        auto z1 = fix.bool_op->XOR(b1, b2);
-        if (party_ == sci::ALICE)
-            for (int i = 0; i < z1.size; ++i) z1.data[i] ^= 1U;
-        FixArray zero(party_, x.size, true, x.ell, x.s);
-        std::fill(zero.data, zero.data + zero.size, std::uint64_t{0});
-        auto r0 = fix.if_else(z0, f0, zero);
-        auto r1 = fix.if_else(z1, f1, zero);
-        auto r2 = fix.if_else(b2, x, zero);
-        auto result = fix.add(fix.add(r0, r1), r2);
-        return MpcShareTensor{
-            std::vector<std::uint64_t>(result.data,
-                                       result.data + result.size),
-            input.physical_shape, input.numeric, ComplexComponent::kReal};
+        const int size = x.size;
+        std::vector<std::uint64_t> output(size);
+        const auto mask = RingMask(x.ell);
+        const auto upper = party_ == sci::ALICE ? encode(threshold) : 0;
+        // SCI/Ferret scratch grows with the number of simultaneous OTs.
+        // Bound the batch instead of tripling its peak for large FFNs.
+        constexpr int kMaxBatchValues = 1 << 18;
+        for (int offset = 0; offset < size;) {
+            const int batch_size = std::min(kMaxBatchValues, size - offset);
+            FixArray values(party_, batch_size, true, x.ell, x.s);
+            std::copy_n(x.data + offset, batch_size, values.data);
+            auto sign = fix.MSB(values);
+            BoolArray select(party_, 2 * batch_size);
+            FixArray left(party_, 2 * batch_size, true, x.ell, x.s),
+                right(party_, 2 * batch_size, true, x.ell, x.s);
+            for (int i = 0; i < batch_size; ++i) {
+                select.data[i] = select.data[batch_size + i] = sign.data[i];
+                left.data[i] = 0;
+                right.data[i] = values.data[i];
+                left.data[batch_size + i] = f0.data[offset + i];
+                right.data[batch_size + i] = f1.data[offset + i];
+            }
+            // One batched mux computes ReLU(x) and the sign-selected branch.
+            // abs(x)=2*ReLU(x)-x needs neither truncation nor a fourth mux.
+            auto selected = fix.if_else(select, left, right);
+            FixArray absolute(party_, batch_size, true, x.ell, x.s),
+                bound(party_, batch_size, true, x.ell, x.s),
+                tail(party_, batch_size, true, x.ell, x.s),
+                polynomial(party_, batch_size, true, x.ell, x.s);
+            for (int i = 0; i < batch_size; ++i) {
+                tail.data[i] = selected.data[i];
+                polynomial.data[i] = selected.data[batch_size + i];
+                absolute.data[i] = (2 * selected.data[i] - values.data[i]) & mask;
+                bound.data[i] = upper;
+            }
+            // GT extracts MSB(T-|x|). For 0<=|x|<=2^(ell-1) and
+            // 0<=T<2^(ell-1), this difference fits the signed ring, even
+            // for its most-negative x. Equality stays inside both branches.
+            auto outside = fix.GT(absolute, bound);
+            auto chosen = fix.if_else(outside, tail, polynomial);
+            std::copy_n(chosen.data, batch_size, output.begin() + offset);
+            offset += batch_size;
+        }
+        return output;
+    }
+
+    Result<MpcShareTensor> Evaluate(
+        const MpcShareTensor &input, const MpcShareTensor &negative,
+        const MpcShareTensor &positive, double threshold)
+    {
+        if (input.local_share.empty() || input.local_share.size() >
+                static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            !std::isfinite(threshold) || threshold <= 0 ||
+            std::round(std::ldexp(threshold, input.numeric.scale_bits)) >=
+                std::ldexp(1., input.numeric.ring_bits - 1))
+            return Status::Invalid("GeLU MPC size or threshold is unsupported");
+        std::vector<std::uint64_t> output(input.local_share.size());
+        session_->ForEachRange(output.size(), 32768,
+            [&](std::size_t worker, std::size_t begin, std::size_t end) {
+                Impl local(session_, worker);
+                auto values = local.EvaluateRange(input, negative, positive, threshold, begin, end);
+                std::copy(values.begin(), values.end(), output.begin() + begin);
+            });
+        return MpcShareTensor{std::move(output), input.physical_shape,
+                             input.numeric, ComplexComponent::kReal};
     }
 
     std::uint64_t communication() const
-    { return native_->communication_bytes(); }
-    std::uint64_t rounds() const { return native_->rounds(); }
+    { return session_->communication_bytes(); }
+    std::uint64_t rounds() const { return session_->rounds(); }
     void Cancel() noexcept { session_->Cancel(); }
 
 private:
@@ -1383,7 +1457,7 @@ Result<MpcShareTensor> MpcGeluRuntime::Evaluate(
                                       positive_branch, threshold);
         if (!result.ok()) return result.status();
         if (report) {
-            report->comparisons += 3 * input.local_share.size();
+            report->comparisons += 2 * input.local_share.size();
             report->muxes += 3 * input.local_share.size();
             report->mpc_communication_bytes +=
                 impl_->communication() - before_bytes;
@@ -1416,10 +1490,11 @@ SealSciFfnGeluExecutor::SealSciFfnGeluExecutor(
     CryptoTensorStore &tensors,
     CkksMpcConverter &converter,
     MpcGeluRuntime &mpc,
-    TensorIdAllocator *ids)
+    TensorIdAllocator *ids,
+    SealCipherTensorStore *he_tensors)
     : config_(config), layer_(layer), contexts_(contexts),
       parameters_(parameters), tensors_(tensors), converter_(converter),
-      mpc_(mpc), ids_(ids)
+      mpc_(mpc), ids_(ids), he_tensors_(he_tensors)
 {}
 
 Result<std::vector<int>> SealSciFfnGeluExecutor::RequiredRotationSteps(
@@ -1431,40 +1506,33 @@ Result<std::vector<int>> SealSciFfnGeluExecutor::RequiredRotationSteps(
     auto layer_valid = ValidateLayerConfig(layer);
     if (!layer_valid.ok()) return layer_valid.status();
     const auto slots = parameters.polynomial_degree / 2;
-    auto packing = FfnGeluPackingPlanner::Build(layer, slots);
+    auto packing = FfnGeluPackingPlanner::GetShared(layer, slots);
     if (!packing.ok()) return packing.status();
-    return ComplexColumnProjectionKernel::RequiredRotationSteps(
-        packing.value().centered, packing.value().projected);
+    auto result = ComplexColumnProjectionKernel::RequiredRotationSteps(
+        packing.value()->centered, packing.value()->projected);
+    if (!result.ok()) return result.status();
+    result.value().push_back(0);
+    result.value().push_back(static_cast<int>(slots / 2));
+    return result;
 }
 
 namespace {
 
-Result<PhysicalSlotMap> CombinedRealMap(const HePackingPlan &packing,
-                                        std::size_t copies)
+Result<PhysicalSlotMap> CombinedGeluMap(const HePackingPlan &packing)
 {
-    PhysicalSlotMap map;
-    map.ciphertext_count = packing.ciphertext_count * copies;
-    map.slots_per_ciphertext = packing.slot_count;
-    map.logical_element_count =
-        packing.logical_locations.size() * copies;
-    map.assignments.resize(map.ciphertext_count * map.slots_per_ciphertext);
-    for (std::size_t copy = 0; copy < copies; ++copy) {
-        for (std::size_t logical = 0;
-             logical < packing.logical_locations.size(); ++logical) {
-            const auto &location = packing.Locations(logical).front();
-            if (location.component != ComplexLane::kReal)
-                return Status::Invalid(
-                    "combined GeLU conversion requires real-only packing");
-            auto &assignment = map.assignments[
-                (copy * packing.ciphertext_count + location.ciphertext) *
-                    packing.slot_count + location.slot];
-            assignment.real_logical_index =
-                copy * packing.logical_locations.size() + logical;
-        }
+    auto input = ToConversionMap(detail::PairedRealPacking(packing));
+    if (!input.ok()) return input.status();
+    auto branches = ToConversionMap(GeluBranchPacking(packing));
+    if (!branches.ok()) return branches.status();
+    const auto count = packing.logical_locations.size();
+    for (auto assignment : branches.value().assignments) {
+        if (assignment.real_logical_index != kUnusedLogicalIndex) assignment.real_logical_index += count;
+        if (assignment.imaginary_logical_index != kUnusedLogicalIndex) assignment.imaginary_logical_index += count;
+        input.value().assignments.push_back(assignment);
     }
-    auto valid = map.Validate();
-    if (!valid.ok()) return valid.status();
-    return map;
+    input.value().ciphertext_count += branches.value().ciphertext_count;
+    input.value().logical_element_count += branches.value().logical_element_count;
+    return input;
 }
 
 } // namespace
@@ -1490,22 +1558,24 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
             region->second.parameter_profile, contexts_.role());
         auto level_valid = FfnGeluLevelPlanner::Validate(context.parameters);
         if (!level_valid.ok()) return level_valid.status();
-        if (context.galois_keys.size() == 0)
-            return Status::FailedPrecondition(
-                "FFN/GeLU Galois keys have not been compiled");
         auto required = RequiredRotationSteps(layer_, context.parameters);
         if (!required.ok()) return required.status();
-        const auto galois_tool =
-            context.context->key_context_data()->galois_tool();
-        for (const auto step : required.value())
-            if (!context.galois_keys.has_key(
-                    galois_tool->get_elt_from_step(step)))
+        if (contexts_.role() == PartyRole::kServer) {
+            if (context.galois_keys.size() == 0)
                 return Status::FailedPrecondition(
-                    "FFN/GeLU is missing rotation/conjugation key for step " +
-                    std::to_string(step));
-        if (!context.relinearization_keys.has_key(2))
-            return Status::FailedPrecondition(
-                "FFN/GeLU is missing the degree-2 relinearization key");
+                    "FFN/GeLU Galois keys have not been compiled");
+            const auto galois_tool =
+                context.context->key_context_data()->galois_tool();
+            for (const auto step : required.value())
+                if (!context.galois_keys.has_key(
+                        galois_tool->get_elt_from_step(step)))
+                    return Status::FailedPrecondition(
+                        "FFN/GeLU is missing rotation/conjugation key for step " +
+                        std::to_string(step));
+            if (!context.relinearization_keys.has_key(2))
+                return Status::FailedPrecondition(
+                    "FFN/GeLU is missing the degree-2 relinearization key");
+        }
         if (report) report->required_rotation_steps = required.value();
 
         const TensorShape centered_shape{{layer_.tokens,
@@ -1536,59 +1606,74 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
                 config_.mpc_numeric.scale_bits)
             return Status::Invalid("FFN inputs require signed configured MPC format");
 
-        auto plans = FfnGeluPackingPlanner::Build(layer_,
+        auto plans = FfnGeluPackingPlanner::GetShared(layer_,
                                                    context.slot_count());
         if (!plans.ok()) return plans.status();
         const auto terminal_level =
             context.parameters.coefficient_modulus_bits.size() -
             context.parameters.terminal_prime_count;
-        constexpr std::size_t kFfnGeluDepth = 6;
+        const auto kFfnGeluDepth = kFfnSuffixDepth;
         if (terminal_level < kFfnGeluDepth)
             return Status::FailedPrecondition(
-                "FFN/GeLU profile has no six-level suffix");
+                "FFN/GeLU profile has no five-level suffix");
         const auto ffn_start_level = terminal_level - kFfnGeluDepth;
-        auto centered_pair = Scatter(centered.value(), plans.value().centered);
+        auto centered_pair = Scatter(centered.value(), plans.value()->centered);
         if (!centered_pair.ok()) return centered_pair.status();
         auto inverse_pair = ScatterInverse(inverse.value(),
-                                            plans.value().inverse_broadcast);
+                                            plans.value()->inverse_broadcast);
         if (!inverse_pair.ok()) return inverse_pair.status();
-        auto centered_map = ToConversionMap(plans.value().centered);
+        auto centered_map = ToConversionMap(plans.value()->centered);
         if (!centered_map.ok()) return centered_map.status();
-        const auto inverse_map = DensePhysicalRealMap(context.slot_count());
+        // Same profile/level/scale: concatenate centered and inverse into one
+        // conversion frame, then move ciphertexts into their original contracts.
+        auto packed_shares = centered_pair.take_value();
+        auto inverse_shares = inverse_pair.take_value();
+        for (auto pair : {std::make_pair(&packed_shares.real, &inverse_shares.real),
+                          std::make_pair(&packed_shares.imag, &inverse_shares.imag)}) {
+            pair.first->local_share.insert(pair.first->local_share.end(),
+                pair.second->local_share.begin(), pair.second->local_share.end());
+            pair.first->physical_shape = {{plans.value()->centered.ciphertext_count + 1,
+                                          context.slot_count()}};
+        }
+        auto input_map = centered_map.take_value();
+        const auto centered_cts = input_map.ciphertext_count;
+        const auto centered_logical = input_map.logical_element_count;
+        ++input_map.ciphertext_count;
+        input_map.logical_element_count += context.slot_count();
+        input_map.assignments.resize(input_map.ciphertext_count * context.slot_count());
+        for (std::size_t slot = 0; slot < context.slot_count(); ++slot)
+            input_map.assignments[centered_cts * context.slot_count() + slot]
+                .real_logical_index = centered_logical + slot;
+        auto map_valid = input_map.Validate();
+        if (!map_valid.ok()) return map_valid.status();
+        const auto before_input = converter_.stats();
+        std::vector<std::optional<int>> input_bounds(centered_cts + 1);
+        input_bounds.back() = inverse.value().public_value_bound_bits;
+        MpcToCkksTarget input_target{context.profile, ffn_start_level, context.parameters.input_scale_bits,
+            {{input_map.logical_element_count}}, Layout::kComplexStrictColumn, input_map,
+            false, std::nullopt, std::move(input_bounds)};
+        input_target.public_slot_periods.resize(centered_cts + 1);
+        input_target.public_slot_periods.back()[0] = NextPowerOfTwo(layer_.tokens);
+        auto converted = converter_.MpcToCkksPacked(packed_shares, input_target);
+        if (!converted.ok()) return converted.status();
+        const auto after_input = converter_.stats();
+        if (report) {
+            ++report->mpc_to_ckks_calls;
+            report->conversion_communication_bytes += after_input.communication_bytes - before_input.communication_bytes;
+            report->conversion_rounds += after_input.rounds - before_input.rounds;
+            report->conversion_milliseconds += after_input.milliseconds - before_input.milliseconds;
+        }
 
-        auto convert_to_he = [&](const ComplexMpcSharePair &shares,
-                                 const TensorShape &shape, Layout layout,
-                                 const PhysicalSlotMap &map)
-            -> Result<std::optional<SealCipherBatch>> {
-            const auto before = converter_.stats();
-            auto output = converter_.MpcToCkks(
-                shares,
-                {context.profile, ffn_start_level,
-                 context.parameters.input_scale_bits, shape, layout, map});
-            if (!output.ok()) return output.status();
-            const auto after = converter_.stats();
-            if (report) {
-                ++report->mpc_to_ckks_calls;
-                report->conversion_communication_bytes +=
-                    after.communication_bytes - before.communication_bytes;
-                report->conversion_rounds += after.rounds - before.rounds;
-                report->conversion_milliseconds +=
-                    after.milliseconds - before.milliseconds;
-            }
-            return output;
-        };
-        auto centered_he = convert_to_he(
-            centered_pair.value(), centered_shape,
-            Layout::kComplexStrictColumn, centered_map.value());
-        if (!centered_he.ok()) return centered_he.status();
-        auto inverse_he = convert_to_he(
-            inverse_pair.value(), {{1, context.slot_count()}},
-            Layout::kReduction, inverse_map);
-        if (!inverse_he.ok()) return inverse_he.status();
-
+        const bool retain_normalized = layer_.norm == NormPlacement::kNormalizedResidual && layer_.ffn_residual;
+        const bool shared_skip = layer_.norm == NormPlacement::kNormalizedResidual &&
+            execution->regions.at(HeRegionId::kRegion1).parameter_profile == context.profile;
+        if (shared_skip && retain_normalized && !he_tensors_)
+            return Status::FailedPrecondition("shared LN2 residual requires an HE tensor store");
+        std::optional<TensorHandle> he_residual_handle;
+        std::optional<SealCipherTensor> normalized_residual;
         std::optional<GeluPolynomialOutputs> polynomials;
         if (contexts_.role() == PartyRole::kServer) {
-            if (!centered_he.value() || !inverse_he.value())
+            if (!converted.value() || converted.value()->ciphertexts.size() != centered_cts + 1)
                 return Status::Internal(
                     "server did not receive FFN MPC-to-CKKS outputs");
             if (weights.layer_id != layer_.id || !weights.wu.valid() ||
@@ -1605,6 +1690,16 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
             if (!gamma.ok()) return gamma.status();
             auto beta = parameters_.GetVectorShared(beta_handle->id);
             if (!beta.ok()) return beta.status();
+            std::optional<GammaFusedLayerNormParameters> original;
+            if (retain_normalized) {
+                original = GammaFusedLayerNormParameters{*gamma.value(), *beta.value()};
+                normalized_residual.emplace();
+            }
+            auto affine = parameters_.GetGammaFusedLayerNorm(weights.wu.id);
+            if (affine.ok()) {
+                gamma = std::shared_ptr<const DenseVectorParameter>(affine.value(), &affine.value()->gamma);
+                beta = std::shared_ptr<const DenseVectorParameter>(affine.value(), &affine.value()->beta);
+            }
             auto wu = parameters_.GetMatrixShared(weights.wu.id);
             if (!wu.ok()) return wu.status();
             std::optional<DenseVectorParameter> bu;
@@ -1619,7 +1714,10 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
 
             SealCipherTensor centered_tensor;
             centered_tensor.parameter_profile = context.profile;
-            centered_tensor.ciphertexts = centered_he.value()->ciphertexts;
+            auto &converted_cts = converted.value()->ciphertexts;
+            centered_tensor.ciphertexts.reserve(centered_cts);
+            for (std::size_t ct = 0; ct < centered_cts; ++ct)
+                centered_tensor.ciphertexts.push_back(std::move(converted_cts[ct]));
             centered_tensor.logical_spec = inputs.centered_shares.spec;
             centered_tensor.logical_spec.domain = Domain::kHeCiphertext;
             centered_tensor.logical_spec.layout = Layout::kComplexStrictColumn;
@@ -1628,11 +1726,11 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
             centered_tensor.logical_spec.planned_level = ffn_start_level;
             centered_tensor.logical_spec.planned_scale_bits =
                 context.parameters.input_scale_bits;
-            centered_tensor.physical_packing = plans.value().centered;
+            centered_tensor.physical_packing = plans.value()->centered;
 
             SealCipherTensor inverse_tensor;
             inverse_tensor.parameter_profile = context.profile;
-            inverse_tensor.ciphertexts = inverse_he.value()->ciphertexts;
+            inverse_tensor.ciphertexts.push_back(std::move(converted_cts.back()));
             inverse_tensor.logical_spec = inputs.inverse_stddev_shares.spec;
             inverse_tensor.logical_spec.domain = Domain::kHeCiphertext;
             inverse_tensor.logical_spec.layout = Layout::kReduction;
@@ -1641,40 +1739,103 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
             inverse_tensor.logical_spec.planned_level = ffn_start_level;
             inverse_tensor.logical_spec.planned_scale_bits =
                 context.parameters.input_scale_bits;
-            inverse_tensor.physical_packing = plans.value().inverse_broadcast;
+            inverse_tensor.physical_packing = plans.value()->inverse_broadcast;
 
             auto normalized = FfnLayerNormTailKernel::Evaluate(
                 centered_tensor, inverse_tensor, *gamma.value(), *beta.value(),
-                layer_, context, report);
+                layer_, context, report, config_.threads,
+                original ? &*original : nullptr,
+                normalized_residual ? &*normalized_residual : nullptr);
             if (!normalized.ok()) return normalized.status();
             auto projected = FfnUpProjectionKernel::Evaluate(
                 normalized.value(), *wu.value(), bu, layer_, context, report,
                 config_.threads);
             if (!projected.ok()) return projected.status();
-            auto real = FfnRealifyKernel::Evaluate(
-                projected.value(), layer_, context, report);
-            if (!real.ok()) return real.status();
             auto polynomial = GeluPolynomialKernel::Evaluate(
-                real.value(), config_.gelu, context, report,
+                projected.value(), config_.gelu, context, report,
                 config_.threads);
             if (!polynomial.ok()) return polynomial.status();
             polynomials = polynomial.take_value();
         }
 
-        auto combined_map = CombinedRealMap(plans.value().realified, 3);
+        if (shared_skip && retain_normalized) {
+            const auto residual_id = ids_ ? ids_->Next() : next_id_.fetch_add(1);
+            auto residual_spec = inputs.centered_shares.spec;
+            residual_spec.domain = Domain::kHeCiphertext;
+            residual_spec.layout = Layout::kStrictColumn;
+            residual_spec.he_region = HeRegionId::kRegion5;
+            residual_spec.he_parameter_profile = context.profile;
+            residual_spec.planned_level = ffn_start_level + 1;
+            residual_spec.planned_scale_bits = context.parameters.output_scale_bits;
+            if (contexts_.role() == PartyRole::kServer) {
+                normalized_residual->logical_spec = residual_spec;
+                auto stored = he_tensors_->Put(residual_id, std::move(*normalized_residual));
+                if (!stored.ok()) return stored.status();
+                normalized_residual.reset();
+            }
+            he_residual_handle = TensorHandle{residual_id, residual_spec};
+        }
+
+        auto combined_map = CombinedGeluMap(plans.value()->projected);
         if (!combined_map.ok()) return combined_map.status();
+        std::optional<HePackingPlan> residual_plan;
+        if (retain_normalized && !shared_skip) {
+            auto built = FfnGeluPackingPlanner::RealColumns(
+                {{layer_.tokens, layer_.model_width}}, context.slot_count(), Layout::kStrictColumn);
+            if (!built.ok()) return built.status();
+            residual_plan = detail::PairedRealPacking(built.value());
+            auto map = ToConversionMap(*residual_plan);
+            if (!map.ok()) return map.status();
+            const auto logical_offset = combined_map.value().logical_element_count;
+            for (auto assignment : map.value().assignments) {
+                if (assignment.real_logical_index != kUnusedLogicalIndex)
+                    assignment.real_logical_index += logical_offset;
+                if (assignment.imaginary_logical_index != kUnusedLogicalIndex)
+                    assignment.imaginary_logical_index += logical_offset;
+                combined_map.value().assignments.push_back(assignment);
+            }
+            combined_map.value().logical_element_count += map.value().logical_element_count;
+            combined_map.value().ciphertext_count += map.value().ciphertext_count;
+        }
         std::optional<SealCipherBatch> batch;
         if (contexts_.role() == PartyRole::kServer) {
             std::vector<seal::Ciphertext> ciphertexts;
-            for (const auto *tensor : {&polynomials->input,
-                                       &polynomials->negative_branch,
-                                       &polynomials->positive_branch})
+            const auto paired_count = (polynomials->input.ciphertexts.size() + 1) / 2;
+            ciphertexts.resize(paired_count);
+            auto paired = detail::ParallelRanges(paired_count, config_.threads, 1,
+                [&](std::size_t begin, std::size_t end) -> Result<void> {
+                    seal::Evaluator evaluator(*context.context);
+                    for (std::size_t pair = begin; pair < end; ++pair) {
+                        auto value = std::move(polynomials->input.ciphertexts[2 * pair]);
+                        if (2 * pair + 1 < polynomials->input.ciphertexts.size()) {
+                            auto imaginary = std::move(polynomials->input.ciphertexts[2 * pair + 1]);
+                            evaluator.multiply_plain_inplace(imaginary, *polynomials->conversion_phase);
+                            evaluator.add_inplace(value, imaginary);
+                        } else {
+                            auto imaginary = value;
+                            evaluator.multiply_plain_inplace(imaginary, *polynomials->conversion_phase);
+                            evaluator.add_inplace(value, imaginary);
+                        }
+                        ciphertexts[pair] = std::move(value);
+                    }
+                    return {};
+                }, detail::EstimatedHeWorkerBytes(context.parameters.polynomial_degree, 1, 4));
+            if (!paired.ok()) return paired.status();
+            if (report) report->ciphertext_plain_multiplications += (polynomials->input.ciphertexts.size() + 1) / 2;
+            ciphertexts.insert(ciphertexts.end(),
+                std::make_move_iterator(polynomials->branches.ciphertexts.begin()),
+                std::make_move_iterator(polynomials->branches.ciphertexts.end()));
+            if (normalized_residual) {
+                auto paired_residual = detail::PairRealCiphertexts(
+                    std::move(normalized_residual->ciphertexts), context, config_.threads);
+                if (!paired_residual.ok()) return paired_residual.status();
+                auto extra = paired_residual.take_value();
                 ciphertexts.insert(ciphertexts.end(),
-                                   tensor->ciphertexts.begin(),
-                                   tensor->ciphertexts.end());
+                    std::make_move_iterator(extra.begin()), std::make_move_iterator(extra.end()));
+            }
             batch = SealCipherBatch{
                 context.profile, std::move(ciphertexts),
-                {{3, layer_.tokens, layer_.ffn_width}},
+                {{combined_map.value().logical_element_count}},
                 Layout::kStrictColumn, combined_map.value()};
         }
         const auto before = converter_.stats();
@@ -1690,16 +1851,16 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
                 after.milliseconds - before.milliseconds;
         }
         const TensorShape output_shape{{layer_.tokens, layer_.ffn_width}};
-        const auto group_cts = plans.value().realified.ciphertext_count;
-        auto x_share = CompactSegment(physical.value(),
-                                      plans.value().realified, 0,
-                                      output_shape);
+        const auto paired_input = detail::PairedRealPacking(plans.value()->projected);
+        const auto group_cts = paired_input.ciphertext_count;
+        auto x_share = CompactSegment(physical.value(), paired_input, 0,
+                                      output_shape, std::nullopt, true);
         auto f0_share = CompactSegment(physical.value(),
-                                       plans.value().realified, group_cts,
+                                       plans.value()->projected, group_cts,
                                        output_shape);
         auto f1_share = CompactSegment(physical.value(),
-                                       plans.value().realified, 2 * group_cts,
-                                       output_shape);
+                                       plans.value()->projected, group_cts,
+                                       output_shape, ComplexLane::kImaginary);
         if (!x_share.ok()) return x_share.status();
         if (!f0_share.ok()) return f0_share.status();
         if (!f1_share.ok()) return f1_share.status();
@@ -1717,11 +1878,24 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
         const auto id = ids_ ? ids_->Next() : next_id_.fetch_add(1);
         auto stored = tensors_.PutMpcShare(id, activation.take_value());
         if (!stored.ok()) return stored.status();
+        std::optional<TensorHandle> residual_handle;
+        if (residual_plan) {
+            const TensorShape shape{{layer_.tokens, layer_.model_width}};
+            auto residual_share = CompactSegment(physical.value(), *residual_plan, group_cts + plans.value()->projected.ciphertext_count, shape, std::nullopt, true);
+            if (!residual_share.ok()) return residual_share.status();
+            auto residual_spec = spec;
+            residual_spec.shape = shape;
+            residual_spec.layout = Layout::kStrictColumn;
+            const auto residual_id = ids_ ? ids_->Next() : next_id_.fetch_add(1);
+            auto stored = tensors_.PutMpcShare(residual_id, residual_share.take_value());
+            if (!stored.ok()) return stored.status();
+            residual_handle = TensorHandle{residual_id, residual_spec};
+        }
         if (report)
             report->he_milliseconds += std::chrono::duration<double,
                 std::milli>(Clock::now() - started).count() -
                 report->conversion_milliseconds - report->mpc_milliseconds;
-        return FfnGeluOutputs{TensorHandle{id, spec}};
+        return FfnGeluOutputs{TensorHandle{id, spec}, residual_handle, he_residual_handle};
     } catch (const std::exception &error) {
         return Status::Internal(std::string("FFN/GeLU stage failed: ") +
                                 error.what());

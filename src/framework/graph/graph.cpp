@@ -65,6 +65,13 @@ const std::string &GraphBuilder::ActiveProfile(HeRegionId region) const
     return it->second.parameter_profile;
 }
 
+const TransformerLayerConfig &GraphBuilder::ActiveLayerConfig() const
+{
+    for (const auto &layer : config_.layers)
+        if (layer.id == active_layer_) return layer;
+    throw std::logic_error("graph builder has no active layer config");
+}
+
 const HeParameterConfig &GraphBuilder::ActiveParameters(HeRegionId region) const
 {
     const auto *parameters = FindRegionParameters(config_, active_layer_, region);

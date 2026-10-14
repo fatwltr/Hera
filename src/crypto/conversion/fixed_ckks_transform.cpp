@@ -218,4 +218,37 @@ Result<std::vector<WideRingShare>> FixedCkksTransform::Encode(
     return result;
 }
 
+std::optional<int> FixedCkksTransform::EncodedCoefficientBoundBits(
+    int slot_bound_bits, int guard_bits, int retained_precision_bits) const
+{
+    if (working_bits_ < 3 || slot_bound_bits < 0 || guard_bits < 0 ||
+        retained_precision_bits < 0 || retained_precision_bits > guard_bits ||
+        slot_bound_bits + guard_bits >= 100)
+        return std::nullopt;
+    using U128 = unsigned __int128;
+    auto magnitude = U128{1} << (slot_bound_bits + guard_bits);
+    const auto limit = U128{1} << (working_bits_ - 2);
+    const int levels = seal::util::get_power_of_two(degree_);
+    // For each component, |root_product| <= 2*M + 1. A butterfly
+    // therefore increases the bound to 3*M + 1. The +1 accommodates
+    // the reconstructed two-party local-truncation rounding error.
+    for (int level = 1; level < levels; ++level) {
+        if (magnitude >= limit / 3) return std::nullopt;
+        magnitude = 3 * magnitude + 1;
+    }
+    // The last stage uses root >> log2(N). Its components are bounded
+    // by 2^root_scale/N + 1, so for N <= 2^root_scale the coefficient
+    // bound is <= 8*M/N + 2, including final rounding. Keep margin for
+    // the unshifted root multiplication before its local truncation.
+    if (magnitude >= limit / 8 ||
+        magnitude >= limit / (U128{1} << (root_scale_bits_ + 2)))
+        return std::nullopt;
+    magnitude = (8 * magnitude + degree_ - 1) / degree_ + 2;
+    const auto divisor = U128{1} << (guard_bits - retained_precision_bits);
+    magnitude = (magnitude + divisor - 1) / divisor + 1;
+    int bound_bits = 0;
+    while (magnitude != 0) { ++bound_bits; magnitude >>= 1; }
+    return bound_bits;
+}
+
 } // namespace hera::conversion_internal

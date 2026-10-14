@@ -107,12 +107,14 @@ void TestHeartbeatTimeout(int port)
     auto server_future = std::async(std::launch::async, [port] {
         return hera::RuntimeCoordinator::Connect(
             hera::PartyRole::kServer, "", port,
-            std::chrono::milliseconds(50), std::chrono::milliseconds(250));
+            std::chrono::milliseconds(50), std::chrono::milliseconds(250),
+            std::chrono::seconds(2));
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     auto client = hera::RuntimeCoordinator::Connect(
         hera::PartyRole::kClient, "127.0.0.1", port,
-        std::chrono::milliseconds(50), std::chrono::milliseconds(250));
+        std::chrono::milliseconds(50), std::chrono::milliseconds(250),
+        std::chrono::seconds(2));
     auto server = server_future.get();
     Require(client.ok() && server.ok(), "timeout connection failed");
     std::atomic<int> cancellations{0};
@@ -134,6 +136,63 @@ void TestHeartbeatTimeout(int port)
     server.value()->Cancel();
 }
 
+void TestSlowLiveStage(int port)
+{
+    const auto connect = [port](hera::PartyRole role) {
+        return hera::RuntimeCoordinator::Connect(
+            role, role == hera::PartyRole::kServer ? "" : "127.0.0.1", port,
+            std::chrono::milliseconds(50), std::chrono::milliseconds(500),
+            std::chrono::seconds(2));
+    };
+    auto server_future = std::async(std::launch::async, [&] {
+        return connect(hera::PartyRole::kServer);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    auto client = connect(hera::PartyRole::kClient);
+    auto server = server_future.get();
+    Require(client.ok() && server.ok(), "slow-stage connection failed");
+    Require(client.value()->Start().ok() && server.value()->Start().ok(),
+            "slow-stage coordinator start failed");
+    auto slow = std::async(std::launch::async, [&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(900));
+        return server.value()->StageComplete(0, 4);
+    });
+    auto fast = client.value()->StageComplete(0, 4);
+    Require(slow.get().ok() && fast.ok(),
+            "live peer exceeding heartbeat timeout failed stage synchronization");
+    auto finish = std::async(std::launch::async, [&] {
+        return server.value()->Finish();
+    });
+    auto client_finish = client.value()->Finish();
+    Require(finish.get().ok() && client_finish.ok(), "slow-stage finish failed");
+}
+
+void TestLiveStageDeadline(int port)
+{
+    auto server_future = std::async(std::launch::async, [port] {
+        return hera::RuntimeCoordinator::Connect(
+            hera::PartyRole::kServer, "", port,
+            std::chrono::milliseconds(50), std::chrono::seconds(2),
+            std::chrono::milliseconds(250));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    auto client = hera::RuntimeCoordinator::Connect(
+        hera::PartyRole::kClient, "127.0.0.1", port,
+        std::chrono::milliseconds(50), std::chrono::seconds(2),
+        std::chrono::milliseconds(250));
+    auto server = server_future.get();
+    Require(client.ok() && server.ok(), "stage-deadline connection failed");
+    Require(client.value()->Start().ok() && server.value()->Start().ok(),
+            "stage-deadline coordinator start failed");
+    const auto status = client.value()->StageComplete(0, 4);
+    Require(status.status().code() == hera::StatusCode::kDeadlineExceeded &&
+            status.status().message().find("matching stage within 250 ms") !=
+                std::string::npos,
+            "live unmatched stage did not respect its own deadline");
+    client.value()->Cancel();
+    server.value()->Cancel();
+}
+
 } // namespace
 
 int main()
@@ -143,6 +202,8 @@ int main()
         TestPeerAbort(29331);
         TestPeerEof(29341);
         TestHeartbeatTimeout(29351);
+        TestSlowLiveStage(29361);
+        TestLiveStageDeadline(29371);
         std::cout << "HERA_RUNTIME_COORDINATOR_STATUS=PASS\n";
         return 0;
     } catch (const std::exception &error) {

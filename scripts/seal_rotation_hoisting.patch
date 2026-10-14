@@ -1,0 +1,164 @@
+--- a/native/src/seal/evaluator.h
++++ b/native/src/seal/evaluator.h
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT license.
+ 
+ #pragma once
++#define HERA_SEAL_ROTATION_HOISTING 1
+ 
+ #include "seal/ciphertext.h"
+ #include "seal/context.h"
+@@ -86,6 +87,18 @@
+     class Evaluator
+     {
+     public:
++        // HERA CKKS-only hoisting; owns the source to prevent mismatched digits.
++        class HoistedRotation {
++            friend class Evaluator;
++            Ciphertext source_;
++            std::vector<std::uint64_t> digits_;
++        };
++        void prepare_rotation(const Ciphertext &input, HoistedRotation &prepared,
++            MemoryPoolHandle pool = MemoryManager::GetPool()) const;
++        void rotate_vector_hoisted(const HoistedRotation &prepared, int steps,
++            const GaloisKeys &keys, Ciphertext &output,
++            MemoryPoolHandle pool = MemoryManager::GetPool()) const;
++
+         /**
+         Creates an Evaluator instance initialized with the specified SEALContext.
+ 
+@@ -1381,9 +1394,12 @@
+             apply_galois_inplace(encrypted, galois_tool->get_elt_from_step(0), galois_keys, std::move(pool));
+         }
+ 
++        void apply_galois_internal(Ciphertext &encrypted, std::uint32_t galois_elt,
++            const GaloisKeys &keys, MemoryPoolHandle pool, const HoistedRotation *prepared) const;
+         void switch_key_inplace(
+             Ciphertext &encrypted, util::ConstRNSIter target_iter, const KSwitchKeys &kswitch_keys,
+-            std::size_t key_index, MemoryPoolHandle pool = MemoryManager::GetPool()) const;
++            std::size_t key_index, MemoryPoolHandle pool = MemoryManager::GetPool(),
++            const HoistedRotation *prepared = nullptr, std::uint32_t galois_elt = 0) const;
+ 
+         void multiply_plain_normal(Ciphertext &encrypted, const Plaintext &plain, MemoryPoolHandle pool) const;
+ 
+--- a/native/src/seal/evaluator.cpp
++++ b/native/src/seal/evaluator.cpp
+@@ -2430,8 +2430,64 @@
+ #endif
+     }
+ 
++    void Evaluator::prepare_rotation(const Ciphertext &input, HoistedRotation &prepared,
++        MemoryPoolHandle pool) const
++    {
++        if (!is_metadata_valid_for(input, context_) || !is_buffer_valid(input) ||
++            input.size() != 2 || !input.is_ntt_form() || !pool)
++            throw invalid_argument("hoisting requires a valid size-2 NTT ciphertext and pool");
++        auto &data = *context_.get_context_data(input.parms_id());
++        if (data.parms().scheme() != scheme_type::ckks || !context_.using_keyswitching())
++            throw invalid_argument("rotation hoisting supports CKKS key switching only");
++        auto &key_parms = context_.key_context_data()->parms();
++        auto key_modulus = key_parms.coeff_modulus();
++        auto tables = context_.key_context_data()->small_ntt_tables();
++        const auto n = data.parms().poly_modulus_degree();
++        const auto q = data.parms().coeff_modulus().size();
++        if (!product_fits_in(q + 1, q, n)) throw invalid_argument("hoisting workspace overflow");
++        HoistedRotation next;
++        next.source_ = input;
++        next.digits_.resize((q + 1) * q * n);
++        SEAL_ALLOCATE_GET_RNS_ITER(coefficients, n, q, pool);
++        set_uint(input.data(1), q * n, coefficients);
++        inverse_ntt_negacyclic_harvey(coefficients, q, tables);
++        for (size_t i = 0; i <= q; ++i) {
++            const auto key_index = i == q ? key_modulus.size() - 1 : i;
++            for (size_t j = 0; j < q; ++j) {
++                CoeffIter digit(next.digits_.data() + (i * q + j) * n);
++                if (i == j) set_uint(input.data(1) + j * n, n, digit);
++                else {
++                    modulo_poly_coeffs(coefficients[j], n, key_modulus[key_index], digit);
++                    ntt_negacyclic_harvey(digit, tables[key_index]);
++                }
++            }
++        }
++        prepared = std::move(next);
++    }
++
++    void Evaluator::rotate_vector_hoisted(const HoistedRotation &prepared, int steps,
++        const GaloisKeys &keys, Ciphertext &output, MemoryPoolHandle pool) const
++    {
++        auto data = context_.get_context_data(prepared.source_.parms_id());
++        if (!data || prepared.source_.size() != 2 || data->parms().scheme() != scheme_type::ckks)
++            throw invalid_argument("invalid hoisted rotation source");
++        const auto q = data->parms().coeff_modulus().size(), n = data->parms().poly_modulus_degree();
++        if (!product_fits_in(q + 1, q, n) || prepared.digits_.size() != (q + 1) * q * n)
++            throw invalid_argument("invalid hoisted rotation workspace");
++        output = prepared.source_;
++        if (steps == 0) return;
++        auto elt = data->galois_tool()->get_elt_from_step(steps);
++        apply_galois_internal(output, elt, keys, std::move(pool), &prepared);
++    }
++
+     void Evaluator::apply_galois_inplace(
+         Ciphertext &encrypted, uint32_t galois_elt, const GaloisKeys &galois_keys, MemoryPoolHandle pool) const
++    {
++        apply_galois_internal(encrypted, galois_elt, galois_keys, std::move(pool), nullptr);
++    }
++
++    void Evaluator::apply_galois_internal(Ciphertext &encrypted, uint32_t galois_elt,
++        const GaloisKeys &galois_keys, MemoryPoolHandle pool, const HoistedRotation *prepared) const
+     {
+         // Verify parameters.
+         if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+@@ -2559,7 +2615,8 @@
+ 
+         // Calculate (temp * galois_key[0], temp * galois_key[1]) + (ct[0], 0)
+         switch_key_inplace(
+-            encrypted, temp, static_cast<const KSwitchKeys &>(galois_keys), GaloisKeys::get_index(galois_elt), pool);
++            encrypted, temp, static_cast<const KSwitchKeys &>(galois_keys), GaloisKeys::get_index(galois_elt), pool,
++            prepared, galois_elt);
+ #ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+         // Transparent ciphertext output is not allowed.
+         if (encrypted.is_transparent())
+@@ -2628,7 +2685,7 @@
+ 
+     void Evaluator::switch_key_inplace(
+         Ciphertext &encrypted, ConstRNSIter target_iter, const KSwitchKeys &kswitch_keys, size_t kswitch_keys_index,
+-        MemoryPoolHandle pool) const
++        MemoryPoolHandle pool, const HoistedRotation *prepared, uint32_t galois_elt) const
+     {
+         auto parms_id = encrypted.parms_id();
+         auto &context_data = *context_.get_context_data(parms_id);
+@@ -2715,14 +2772,12 @@
+             }
+         }
+ 
+-        // Create a copy of target_iter
++        // A hoisted rotation reuses the source's converted NTT digits.
+         SEAL_ALLOCATE_GET_RNS_ITER(t_target, coeff_count, decomp_modulus_size, pool);
+-        set_uint(target_iter, decomp_modulus_size * coeff_count, t_target);
+-
+-        // In CKKS or BGV, t_target is in NTT form; switch back to normal form
+-        if (scheme == scheme_type::ckks || scheme == scheme_type::bgv)
+-        {
+-            inverse_ntt_negacyclic_harvey(t_target, decomp_modulus_size, key_ntt_tables);
++        if (!prepared) {
++            set_uint(target_iter, decomp_modulus_size * coeff_count, t_target);
++            if (scheme == scheme_type::ckks || scheme == scheme_type::bgv)
++                inverse_ntt_negacyclic_harvey(t_target, decomp_modulus_size, key_ntt_tables);
+         }
+ 
+         // Temporary result
+@@ -2746,8 +2801,13 @@
+                 SEAL_ALLOCATE_GET_COEFF_ITER(t_ntt, coeff_count, pool);
+                 ConstCoeffIter t_operand;
+ 
++                if (prepared) {
++                    ConstCoeffIter digit(prepared->digits_.data() + (I * decomp_modulus_size + J) * coeff_count);
++                    context_data.galois_tool()->apply_galois_ntt(digit, galois_elt, t_ntt);
++                    t_operand = t_ntt;
++                }
+                 // RNS-NTT form exists in input
+-                if ((scheme == scheme_type::ckks || scheme == scheme_type::bgv) && (I == J))
++                else if ((scheme == scheme_type::ckks || scheme == scheme_type::bgv) && (I == J))
+                 {
+                     t_operand = target_iter[J];
+                 }

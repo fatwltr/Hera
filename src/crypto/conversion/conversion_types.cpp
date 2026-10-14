@@ -79,6 +79,9 @@ Result<void> MpcShareTensor::Validate() const
     if (numeric.ring_bits < 2 || numeric.ring_bits > 63 ||
         numeric.scale_bits < 0 || numeric.scale_bits >= numeric.ring_bits)
         return Status::Invalid("MPC share has an invalid numeric format");
+    if (public_value_bound_bits && (*public_value_bound_bits < 0 ||
+        *public_value_bound_bits >= numeric.ring_bits))
+        return Status::Invalid("MPC public value bound does not fit its signed ring");
     const std::uint64_t mask =
         (std::uint64_t{1} << numeric.ring_bits) - 1;
     for (const auto value : local_share)
@@ -99,7 +102,8 @@ Result<void> ComplexMpcSharePair::Validate() const
     if (real.physical_shape != imag.physical_shape ||
         real.numeric.ring_bits != imag.numeric.ring_bits ||
         real.numeric.scale_bits != imag.numeric.scale_bits ||
-        real.numeric.is_signed != imag.numeric.is_signed)
+        real.numeric.is_signed != imag.numeric.is_signed ||
+        real.public_value_bound_bits != imag.public_value_bound_bits)
         return Status::Invalid("complex MPC component contracts differ");
     return {};
 }

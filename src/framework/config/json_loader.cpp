@@ -53,6 +53,7 @@ NormPlacement ParseNorm(const std::string &value)
 {
     if (value == "pre") return NormPlacement::kPreNorm;
     if (value == "post") return NormPlacement::kPostNorm;
+    if (value == "normalized_residual") return NormPlacement::kNormalizedResidual;
     throw std::runtime_error("unknown norm placement: " + value);
 }
 
@@ -104,7 +105,8 @@ TransformerLayerConfig ParseLayer(const ptree &tree, std::size_t index)
          "qk_head_width", "value_head_width", "ffn_width", "norm",
          "activation", "attention_mask", "qkv_bias", "output_bias",
          "ffn_bias", "attention_residual", "ffn_residual",
-         "attention_norm_epsilon", "attention_norm_rsqrt_bits"}, path);
+         "attention_norm_epsilon", "attention_norm_rsqrt_bits",
+         "attention_norm_variance_scale_bits"}, path);
     TransformerLayerConfig layer;
     layer.id = Required<std::string>(tree, "id", path);
     layer.tokens = Required<std::size_t>(tree, "tokens", path);
@@ -130,6 +132,8 @@ TransformerLayerConfig ParseLayer(const ptree &tree, std::size_t index)
         "attention_norm_epsilon", 1.0e-5);
     layer.attention_norm_rsqrt_bits = tree.get<int>(
         "attention_norm_rsqrt_bits", 20);
+    layer.attention_norm_variance_scale_bits = tree.get<int>(
+        "attention_norm_variance_scale_bits", 24);
     return layer;
 }
 

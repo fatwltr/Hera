@@ -1,4 +1,8 @@
 #include "hera/block5_bridge.h"
+#include "hera/detail/he_level.h"
+#include "hera/detail/level_schedule.h"
+#include "hera/detail/he_packing.h"
+#include "hera/pre_ln_entry.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,15 +12,7 @@
 namespace hera {
 namespace {
 
-Result<std::size_t> LevelOf(const HeContext &context,
-                            seal::parms_id_type id)
-{
-    std::size_t level = 0;
-    for (auto data = context.context->first_context_data(); data;
-         data = data->next_context_data(), ++level)
-        if (data->parms_id() == id) return level;
-    return Status::Invalid("ciphertext is outside its declared HE profile");
-}
+using detail::LevelOf;
 
 bool CloseScale(double left, double right)
 {
@@ -27,23 +23,7 @@ bool CloseScale(double left, double right)
 
 bool SamePacking(const HePackingPlan &left, const HePackingPlan &right)
 {
-    if (left.layout != right.layout ||
-        left.logical_shape != right.logical_shape ||
-        left.slot_count != right.slot_count ||
-        left.ciphertext_count != right.ciphertext_count ||
-        left.logical_locations.size() != right.logical_locations.size())
-        return false;
-    for (std::size_t i = 0; i < left.logical_locations.size(); ++i) {
-        if (left.logical_locations[i].size() !=
-            right.logical_locations[i].size()) return false;
-        for (std::size_t j = 0; j < left.logical_locations[i].size(); ++j) {
-            const auto &a = left.logical_locations[i][j];
-            const auto &b = right.logical_locations[i][j];
-            if (a.ciphertext != b.ciphertext || a.slot != b.slot ||
-                a.component != b.component) return false;
-        }
-    }
-    return true;
+    return detail::PackingMatches(left, right);
 }
 
 const PlainParameterHandle *FindPlain(const LayerWeightHandles &weights,
@@ -54,35 +34,7 @@ const PlainParameterHandle *FindPlain(const LayerWeightHandles &weights,
     return nullptr;
 }
 
-Result<PhysicalSlotMap> ToConversionMap(const HePackingPlan &packing)
-{
-    auto valid = packing.Validate();
-    if (!valid.ok()) return valid.status();
-    PhysicalSlotMap map;
-    map.ciphertext_count = packing.ciphertext_count;
-    map.slots_per_ciphertext = packing.slot_count;
-    map.logical_element_count = packing.logical_locations.size();
-    map.assignments.resize(map.ciphertext_count * map.slots_per_ciphertext);
-    for (std::size_t logical = 0;
-         logical < packing.logical_locations.size(); ++logical) {
-        const auto &locations = packing.Locations(logical);
-        if (locations.size() != 1)
-            return Status::Invalid(
-                "conversion requires exactly one lane per logical value");
-        const auto &location = locations.front();
-        auto &assignment = map.assignments[
-            location.ciphertext * map.slots_per_ciphertext + location.slot];
-        auto &index = location.component == ComplexLane::kReal
-            ? assignment.real_logical_index
-            : assignment.imaginary_logical_index;
-        if (index != kUnusedLogicalIndex)
-            return Status::Invalid("conversion packing lane collision");
-        index = logical;
-    }
-    auto map_valid = map.Validate();
-    if (!map_valid.ok()) return map_valid.status();
-    return map;
-}
+using detail::ToConversionMap;
 
 Result<ComplexMpcSharePair> Scatter(const MpcShareTensor &logical,
                                     const HePackingPlan &packing)
@@ -106,42 +58,6 @@ Result<ComplexMpcSharePair> Scatter(const MpcShareTensor &logical,
         {std::move(real), physical, logical.numeric, ComplexComponent::kReal},
         {std::move(imag), physical, logical.numeric,
          ComplexComponent::kImaginary}};
-}
-
-Result<MpcShareTensor> Compact(const ComplexMpcSharePair &physical,
-                               const HePackingPlan &packing,
-                               const TensorShape &shape,
-                               bool is_signed)
-{
-    auto valid = physical.Validate();
-    if (!valid.ok()) return valid.status();
-    std::vector<std::uint64_t> values(packing.logical_locations.size());
-    for (std::size_t logical = 0; logical < values.size(); ++logical) {
-        const auto &location = packing.Locations(logical).front();
-        const auto index = location.ciphertext * packing.slot_count +
-                           location.slot;
-        values[logical] = location.component == ComplexLane::kReal
-            ? physical.real.local_share[index]
-            : physical.imag.local_share[index];
-    }
-    auto numeric = physical.real.numeric;
-    numeric.is_signed = is_signed;
-    return MpcShareTensor{std::move(values), shape, numeric,
-                          ComplexComponent::kReal};
-}
-
-HePackingPlan VariancePlan(std::size_t tokens, std::size_t slots)
-{
-    HePackingPlan plan;
-    plan.layout = Layout::kReduction;
-    plan.logical_shape = {{tokens, 1}};
-    plan.slot_count = slots;
-    plan.ciphertext_count = 1;
-    plan.logical_locations.resize(tokens);
-    for (std::size_t token = 0; token < tokens; ++token)
-        plan.logical_locations[token].push_back(
-            {0, token, ComplexLane::kReal, std::nullopt});
-    return plan;
 }
 
 TensorSpec HeSpec(const TensorShape &shape, Layout layout,
@@ -203,36 +119,48 @@ SealSciBlock5BridgeExecutor::RequiredRotationSteps(
         auto input = FfnGeluPackingPlanner::ComplexColumns(
             {{layer.tokens, layer.ffn_width}}, slots, Layout::kFfn);
         if (!input.ok()) return input.status();
-        auto output = FfnGeluPackingPlanner::ComplexColumns(
-            {{layer.tokens, layer.model_width}}, slots,
-            Layout::kComplexStrictColumn);
+        auto output = FfnGeluPackingPlanner::RealColumns(
+            {{layer.tokens, layer.model_width}}, slots, Layout::kStrictColumn);
         if (!output.ok()) return output.status();
         auto steps = ComplexColumnProjectionKernel::RequiredRotationSteps(
             input.value(), output.value());
         if (!steps.ok()) return steps.status();
         collected[profile].insert(steps.value().begin(), steps.value().end());
         collected[profile].insert(0); // conjugation key
+        for (const auto *boundary : {&input.value(), &output.value()}) {
+            auto map = ToConversionMap(*boundary);
+            if (!map.ok()) return map.status();
+            auto packing = detail::PlanRealConversion(map.value());
+            if (!packing.ok()) return packing.status();
+            collected[profile].insert(packing.value().rotations.begin(), packing.value().rotations.end());
+        }
         return {};
     };
     const auto &layer = config.layers[current_layer_index];
     const auto *execution = FindLayerExecution(config, layer.id);
     if (!execution) return Status::Invalid("Block-5 layer placement is absent");
-    const auto shared = execution->regions.find(HeRegionId::kRegion4);
+    const bool shared_skip = layer.norm == NormPlacement::kNormalizedResidual &&
+        execution->regions.at(HeRegionId::kRegion1).parameter_profile ==
+            execution->regions.at(HeRegionId::kRegion5).parameter_profile;
+    const auto shared = execution->regions.find(shared_skip ? HeRegionId::kRegion5 : HeRegionId::kRegion4);
     if (shared == execution->regions.end())
         return Status::Invalid("Block-5 shared residual region is absent");
     const auto profile_it = config.he_parameter_profiles.find(
         shared->second.parameter_profile);
     if (profile_it == config.he_parameter_profiles.end())
         return Status::Invalid("Block-5 HE profile is absent");
+    if (!shared_skip && execution->regions.at(HeRegionId::kRegion2).parameter_profile !=
+        shared->second.parameter_profile)
+        return Status::Invalid("Region 4 must use the same parameter profile as Region 2");
     auto added = add_projection(layer, shared->second.parameter_profile,
         profile_it->second.polynomial_degree / 2);
     if (!added.ok()) return added.status();
 
     if (include_next_layer && current_layer_index + 1 < config.layers.size()) {
         const auto &next = config.layers[current_layer_index + 1];
-        if (next.norm != NormPlacement::kPreNorm)
+        if (next.norm == NormPlacement::kPostNorm)
             return Status::KernelUnavailable(
-                "automatic cross-layer bridge supports Pre-LN only");
+                "automatic cross-layer bridge supports pre or normalized_residual, not post");
         const auto *next_execution = FindLayerExecution(config, next.id);
         if (!next_execution)
             return Status::Invalid("next-layer placement is absent");
@@ -257,6 +185,18 @@ SealSciBlock5BridgeExecutor::RequiredRotationSteps(
         for (std::size_t step = 1; step < columns; step <<= 1U)
             collected[region1->second.parameter_profile].insert(
                 static_cast<int>(step * stride));
+        collected[region1->second.parameter_profile].insert(0);
+        auto real_plan = AttentionLn2PackingPlanner::RealStrictColumns(
+            {{next.tokens, next.model_width}}, r1->second.polynomial_degree / 2);
+        if (!real_plan.ok()) return real_plan.status();
+        auto map = ToConversionMap(real_plan.value());
+        if (!map.ok()) return map.status();
+        auto packing = detail::PlanRealConversion(map.value());
+        if (!packing.ok()) return packing.status();
+        collected[region1->second.parameter_profile].insert(
+            packing.value().rotations.begin(), packing.value().rotations.end());
+        collected[region2->second.parameter_profile].insert(0);
+        collected[region2->second.parameter_profile].insert(static_cast<int>(r2->second.polynomial_degree / 4));
         auto block2 = SealBlock2Executor::RequiredRotationSteps(
             next, r2->second);
         if (!block2.ok()) return block2.status();
@@ -296,9 +236,9 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
                             report->required_rotation_steps.end()),
                 report->required_rotation_steps.end());
         }
-        if (layer.norm != NormPlacement::kPreNorm)
+        if (layer.norm == NormPlacement::kPostNorm)
             return Status::KernelUnavailable(
-                "Block-5 bridge supports Pre-LN only");
+                "Block-5 bridge supports pre or normalized_residual, not post");
         if (current_weights.layer_id != layer.id)
             return Status::Invalid("Wd weight layer ID mismatch");
         if (!inputs.activation_shares.valid() ||
@@ -313,12 +253,17 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
 
         const auto *execution = FindLayerExecution(config_, layer.id);
         if (!execution) return Status::Invalid("layer HE placement is absent");
-        const auto shared_region = execution->regions.find(HeRegionId::kRegion4);
+        const bool shared_skip = layer.norm == NormPlacement::kNormalizedResidual &&
+            execution->regions.at(HeRegionId::kRegion1).parameter_profile ==
+                execution->regions.at(HeRegionId::kRegion5).parameter_profile;
+        const auto wd_region = shared_skip ? HeRegionId::kRegion5 : HeRegionId::kRegion4;
+        const auto shared_region = execution->regions.find(wd_region);
         if (shared_region == execution->regions.end())
             return Status::Invalid("shared residual HE region is absent");
         const auto &shared = contexts_.Require(
             shared_region->second.parameter_profile, contexts_.role());
-        if (shared.galois_keys.size() == 0)
+        const int wd_scale_bits = shared_skip ? shared.parameters.output_scale_bits : shared.parameters.default_scale_bits;
+        if (contexts_.role() == PartyRole::kServer && shared.galois_keys.size() == 0)
             return Status::FailedPrecondition("Block-5 Galois keys are absent");
 
         auto activation = mpc_tensors_.GetMpcShare(
@@ -328,22 +273,35 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
             {{layer.tokens, layer.ffn_width}}, shared.slot_count(),
             Layout::kFfn);
         if (!activation_plan.ok()) return activation_plan.status();
-        auto output_plan = FfnGeluPackingPlanner::ComplexColumns(
-            {{layer.tokens, layer.model_width}}, shared.slot_count(),
-            Layout::kComplexStrictColumn);
+        if (!shared_skip && execution->regions.at(HeRegionId::kRegion2).parameter_profile != shared.profile)
+            return Status::Invalid("Region 4 must use the same parameter profile as Region 2");
+        auto output_plan = FfnGeluPackingPlanner::RealColumns(
+            {{layer.tokens, layer.model_width}}, shared.slot_count(), Layout::kStrictColumn);
         if (!output_plan.ok()) return output_plan.status();
-        auto real_plan = FfnGeluPackingPlanner::RealColumns(
-            {{layer.tokens, layer.model_width}}, shared.slot_count(),
-            Layout::kStrictColumn);
-        if (!real_plan.ok()) return real_plan.status();
 
+        const bool normalized_skip = layer.norm == NormPlacement::kNormalizedResidual;
         std::size_t residual_level = 0;
         std::optional<SealCipherTensor> residual;
-        if (inputs.ffn_residual) {
-            if (inputs.ffn_residual->spec.he_parameter_profile !=
+        std::optional<MpcShareTensor> residual_shares;
+        if (inputs.ffn_residual && normalized_skip && !shared_skip) {
+            if (inputs.ffn_residual->spec.domain != Domain::kMpcArithmeticShare ||
+                inputs.ffn_residual->spec.layout != Layout::kStrictColumn ||
+                inputs.ffn_residual->spec.shape != TensorShape{{layer.tokens, layer.model_width}})
+                return Status::Invalid("normalized FFN residual must contain complete LN2 shares");
+            auto loaded = mpc_tensors_.GetMpcShare(inputs.ffn_residual->id);
+            if (!loaded.ok()) return loaded.status();
+            residual_shares = loaded.take_value();
+            if (residual_shares->numeric.ring_bits != activation.value().numeric.ring_bits ||
+                residual_shares->numeric.scale_bits != activation.value().numeric.scale_bits ||
+                !residual_shares->numeric.is_signed)
+                return Status::Invalid("normalized FFN residual numeric format mismatch");
+            residual_level = AttentionLn2LevelPlanner::OutputInputLevel(shared.parameters) + 1;
+        } else if (inputs.ffn_residual) {
+            if (inputs.ffn_residual->spec.domain != Domain::kHeCiphertext ||
+                inputs.ffn_residual->spec.planned_scale_bits != std::optional<int>{wd_scale_bits} ||
+                inputs.ffn_residual->spec.he_parameter_profile !=
                     shared.profile ||
-                inputs.ffn_residual->spec.layout !=
-                    Layout::kComplexStrictColumn ||
+                inputs.ffn_residual->spec.layout != output_plan.value().layout ||
                 inputs.ffn_residual->spec.shape !=
                     TensorShape{{layer.tokens, layer.model_width}} ||
                 !inputs.ffn_residual->spec.planned_level)
@@ -370,62 +328,94 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
                         "residual metadata does not match its parms_id");
             }
         } else {
-            // Without a residual, use the conventional level-6 Wd output.
-            residual_level = 6;
+            // Match the LN2 tail level even when its skip is disabled.
+            residual_level = shared_skip
+                ? shared.parameters.coefficient_modulus_bits.size() - shared.parameters.terminal_prime_count - (kFfnSuffixDepth - 1)
+                : AttentionLn2LevelPlanner::OutputInputLevel(shared.parameters) + 1;
         }
 
         const auto terminal_level =
             shared.parameters.coefficient_modulus_bits.size() -
             shared.parameters.terminal_prime_count;
-        const bool has_next_layer =
-            current_layer_index_ + 1 < config_.layers.size();
-        // A cross-layer hidden state is immediately converted by the next
-        // Pre-LN entry. Place Wd one level before terminal so accurate
-        // realification lands exactly on the conversion boundary. The final
-        // layer keeps the earlier output level because it is returned as HE.
-        const auto wd_output_level = has_next_layer
-            ? terminal_level - 1 : residual_level;
-        if (wd_output_level == 0 || wd_output_level >= terminal_level)
-            return Status::FailedPrecondition(
-                "shared profile has no Wd/realify suffix");
-        if (residual_level > wd_output_level)
-            return Status::FailedPrecondition(
-                "FFN residual is already below the planned Wd output");
+        // Shared R1/R5: encrypt the activation immediately above the LN1
+        // statistics suffix, rather than carrying unused high-level primes.
+        // Standard Pre-LN retains the Wo boundary for its raw hidden skip.
+        const auto wd_output_level = shared_skip
+            ? std::max(residual_level, detail::SharedFfnOutputLevel(shared.parameters))
+            : residual_level;
+        if (wd_output_level == 0 || wd_output_level > terminal_level)
+            return Status::FailedPrecondition("shared profile has no Wd suffix");
 
         auto activation_pair = Scatter(activation.value(),
                                        activation_plan.value());
         if (!activation_pair.ok()) return activation_pair.status();
         auto activation_map = ToConversionMap(activation_plan.value());
         if (!activation_map.ok()) return activation_map.status();
+        TensorShape conversion_shape{{layer.tokens, layer.ffn_width}};
+        if (residual_shares) {
+            auto pair = Scatter(*residual_shares, output_plan.value());
+            if (!pair.ok()) return pair.status();
+            auto map = ToConversionMap(output_plan.value());
+            if (!map.ok()) return map.status();
+            const auto logical_offset = activation_map.value().logical_element_count;
+            for (auto assignment : map.value().assignments) {
+                if (assignment.real_logical_index != kUnusedLogicalIndex)
+                    assignment.real_logical_index += logical_offset;
+                activation_map.value().assignments.push_back(assignment);
+            }
+            activation_map.value().logical_element_count += map.value().logical_element_count;
+            activation_map.value().ciphertext_count += map.value().ciphertext_count;
+            for (auto planes : {std::make_pair(&activation_pair.value().real, &pair.value().real),
+                                std::make_pair(&activation_pair.value().imag, &pair.value().imag)}) {
+                planes.first->local_share.insert(planes.first->local_share.end(),
+                    planes.second->local_share.begin(), planes.second->local_share.end());
+                planes.first->physical_shape = {{activation_map.value().ciphertext_count, shared.slot_count()}};
+            }
+            conversion_shape = {{activation_map.value().logical_element_count}};
+        }
         auto before = converter_.stats();
-        auto activation_he = converter_.MpcToCkks(
+        auto activation_he = converter_.MpcToCkksPacked(
             activation_pair.value(),
             {shared.profile, wd_output_level - 1,
-             shared.parameters.default_scale_bits,
-             {{layer.tokens, layer.ffn_width}}, Layout::kFfn,
-             activation_map.take_value()});
+             wd_scale_bits,
+             conversion_shape, Layout::kFfn, activation_map.take_value()});
         if (!activation_he.ok()) return activation_he.status();
         AccumulateConversion(before, converter_.stats(), report, true);
 
         const auto allocate_id = [&]() {
-            return ids_ ? ids_->Next() : next_id_.fetch_add(1);
+            return (ids_ ? ids_ : &owned_ids_)->Next();
         };
         const auto hidden_id = allocate_id();
-        const auto hidden_level = wd_output_level + 1;
+        const auto hidden_level = wd_output_level;
         const auto hidden_spec = HeSpec(
             {{layer.tokens, layer.model_width}}, Layout::kStrictColumn,
-            HeRegionId::kRegion4, shared, hidden_level,
-            shared.parameters.default_scale_bits, config_.mpc_numeric);
+            wd_region, shared, hidden_level,
+            wd_scale_bits, config_.mpc_numeric);
         if (contexts_.role() == PartyRole::kServer) {
             if (!activation_he.value())
                 return Status::Internal("server did not receive GeLU ciphertext");
             SealCipherTensor encoded;
             encoded.parameter_profile = shared.profile;
-            encoded.ciphertexts = activation_he.value()->ciphertexts;
+            auto &converted = activation_he.value()->ciphertexts;
+            const auto activation_cts = activation_plan.value().ciphertext_count;
+            if (converted.size() != activation_cts +
+                (residual_shares ? output_plan.value().ciphertext_count : 0))
+                return Status::Internal("batched activation/residual ciphertext count mismatch");
+            for (std::size_t ct = 0; ct < activation_cts; ++ct)
+                encoded.ciphertexts.push_back(std::move(converted[ct]));
+            if (residual_shares) {
+                residual.emplace();
+                residual->parameter_profile = shared.profile;
+                residual->physical_packing = output_plan.value();
+                residual->logical_spec = hidden_spec;
+                residual->logical_spec.planned_level = wd_output_level - 1;
+                for (std::size_t ct = activation_cts; ct < converted.size(); ++ct)
+                    residual->ciphertexts.push_back(std::move(converted[ct]));
+            }
             encoded.logical_spec = HeSpec(
                 {{layer.tokens, layer.ffn_width}}, Layout::kFfn,
-                HeRegionId::kRegion4, shared, wd_output_level - 1,
-                shared.parameters.default_scale_bits, config_.mpc_numeric);
+                wd_region, shared, wd_output_level - 1,
+                wd_scale_bits, config_.mpc_numeric);
             encoded.physical_packing = activation_plan.value();
 
             if (!current_weights.wd.valid() ||
@@ -445,8 +435,8 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
             }
             auto down = ComplexColumnProjectionKernel::Evaluate(
                 encoded, *wd.value(), bd, output_plan.value(),
-                HeRegionId::kRegion4,
-                shared.parameters.default_scale_bits, shared,
+                wd_region,
+                wd_scale_bits, shared,
                 report ? &report->he : nullptr, config_.threads);
             if (!down.ok()) return down.status();
             if (layer.ffn_residual) {
@@ -472,12 +462,7 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
                 }
                 if (report) ++report->direct_residual_additions;
             }
-            auto hidden = ComplexColumnRealifyKernel::Evaluate(
-                down.value(), real_plan.value(),
-                shared.parameters.default_scale_bits, shared,
-                report ? &report->he : nullptr);
-            if (!hidden.ok()) return hidden.status();
-            auto stored = he_tensors_.Put(hidden_id, hidden.take_value());
+            auto stored = he_tensors_.Put(hidden_id, down.take_value());
             if (!stored.ok()) return stored.status();
         }
 
@@ -489,223 +474,30 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
             return outputs;
         }
         // The graph-wide orchestrator closes one layer at a time and lets the
-        // reusable Pre-LN entry stage refresh the next residual. Keep the old
-        // cross-layer path only when next-layer weights are explicitly passed.
+        // reusable Pre-LN entry stage prepare the next residual. Explicit
+        // bridging delegates to that same stage, including its frozen cache.
         if (!next_weights)
             return outputs;
-        const auto &next = config_.layers[current_layer_index_ + 1];
-        if (next.norm != NormPlacement::kPreNorm)
-            return Status::KernelUnavailable(
-                "automatic cross-layer bridge supports Pre-LN only");
-        if (next.tokens != layer.tokens || next.model_width != layer.model_width)
-            return Status::Invalid("adjacent hidden-state shapes differ");
-        const auto *next_execution = FindLayerExecution(config_, next.id);
-        if (!next_execution)
-            return Status::Invalid("next-layer placement is absent");
-        const auto region1_it = next_execution->regions.find(HeRegionId::kRegion1);
-        const auto region2_it = next_execution->regions.find(HeRegionId::kRegion2);
-        if (region1_it == next_execution->regions.end() ||
-            region2_it == next_execution->regions.end())
-            return Status::Invalid("next-layer Region 1/2 is absent");
-        const auto &region1 = contexts_.Require(
-            region1_it->second.parameter_profile, contexts_.role());
-        const auto &region2 = contexts_.Require(
-            region2_it->second.parameter_profile, contexts_.role());
-
-        std::optional<SealCipherBatch> hidden_batch;
-        if (contexts_.role() == PartyRole::kServer) {
-            auto hidden = he_tensors_.Get(hidden_id);
-            if (!hidden.ok()) return hidden.status();
-            auto map = ToConversionMap(hidden.value().physical_packing);
-            if (!map.ok()) return map.status();
-            hidden_batch = SealCipherBatch{
-                shared.profile, hidden.value().ciphertexts,
-                hidden_spec.shape, hidden_spec.layout, map.take_value()};
+        SealSciPreLnEntryExecutor entry(config_, current_layer_index_ + 1,
+            contexts_, he_tensors_, mpc_tensors_, parameters_, converter_, mpc_layer_norm_,
+            ids_ ? ids_ : &owned_ids_);
+        PreLnEntryExecutionReport next_report;
+        PreLnEntryShareOutputs retained;
+        auto next = entry.Evaluate(outputs.hidden_states, *next_weights,
+            report ? &next_report : nullptr, &retained);
+        if (!next.ok()) return next.status();
+        if (report) {
+            report->ckks_to_mpc_calls += next_report.ckks_to_mpc_calls;
+            report->mpc_to_ckks_calls += next_report.mpc_to_ckks_calls;
+            report->conversion_communication_bytes += next_report.conversion_communication_bytes;
+            report->conversion_rounds += next_report.conversion_rounds;
+            report->conversion_milliseconds += next_report.conversion_milliseconds;
+            report->layer_norm = std::move(next_report.statistics);
+            report->next_block2 = std::move(next_report.block2);
         }
-        before = converter_.stats();
-        auto hidden_physical = converter_.CkksToMpc(hidden_batch);
-        if (!hidden_physical.ok()) return hidden_physical.status();
-        AccumulateConversion(before, converter_.stats(), report, false);
-        auto hidden_shares = Compact(hidden_physical.value(), real_plan.value(),
-                                     hidden_spec.shape, true);
-        if (!hidden_shares.ok()) return hidden_shares.status();
-
-        auto region1_plan = FfnGeluPackingPlanner::RealColumns(
-            hidden_spec.shape, region1.slot_count(), Layout::kStrictColumn);
-        if (!region1_plan.ok()) return region1_plan.status();
-        auto region1_pair = Scatter(hidden_shares.value(), region1_plan.value());
-        if (!region1_pair.ok()) return region1_pair.status();
-        auto region1_map = ToConversionMap(region1_plan.value());
-        if (!region1_map.ok()) return region1_map.status();
-        before = converter_.stats();
-        auto region1_he = converter_.MpcToCkks(
-            region1_pair.value(),
-            {region1.profile, std::size_t{0},
-             region1.parameters.input_scale_bits, hidden_spec.shape,
-             Layout::kStrictColumn, region1_map.take_value()});
-        if (!region1_he.ok()) return region1_he.status();
-        AccumulateConversion(before, converter_.stats(), report, true);
-
-        std::optional<LayerNormStatisticsOutputs> statistics;
-        if (contexts_.role() == PartyRole::kServer) {
-            if (!region1_he.value())
-                return Status::Internal(
-                    "server did not receive next Region-1 ciphertext");
-            SealCipherTensor input;
-            input.parameter_profile = region1.profile;
-            input.ciphertexts = region1_he.value()->ciphertexts;
-            input.logical_spec = HeSpec(
-                hidden_spec.shape, Layout::kStrictColumn,
-                HeRegionId::kRegion1, region1, 0,
-                region1.parameters.input_scale_bits, config_.mpc_numeric);
-            input.physical_packing = region1_plan.value();
-            auto computed = LayerNormStatisticsKernel::Evaluate(
-                input, next, region1,
-                report ? &report->layer_norm : nullptr);
-            if (!computed.ok()) return computed.status();
-            statistics = computed.take_value();
-        }
-
-        auto convert_statistics = [&](bool centered)
-            -> Result<MpcShareTensor> {
-            const auto shape = centered
-                ? TensorShape{{next.tokens, next.model_width}}
-                : TensorShape{{next.tokens, 1}};
-            const auto plan = centered ? region1_plan.value()
-                                       : VariancePlan(next.tokens,
-                                                      region1.slot_count());
-            std::optional<SealCipherBatch> batch;
-            if (contexts_.role() == PartyRole::kServer) {
-                const auto &tensor = centered ? statistics->centered
-                                              : statistics->variance;
-                auto map = ToConversionMap(tensor.physical_packing);
-                if (!map.ok()) return map.status();
-                batch = SealCipherBatch{region1.profile, tensor.ciphertexts,
-                                        shape, plan.layout,
-                                        map.take_value()};
-            }
-            auto before_local = converter_.stats();
-            auto physical = converter_.CkksToMpc(batch);
-            if (!physical.ok()) return physical.status();
-            AccumulateConversion(before_local, converter_.stats(), report,
-                                 false);
-            return Compact(physical.value(), plan, shape, true);
-        };
-        auto centered = convert_statistics(true);
-        if (!centered.ok()) return centered.status();
-        auto variance = convert_statistics(false);
-        if (!variance.ok()) return variance.status();
-        auto inverse = mpc_layer_norm_.ReciprocalSqrt(
-            variance.value(), next.attention_norm_rsqrt_bits,
-            report ? &report->layer_norm : nullptr);
-        if (!inverse.ok()) return inverse.status();
-        // Keep the shared LayerNorm OT stream available to the orchestrator.
-
-        const auto centered_id = allocate_id();
-        const auto inverse_id = allocate_id();
-        TensorSpec centered_spec;
-        centered_spec.shape = centered.value().physical_shape;
-        centered_spec.domain = Domain::kMpcArithmeticShare;
-        centered_spec.layout = Layout::kStrictColumn;
-        centered_spec.numeric = centered.value().numeric;
-        TensorSpec inverse_spec;
-        inverse_spec.shape = inverse.value().physical_shape;
-        inverse_spec.domain = Domain::kMpcArithmeticShare;
-        inverse_spec.layout = Layout::kReduction;
-        inverse_spec.numeric = inverse.value().numeric;
-        auto stored = mpc_tensors_.PutMpcShare(centered_id, centered.value());
-        if (!stored.ok()) return stored.status();
-        stored = mpc_tensors_.PutMpcShare(inverse_id, inverse.value());
-        if (!stored.ok()) return stored.status();
-
-        auto dense = MultiHeadPackingPlan::DenseSpatial(
-            hidden_spec.shape, region2.slot_count());
-        if (!dense.ok()) return dense.status();
-        auto centered_dense = Scatter(centered.value(), dense.value());
-        if (!centered_dense.ok()) return centered_dense.status();
-        MpcShareTensor inverse_broadcast;
-        inverse_broadcast.physical_shape = hidden_spec.shape;
-        inverse_broadcast.numeric = inverse.value().numeric;
-        inverse_broadcast.component = ComplexComponent::kReal;
-        inverse_broadcast.local_share.resize(next.tokens * next.model_width);
-        for (std::size_t token = 0; token < next.tokens; ++token)
-            for (std::size_t feature = 0; feature < next.model_width; ++feature)
-                inverse_broadcast.local_share[token * next.model_width + feature] =
-                    inverse.value().local_share[token];
-        auto inverse_dense = Scatter(inverse_broadcast, dense.value());
-        if (!inverse_dense.ok()) return inverse_dense.status();
-        auto dense_map = ToConversionMap(dense.value());
-        if (!dense_map.ok()) return dense_map.status();
-        before = converter_.stats();
-        auto centered_he = converter_.MpcToCkks(
-            centered_dense.value(),
-            {region2.profile, std::size_t{0},
-             region2.parameters.input_scale_bits, hidden_spec.shape,
-             Layout::kSpatial, dense_map.value()});
-        if (!centered_he.ok()) return centered_he.status();
-        AccumulateConversion(before, converter_.stats(), report, true);
-        before = converter_.stats();
-        auto inverse_he = converter_.MpcToCkks(
-            inverse_dense.value(),
-            {region2.profile, std::size_t{0},
-             region2.parameters.input_scale_bits, hidden_spec.shape,
-             Layout::kSpatial, dense_map.value()});
-        if (!inverse_he.ok()) return inverse_he.status();
-        AccumulateConversion(before, converter_.stats(), report, true);
-
-        const auto block_centered_id = allocate_id();
-        const auto block_inverse_id = allocate_id();
-        const auto score_id = allocate_id();
-        const auto value_id = allocate_id();
-        const auto block_input_spec = HeSpec(
-            hidden_spec.shape, Layout::kSpatial, HeRegionId::kRegion2,
-            region2, 0, region2.parameters.input_scale_bits,
-            config_.mpc_numeric);
-        if (contexts_.role() == PartyRole::kServer) {
-            if (!centered_he.value() || !inverse_he.value())
-                return Status::Internal(
-                    "server did not receive next Block-2 inputs");
-            SealCipherTensor centered_tensor{
-                region2.profile, centered_he.value()->ciphertexts,
-                block_input_spec, dense.value()};
-            SealCipherTensor inverse_tensor{
-                region2.profile, inverse_he.value()->ciphertexts,
-                block_input_spec, dense.value()};
-            stored = he_tensors_.Put(block_centered_id,
-                                     std::move(centered_tensor));
-            if (!stored.ok()) return stored.status();
-            stored = he_tensors_.Put(block_inverse_id,
-                                     std::move(inverse_tensor));
-            if (!stored.ok()) return stored.status();
-            SealBlock2Executor block2(config_, next, contexts_, he_tensors_,
-                                      parameters_);
-            auto result = block2.Evaluate(
-                {{block_centered_id, block_input_spec},
-                 {block_inverse_id, block_input_spec}},
-                *next_weights, report ? &report->next_block2 : nullptr);
-            if (!result.ok()) return result.status();
-            auto scores = he_tensors_.Get(result.value().scaled_attention_scores.id);
-            if (!scores.ok()) return scores.status();
-            auto values = he_tensors_.Get(result.value().value.id);
-            if (!values.ok()) return values.status();
-            stored = he_tensors_.Put(score_id, scores.value());
-            if (!stored.ok()) return stored.status();
-            stored = he_tensors_.Put(value_id, values.value());
-            if (!stored.ok()) return stored.status();
-        }
-        auto score_spec = HeSpec(
-            {{next.q_heads, next.tokens, next.tokens}},
-            Layout::kAttentionDiagonal, HeRegionId::kRegion2, region2,
-            region2.parameters.coefficient_modulus_bits.size() -
-                region2.parameters.terminal_prime_count,
-            region2.parameters.output_scale_bits, config_.mpc_numeric);
-        auto value_spec = HeSpec(
-            {{next.tokens, next.kv_heads, next.value_head_width}},
-            Layout::kMultiHeadV, HeRegionId::kRegion2, region2, 2,
-            region2.parameters.default_scale_bits, config_.mpc_numeric);
         outputs.next_layer = NextLayerBridgeOutputs{
-            {centered_id, centered_spec}, {inverse_id, inverse_spec},
-            {{score_id, score_spec}, {value_id, value_spec}}};
+            retained.centered_shares, retained.inverse_stddev_shares,
+            next.value().block2, next.value().attention_residual};
         return outputs;
     } catch (const std::exception &error) {
         return Status::Internal(std::string("Block-5 bridge evaluation: ") +

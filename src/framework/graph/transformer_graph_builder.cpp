@@ -34,24 +34,30 @@ Result<TensorId> BuildPreNormLayer(GraphBuilder &graph, TensorId input,
                                    const PlacementConfig &placement,
                                    bool has_next_layer)
 {
+    const bool normalized_skip = layer.norm == NormPlacement::kNormalizedResidual;
+    const bool shared_ffn = normalized_skip &&
+        graph.ActiveProfile(placement.ln_statistics) == graph.ActiveProfile(placement.ffn_activation);
     auto ln1 = LayerNormGraphModule::Build(
         graph, input,
         {layer.id + ".ln1", layer.model_width, placement.ln_statistics,
-         placement.attention_main, layer.attention_norm_epsilon});
+         placement.attention_main, layer.attention_norm_epsilon,
+         shared_ffn ? std::optional<int>{graph.ActiveParameters(placement.ln_statistics).output_scale_bits} : std::nullopt});
     if (!ln1.ok()) return ln1.status();
-    auto attention = BuildAttention(graph, ln1.value(), input, layer,
-                                    softmax_config, placement, layer.id);
+    auto attention = BuildAttention(graph, ln1.value(), normalized_skip ? ln1.value() : input,
+                                    layer, softmax_config, placement, layer.id);
     if (!attention.ok()) return attention.status();
+    TensorId ln2_residual{};
     auto ln2 = LayerNormGraphModule::Build(
         graph, attention.value().hidden_states,
         {layer.id + ".ln2", layer.model_width,
          placement.attention_output_ln2, placement.ffn_activation,
-         layer.attention_norm_epsilon});
+         layer.attention_norm_epsilon},
+        normalized_skip && layer.ffn_residual ? &ln2_residual : nullptr);
     if (!ln2.ok()) return ln2.status();
     return FeedForwardGraphModule::Build(
-        graph, ln2.value(), attention.value().ffn_residual, layer,
+        graph, ln2.value(), normalized_skip ? ln2_residual : attention.value().ffn_residual, layer,
         gelu_config, placement.ffn_activation,
-        placement.attention_output_ln2, has_next_layer,
+        shared_ffn ? placement.ffn_activation : placement.attention_output_ln2, has_next_layer,
         layer.id + ".ffn");
 }
 
@@ -92,17 +98,16 @@ Result<TransformerGraph> BuildTransformerGraph(const HeraConfig &config)
     try {
         GraphBuilder graph(config);
         const auto &first = config.layers.front();
-        const auto entry_region = first.norm == NormPlacement::kPreNorm
-            ? config.placement.ln_statistics
-            : config.placement.attention_main;
+        graph.SetActiveLayer(first.id);
+        const auto entry_region = config.placement.attention_main;
         TensorSpec input_spec;
         input_spec.shape = {{first.tokens, first.model_width}};
         input_spec.domain = Domain::kHeCiphertext;
         // The real runtime consumes a real-only strict-column ciphertext so
         // Region-1 LayerNorm reductions have an unambiguous physical input
         // contract. Other layouts require an explicit producer/repack step.
-        input_spec.layout = first.norm == NormPlacement::kPreNorm
-            ? Layout::kStrictColumn : Layout::kSpatial;
+        input_spec.layout = first.norm == NormPlacement::kPostNorm
+            ? Layout::kSpatial : Layout::kStrictColumn;
         input_spec.numeric = config.mpc_numeric;
         input_spec.he_region = entry_region;
         graph.SetActiveLayer(first.id);
@@ -113,7 +118,7 @@ Result<TransformerGraph> BuildTransformerGraph(const HeraConfig &config)
             const auto &layer = config.layers[layer_index];
             const bool has_next_layer = layer_index + 1 < config.layers.size();
             graph.SetActiveLayer(layer.id);
-            Result<TensorId> next = layer.norm == NormPlacement::kPreNorm
+            Result<TensorId> next = layer.norm != NormPlacement::kPostNorm
                 ? BuildPreNormLayer(graph, current, layer, config.softmax,
                                     config.gelu, config.placement,
                                     has_next_layer)

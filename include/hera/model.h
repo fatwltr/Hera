@@ -8,7 +8,9 @@
 
 namespace hera {
 
-enum class NormPlacement { kPreNorm, kPostNorm };
+// NormalizedResidual follows Figure 10: each LN output feeds both the
+// projection and its residual. It is distinct from standard Pre-LN.
+enum class NormPlacement { kPreNorm, kPostNorm, kNormalizedResidual };
 enum class ActivationKind { kGelu, kRelu, kSilu };
 enum class AttentionMaskKind { kNone, kPublicPadding, kPublicCausal };
 
@@ -37,7 +39,13 @@ struct TransformerLayerConfig {
     // narrower working ring is valid only when every non-negative variance
     // fits its signed fixed-point range.
     int attention_norm_rsqrt_bits{20};
+    // Local variance precision; centered and inverse shares keep the global
+    // MPC format. Preserve epsilon through HE->MPC before computing rsqrt.
+    int attention_norm_variance_scale_bits{24};
 };
+
+// LN2 tail (1), real-output Wu (1), GeLU polynomial (3).
+inline constexpr std::size_t kFfnSuffixDepth = 5;
 
 struct MatrixSpec {
     std::string name;

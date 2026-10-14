@@ -12,7 +12,7 @@ seal_source=$(realpath "$1")
 output_parent=$(realpath -m "$(dirname "$2")")
 output="$output_parent/$(basename "$2")"
 jobs=${3:-2}
-compression=${4:-none}
+compression=${4:-zstd}
 
 [[ -f "$seal_source/CMakeLists.txt" ]] || {
   echo "Not a Microsoft SEAL source tree: $seal_source" >&2
@@ -38,6 +38,12 @@ grep -Eq 'project\(SEAL VERSION 4\.4\.5([[:space:]]|\))' \
   echo "Refusing to overwrite existing path: $output" >&2
   exit 2
 }
+
+# The checked-in CKKS hoisting patch is part of the HERA SEAL build.
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if ! grep -q 'HERA_SEAL_ROTATION_HOISTING' "$seal_source/native/src/seal/evaluator.h"; then
+  patch -d "$seal_source" -p1 --forward < "$script_dir/seal_rotation_hoisting.patch"
+fi
 
 mkdir -p "$output/build" "$output/install"
 cmake -S "$seal_source" -B "$output/build" \
@@ -66,6 +72,7 @@ fi
 mkdir -p "$output/install/share/hera-seal"
 printf '%s\n' \
   'HERA_SEAL_ABI=1' \
+  'HERA_ROTATION_HOISTING=1' \
   'SEAL_VERSION=4.4.5' \
   "SEAL_COMMIT=$commit" \
   'BUILD_TYPE=Release' \

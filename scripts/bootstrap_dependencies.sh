@@ -70,7 +70,7 @@ checkout_pinned bolt "$BOLT_REPOSITORY" "$BOLT_COMMIT"
 git -C "$src_root/bolt" submodule update --init --depth 1 SCI/extern/eigen
 
 seal_output="$build_root/seal-$SEAL_VERSION"
-seal_compression=${HERA_SEAL_COMPRESSION:-none}
+seal_compression=${HERA_SEAL_COMPRESSION:-zstd}
 seal_dir="$seal_output/install/lib/cmake/SEAL-4.4"
 if [[ ! -f "$seal_dir/SEALConfig.cmake" ]]; then
   [[ ! -e "$seal_output" ]] || {
@@ -93,7 +93,8 @@ if ! grep -qx "SEAL_COMPRESSION=$seal_compression" "$seal_manifest"; then
   fi
 fi
 
-sci_output="$build_root/hera-sci-abi-$HERA_SCI_ABI"
+# Keep the previous ABI-compatible build intact for reproducible comparisons.
+sci_output="$build_root/hera-sci-abi-$HERA_SCI_ABI-correlated"
 sci_dir="$sci_output/install/lib/cmake/SCI"
 if [[ ! -f "$sci_dir/SCIConfig.cmake" ]]; then
   [[ ! -e "$sci_output" ]] || {
@@ -110,6 +111,9 @@ sci_manifest="$sci_output/install/share/hera-sci/manifest.txt"
 grep -qx "HERA_SCI_ABI=$HERA_SCI_ABI" "$sci_manifest"
 grep -qx "SEAL_VERSION=$SEAL_VERSION" "$sci_manifest"
 grep -qx "OT_BACKEND=VOLE_SILENT_OT" "$sci_manifest"
+grep -qx "OT_EXPANSION=UNROLLED_AES_PREFIX_PAD" "$sci_manifest"
+grep -qx "MPC_MEMORY=REUSABLE_SLAB_V1" "$sci_manifest"
+grep -qx "MPC_COMPARISON=CORRELATED_AND_V1" "$sci_manifest"
 grep -qx "BLB_COMMIT=$BLB_COMMIT" "$sci_manifest"
 grep -qx "BOLT_COMMIT=$BOLT_COMMIT" "$sci_manifest"
 

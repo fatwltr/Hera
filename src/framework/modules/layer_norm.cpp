@@ -1,11 +1,13 @@
 #include "hera/modules.h"
 
 #include "module_utils.h"
+#include <algorithm>
 
 namespace hera {
 
 Result<TensorId> LayerNormGraphModule::Build(
-    GraphBuilder &graph, TensorId input, const LayerNormBuildConfig &config)
+    GraphBuilder &graph, TensorId input, const LayerNormBuildConfig &config,
+    TensorId *normalized_residual)
 {
     try {
         using namespace module_internal;
@@ -14,14 +16,13 @@ Result<TensorId> LayerNormGraphModule::Build(
         const auto requested_layout = graph.Spec(input).layout ==
                 Layout::kStrictColumn
             ? Layout::kStrictColumn : Layout::kSpatial;
-        // Region-1 statistics consume real strict columns, but Block 2 has a
-        // fixed dense-spatial producer contract. Do not propagate the
-        // external input layout across the MPC refresh boundary.
+        // Preserve feature columns across LN1's MPC refresh. LN2's FFN
+        // producer continues to use its complex strict-column contract.
         const auto finish_layout = is_second
-            ? Layout::kComplexStrictColumn : Layout::kSpatial;
+            ? Layout::kComplexStrictColumn : Layout::kStrictColumn;
         auto source = EnsureRegion(graph, input, config.statistics_region,
                                    requested_layout,
-                                   config.prefix + ".input");
+                                   config.prefix + ".input", std::nullopt, config.statistics_scale_bits);
         const auto &input_spec = graph.Spec(source);
         if (input_spec.shape.dimensions.size() != 2 ||
             input_spec.shape.dimensions[1] != config.width)
@@ -66,9 +67,12 @@ Result<TensorId> LayerNormGraphModule::Build(
 
         const auto variance_share = HeToMpc(
             graph, variance_epsilon, Layout::kReduction,
-            config.prefix + ".variance.he_to_mpc");
+            config.prefix + ".variance.he_to_mpc",
+            std::max(input_spec.numeric.scale_bits,
+                graph.ActiveLayerConfig().attention_norm_variance_scale_bits));
         auto inverse_spec = ArithmeticShareSpec(
             graph.Spec(variance_share), reduced_shape, Layout::kReduction);
+        inverse_spec.numeric = input_spec.numeric;
         const auto inverse_share = graph.AddNode(
             config.prefix + ".rsqrt", OpKind::kReciprocalSqrt,
             {variance_share}, inverse_spec,
@@ -84,10 +88,10 @@ Result<TensorId> LayerNormGraphModule::Build(
         const auto finish_terminal =
             finish_parameters.coefficient_modulus_bits.size() -
             finish_parameters.terminal_prime_count;
-        constexpr std::size_t kFfnGeluDepth = 6;
+        const auto kFfnGeluDepth = kFfnSuffixDepth;
         if (is_second && finish_terminal < kFfnGeluDepth)
             return Status::FailedPrecondition(
-                config.prefix + ": Region-5 suffix is shorter than six levels");
+                config.prefix + ": Region-5 suffix is shorter than five levels");
         const auto finish_start = is_second
             ? finish_terminal - kFfnGeluDepth : std::size_t{0};
         const auto centered_refreshed = MpcToHe(
@@ -128,12 +132,34 @@ Result<TensorId> LayerNormGraphModule::Build(
             ElementwisePlainAttributes{
                 graph.ActiveLayer(), parameter_prefix + ".gamma",
                 HeKernelKind::kLayerNormTail});
-        return graph.AddNode(
+        const auto output = graph.AddNode(
             config.prefix + ".beta", OpKind::kElementwiseAddPlain,
             {scaled}, affine_spec,
             ElementwisePlainAttributes{
                 graph.ActiveLayer(), parameter_prefix + ".beta",
                 HeKernelKind::kLayerNormTail});
+        if (normalized_residual) {
+            if (!is_second) {
+                *normalized_residual = output;
+            } else {
+                // The full original affine and channel extraction are fused
+                // into the same tail rescale, independent of the Wu branch.
+                auto residual_spec = affine_spec;
+                residual_spec.layout = Layout::kStrictColumn;
+                residual_spec.planned_scale_bits = finish_parameters.output_scale_bits;
+                const auto gain = graph.AddNode(
+                    config.prefix + ".residual_gamma", OpKind::kElementwiseMultiplyPlain,
+                    {normalized}, residual_spec,
+                    ElementwisePlainAttributes{graph.ActiveLayer(), parameter_prefix + ".gamma",
+                                               HeKernelKind::kLayerNormResidual});
+                *normalized_residual = graph.AddNode(
+                    config.prefix + ".residual_beta", OpKind::kElementwiseAddPlain,
+                    {gain}, residual_spec,
+                    ElementwisePlainAttributes{graph.ActiveLayer(), parameter_prefix + ".beta",
+                                               HeKernelKind::kLayerNormResidual});
+            }
+        }
+        return output;
     } catch (const std::exception &error) {
         return Status::Internal(config.prefix + ": " + error.what());
     }

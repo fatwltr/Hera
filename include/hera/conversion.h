@@ -7,6 +7,7 @@
 #include <seal/seal.h>
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -57,6 +58,13 @@ struct ConversionConfig {
     int statistical_security_bits{40};
     int fft_scale_bits{20};
     bool allow_internal_mod_switch{true};
+    // Public upper bound on coefficients per secure batch. Zero chooses
+    // 16384 coefficients per worker. At least one
+    // complete ciphertext is processed even when its degree exceeds this.
+    // Both parties must use the same value; negotiated before OT setup.
+    std::size_t batch_elements{};
+    static constexpr std::size_t DefaultBatchElements(std::size_t workers)
+    { return workers * 16384; }
 };
 
 struct SealCipherBatch {
@@ -72,6 +80,11 @@ struct MpcShareTensor {
     TensorShape physical_shape;
     NumericFormat numeric;
     ComplexComponent component{ComplexComponent::kReal};
+
+    // Optional public producer contract for the reconstructed signed integer:
+    // |x| < 2^bits, before interpreting its fixed-point scale. It is never
+    // inferred from a party's local shares.
+    std::optional<int> public_value_bound_bits{};
 
     Result<void> Validate() const;
 };
@@ -90,6 +103,39 @@ struct MpcToCkksTarget {
     TensorShape logical_shape;
     Layout logical_layout{Layout::kSpatial};
     PhysicalSlotMap slot_map;
+    // Explicit public contract: imaginary lanes are unused and BOTH parties'
+    // imaginary shares are canonical zero. Negotiated before secure work.
+    bool public_zero_imaginary{false};
+    // Applies to both components, including physical padding. The producer
+    // must establish the bound; peers negotiate it before entering SCI.
+    // A valid bound without quarter-ring headroom uses the general path.
+    std::optional<int> public_value_bound_bits{};
+    // Per-ciphertext refinements for concatenated boundaries. Empty or null
+    // entries use the scalar contract. Peers negotiate the entire vector.
+    std::vector<std::optional<int>> public_ciphertext_bound_bits{};
+    // Optional public slot periods for {real, imaginary}, per ciphertext.
+    // Zero means no replication. Only mapped lanes participate; replicas
+    // must have equal local shares on BOTH parties, checked before SCI.
+    // Conversion extends each representative once, then copies its wide
+    // share. This never reuses OT randomness between different values.
+    std::vector<std::array<std::size_t, 2>> public_slot_periods{};
+};
+
+// Accumulated work durations in milliseconds. Secure field/ring stages include
+// their SCI communication. Async local work can overlap other stages, so these
+// values must not be summed to estimate end-to-end latency.
+struct ConversionStageTimes {
+    double preparation{};
+    double handshake{};
+    double sampling{};
+    double mask_encode{};
+    double field_to_ring{};
+    double signed_extend{};
+    double slot_encode{};
+    double slot_decode{};
+    double rns{};
+    double he{};
+    double ciphertext_transport{};
 };
 
 struct ConversionStats {
@@ -102,7 +148,25 @@ struct ConversionStats {
     std::size_t transform_cache_misses{};
     std::size_t local_transform_tasks{};
     std::size_t local_transform_peak_inflight{};
+    std::size_t public_zero_imaginary_ciphertexts{};
+    std::size_t packed_real_input_ciphertexts{};
+    std::size_t packed_real_wire_ciphertexts{};
+    std::size_t real_output_split_ciphertexts{};
+    std::size_t signed_extension_batches{};
+    std::size_t max_signed_extension_elements{};
+    std::size_t bounded_signed_extension_elements{};
+    std::size_t generic_signed_extension_elements{};
+    std::size_t wide_b2a_elements{};
+    std::size_t field_to_ring_batches{};
+    std::size_t max_field_to_ring_elements{};
+    std::size_t radix5_comparison_elements{};
+    std::size_t correlated_comparison_elements{};
+    std::size_t slot_extension_input_elements{};
+    std::size_t slot_extension_unique_elements{};
+    std::size_t slot_extension_padding_elements{};
     double milliseconds{};
+    ConversionStageTimes ckks_to_mpc;
+    ConversionStageTimes mpc_to_ckks;
 };
 
 class IProtocolTransport {
@@ -140,8 +204,9 @@ std::shared_ptr<IRandomSource> MakeProductionRandomSource();
 std::shared_ptr<IRandomSource> MakeDeterministicRandomSourceForTesting(
     const std::vector<std::uint8_t> &seed);
 
-// Direct two-party implementation of BLB Algorithms 1 and 2 with an
-// additional independent Z_(2^ell) output-share refresh in CkksToMpc. The
+// Two-party conversion based on BLB Algorithms 1 and 2. CkksToMpc independently
+// samples coefficient-domain A and slot-domain Z_(2^ell) masks and adds their
+// combined coefficient mask A + Encode(Z) before client decryption. The
 // client is the only party allowed to own a decryption key. The server is the
 // only party that may pass a ciphertext to CkksToMpc and the only party that
 // receives the MpcToCkks result.
@@ -154,16 +219,26 @@ public:
                      std::string peer_address, int worker_port,
                      std::size_t threads,
                      seal::compr_mode_type wire_compression =
-                         seal::compr_mode_type::none);
+                         seal::Serialization::compr_mode_default);
     ~CkksMpcConverter();
     CkksMpcConverter(CkksMpcConverter &&) noexcept;
     CkksMpcConverter &operator=(CkksMpcConverter &&) noexcept;
     CkksMpcConverter(const CkksMpcConverter &) = delete;
     CkksMpcConverter &operator=(const CkksMpcConverter &) = delete;
 
+    // Both parties request the same optional fractional precision; the
+    // existing handshake negotiates it. Other calls keep the global format.
     Result<ComplexMpcSharePair> CkksToMpc(
-        const std::optional<SealCipherBatch> &server_input);
+        const std::optional<SealCipherBatch> &server_input,
+        std::optional<int> output_scale_bits = std::nullopt);
     Result<std::optional<SealCipherBatch>> MpcToCkks(
+        const ComplexMpcSharePair &local_shares,
+        const MpcToCkksTarget &target);
+    // Pack real-only ciphertexts into both lanes during conversion, encoding
+    // the split's 1/2 in RNS. Restore the requested real layout afterwards
+    // using conjugation and scale-1 phases, without rescaling or losing bits
+    // from the MPC shares. Existing complex ciphertexts pass through.
+    Result<std::optional<SealCipherBatch>> MpcToCkksPacked(
         const ComplexMpcSharePair &local_shares,
         const MpcToCkksTarget &target);
 

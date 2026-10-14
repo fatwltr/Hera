@@ -11,7 +11,7 @@
         "qk_head_width": 48,
         "value_head_width": 64,
         "ffn_width": 3072,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -19,7 +19,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -31,7 +31,7 @@
         "qk_head_width": 48,
         "value_head_width": 32,
         "ffn_width": 3056,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -39,7 +39,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -51,7 +51,7 @@
         "qk_head_width": 48,
         "value_head_width": 64,
         "ffn_width": 3072,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -59,7 +59,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -71,7 +71,7 @@
         "qk_head_width": 64,
         "value_head_width": 64,
         "ffn_width": 3056,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -79,7 +79,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -91,7 +91,7 @@
         "qk_head_width": 64,
         "value_head_width": 64,
         "ffn_width": 3072,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -99,7 +99,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -111,7 +111,7 @@
         "qk_head_width": 64,
         "value_head_width": 64,
         "ffn_width": 2768,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -119,7 +119,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -131,7 +131,7 @@
         "qk_head_width": 64,
         "value_head_width": 48,
         "ffn_width": 3072,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -139,7 +139,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -151,7 +151,7 @@
         "qk_head_width": 48,
         "value_head_width": 64,
         "ffn_width": 2464,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -159,7 +159,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -171,7 +171,7 @@
         "qk_head_width": 48,
         "value_head_width": 64,
         "ffn_width": 2144,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -179,7 +179,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -191,7 +191,7 @@
         "qk_head_width": 48,
         "value_head_width": 64,
         "ffn_width": 1232,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -199,7 +199,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -211,7 +211,7 @@
         "qk_head_width": 48,
         "value_head_width": 48,
         "ffn_width": 1232,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -219,7 +219,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       },
       {
@@ -231,7 +231,7 @@
         "qk_head_width": 32,
         "value_head_width": 48,
         "ffn_width": 624,
-        "norm": "pre",
+        "norm": "normalized_residual",
         "activation": "gelu",
         "attention_mask": "public_padding",
         "qkv_bias": true,
@@ -239,7 +239,7 @@
         "ffn_bias": true,
         "attention_residual": true,
         "ffn_residual": true,
-        "attention_norm_epsilon": 1e-5,
+        "attention_norm_epsilon": 1e-05,
         "attention_norm_rsqrt_bits": 20
       }
     ]
@@ -271,24 +271,13 @@
     }
   },
   "he_parameter_profiles": {
-    "bert_base_ln_statistics": {
-      "polynomial_degree": 16384,
-      "coefficient_modulus_bits": [60, 60, 60, 60, 60],
-      "default_scale_bits": 38,
-      "input_scale_bits": 38,
-      "output_scale_bits": 38,
-      "declared_depth": 4,
-      "terminal_prime_count": 1,
-      "require_exact_terminal_level": true,
-      "security_level": "none"
-    },
-    "bert_base_attention_shared": {
+    "bert_base_attention_main": {
       "polynomial_degree": 32768,
-      "coefficient_modulus_bits": [60, 35, 60, 60, 60, 60, 60, 60, 60, 60],
+      "coefficient_modulus_bits": [60, 35, 60, 60, 60, 60, 60],
       "default_scale_bits": 44,
       "input_scale_bits": 44,
       "output_scale_bits": 44,
-      "declared_depth": 9,
+      "declared_depth": 6,
       "terminal_prime_count": 1,
       "require_exact_terminal_level": true,
       "security_level": "none"
@@ -305,136 +294,376 @@
       "security_level": "none"
     },
     "bert_base_ffn": {
-      "polynomial_degree": 32768,
-      "coefficient_modulus_bits": [60, 60, 46, 46, 46, 46, 60, 60],
+      "polynomial_degree": 16384,
+      "coefficient_modulus_bits": [60, 60, 46, 46, 46, 60],
       "default_scale_bits": 45,
       "input_scale_bits": 45,
       "output_scale_bits": 46,
-      "declared_depth": 6,
+      "declared_depth": 5,
       "terminal_prime_count": 1,
       "require_exact_terminal_level": true,
-      "security_level": "none"
+      "security_level": "tc128"
     }
   },
   "layers": [
     {
       "id": "layer0",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer1",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer2",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer3",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer4",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer5",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer6",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer7",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer8",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer9",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer10",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     },
     {
       "id": "layer11",
       "he_regions": {
-        "region1": {"profile": "bert_base_ln_statistics", "input_layout": "spatial", "output_layout": "reduction"},
-        "region2": {"profile": "bert_base_attention_shared", "input_layout": "spatial", "output_layout": "attention_output"},
-        "region3": {"profile": "bert_base_softmax_polynomial", "input_layout": "softmax_rows", "output_layout": "softmax_rows"},
-        "region4": {"profile": "bert_base_attention_shared", "input_layout": "attention_output", "output_layout": "reduction"},
-        "region5": {"profile": "bert_base_ffn", "input_layout": "spatial", "output_layout": "spatial"}
+        "region1": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "reduction"
+        },
+        "region2": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "strict_column",
+          "output_layout": "attention_output"
+        },
+        "region3": {
+          "profile": "bert_base_softmax_polynomial",
+          "input_layout": "softmax_rows",
+          "output_layout": "softmax_rows"
+        },
+        "region4": {
+          "profile": "bert_base_attention_main",
+          "input_layout": "attention_output",
+          "output_layout": "reduction"
+        },
+        "region5": {
+          "profile": "bert_base_ffn",
+          "input_layout": "spatial",
+          "output_layout": "spatial"
+        }
       }
     }
   ],

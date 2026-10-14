@@ -1,4 +1,7 @@
 #include "hera/softmax.h"
+#include "hera/detail/he_level.h"
+#include "hera/detail/he_packing.h"
+#include "hera/detail/nonlinear_contracts.h"
 #include "hera/detail/mpc_session_internal.h"
 #include "hera/detail/parallel_ranges.h"
 
@@ -6,6 +9,7 @@
 #include "FloatingPoint/fixed-point.h"
 #include "OT/ot_pack.h"
 #include "utils/io_pack.h"
+#include <seal/util/ntt.h>
 
 #ifdef I
 #undef I
@@ -18,8 +22,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -51,23 +58,9 @@ bool CloseScale(double actual, double expected)
            std::abs(actual - expected) <= largest * kScaleTolerance;
 }
 
-Result<std::size_t> LevelOf(const HeContext &context,
-                            seal::parms_id_type parms_id)
-{
-    std::size_t level = 0;
-    for (auto data = context.context->first_context_data(); data;
-         data = data->next_context_data(), ++level)
-        if (data->parms_id() == parms_id) return level;
-    return Status::Invalid("ciphertext is outside the Block-3 context");
-}
+using detail::LevelOf;
 
-double DroppedPrime(const HeContext &context, seal::parms_id_type parms_id)
-{
-    const auto data = context.context->get_context_data(parms_id);
-    if (!data || !data->next_context_data())
-        throw std::invalid_argument("Block 3 has no remaining rescale prime");
-    return static_cast<double>(data->parms().coeff_modulus().back().value());
-}
+using detail::DroppedPrime;
 
 Result<void> NormalizeScale(seal::Ciphertext &ciphertext, double target)
 {
@@ -117,6 +110,40 @@ Result<std::vector<bool>> ValidMask(const TransformerLayerConfig &layer,
     return valid;
 }
 
+struct PublicMaskPlan {
+    std::size_t tokens{};
+    PublicAttentionMask source;
+    std::vector<bool> valid;
+    std::vector<std::vector<std::size_t>> columns;
+};
+
+Result<std::shared_ptr<const PublicMaskPlan>> GetMaskPlan(
+    const TransformerLayerConfig &layer, const PublicAttentionMask &mask)
+{
+    // One bounded, thread-local public plan is shared by validation, centering
+    // and normalization. Compare contents, not the address of a mutable mask.
+    thread_local std::shared_ptr<const PublicMaskPlan> cached;
+    if (mask.kind == layer.attention_mask && cached &&
+        cached->tokens == layer.tokens && cached->source.kind == mask.kind &&
+        (mask.kind != AttentionMaskKind::kPublicPadding ||
+         (cached->source.shape == mask.shape &&
+          cached->source.additive_values == mask.additive_values)))
+        return cached;
+    auto validity = ValidMask(layer, mask);
+    if (!validity.ok()) return validity.status();
+    auto plan = std::make_shared<PublicMaskPlan>();
+    plan->tokens = layer.tokens;
+    plan->source = mask;
+    plan->valid = validity.take_value();
+    plan->columns.resize(layer.tokens);
+    for (std::size_t row = 0; row < layer.tokens; ++row)
+        for (std::size_t column = 0; column < layer.tokens; ++column)
+            if (plan->valid[row * layer.tokens + column])
+                plan->columns[row].push_back(column);
+    cached = plan;
+    return cached;
+}
+
 std::size_t RowMajorIndex(std::size_t row, std::size_t head,
                           std::size_t column,
                           const TransformerLayerConfig &layer)
@@ -131,54 +158,11 @@ std::size_t Block2Index(std::size_t head, std::size_t row,
     return (head * layer.tokens + row) * layer.tokens + column;
 }
 
-Result<PhysicalSlotMap> ToConversionMap(const HePackingPlan &packing)
-{
-    auto logical_count = packing.logical_shape.ElementCount();
-    if (!logical_count.ok()) return logical_count.status();
-    PhysicalSlotMap map;
-    map.ciphertext_count = packing.ciphertext_count;
-    map.slots_per_ciphertext = packing.slot_count;
-    map.logical_element_count = logical_count.value();
-    map.assignments.resize(map.ciphertext_count * map.slots_per_ciphertext);
-    for (std::size_t logical = 0;
-         logical < packing.logical_locations.size(); ++logical) {
-        if (packing.logical_locations[logical].size() != 1)
-            return Status::FailedPrecondition(
-                "Softmax score conversion requires one physical score lane");
-        const auto &location = packing.logical_locations[logical].front();
-        auto &assignment = map.assignments[
-            location.ciphertext * map.slots_per_ciphertext + location.slot];
-        if (location.component == ComplexLane::kReal)
-            assignment.real_logical_index = logical;
-        else
-            assignment.imaginary_logical_index = logical;
-    }
-    auto valid = map.Validate();
-    if (!valid.ok()) return valid.status();
-    return map;
-}
+using detail::ToConversionMap;
 
 bool SamePacking(const HePackingPlan &left, const HePackingPlan &right)
 {
-    if (left.layout != right.layout ||
-        left.logical_shape != right.logical_shape ||
-        left.slot_count != right.slot_count ||
-        left.ciphertext_count != right.ciphertext_count ||
-        left.logical_locations.size() != right.logical_locations.size())
-        return false;
-    for (std::size_t logical = 0;
-         logical < left.logical_locations.size(); ++logical) {
-        const auto &a = left.logical_locations[logical];
-        const auto &b = right.logical_locations[logical];
-        if (a.size() != b.size()) return false;
-        for (std::size_t i = 0; i < a.size(); ++i)
-            if (a[i].ciphertext != b[i].ciphertext ||
-                a[i].slot != b[i].slot ||
-                a[i].component != b[i].component ||
-                a[i].packed_query_head != b[i].packed_query_head)
-                return false;
-    }
-    return true;
+    return detail::PackingMatches(left, right);
 }
 
 Result<MpcShareTensor> CompactScores(
@@ -216,7 +200,7 @@ Result<MpcShareTensor> CompactScores(
                           numeric, ComplexComponent::kReal};
 }
 
-ComplexMpcSharePair ScatterDenseReal(const MpcShareTensor &logical,
+ComplexMpcSharePair ScatterBoundaryShares(const MpcShareTensor &logical,
                                      const PhysicalSlotMap &map)
 {
     const std::size_t count = map.ciphertext_count * map.slots_per_ciphertext;
@@ -231,11 +215,18 @@ ComplexMpcSharePair ScatterDenseReal(const MpcShareTensor &logical,
         const auto index = map.assignments[physical].real_logical_index;
         if (index != kUnusedLogicalIndex)
             pair.real.local_share[physical] = logical.local_share[index];
+        const auto imaginary = map.assignments[physical].imaginary_logical_index;
+        if (imaginary != kUnusedLogicalIndex) {
+            const auto value = logical.local_share[imaginary];
+            pair.imag.local_share[physical] = physical % map.slots_per_ciphertext & 1U
+                ? (std::uint64_t{0} - value) & RingMask(logical.numeric.ring_bits)
+                : value;
+        }
     }
     return pair;
 }
 
-Result<MpcShareTensor> CompactDenseReal(
+Result<MpcShareTensor> CompactBoundaryShares(
     const ComplexMpcSharePair &physical, const PhysicalSlotMap &map,
     const TensorShape &shape, bool is_signed)
 {
@@ -248,11 +239,174 @@ Result<MpcShareTensor> CompactDenseReal(
             map.assignments[physical_index].real_logical_index;
         if (logical_index != kUnusedLogicalIndex)
             logical[logical_index] = physical.real.local_share[physical_index];
+        const auto imaginary = map.assignments[physical_index].imaginary_logical_index;
+        if (imaginary != kUnusedLogicalIndex) {
+            const auto value = physical.imag.local_share[physical_index];
+            logical[imaginary] = physical_index % map.slots_per_ciphertext & 1U
+                ? (std::uint64_t{0} - value) & RingMask(physical.imag.numeric.ring_bits)
+                : value;
+        }
     }
     auto numeric = physical.real.numeric;
     numeric.is_signed = is_signed;
     return MpcShareTensor{std::move(logical), shape, numeric,
                           ComplexComponent::kReal};
+}
+
+struct PreparedExponent : PreparedBlock2Program {
+    std::string signature;
+    std::shared_ptr<const seal::Plaintext> divisor;
+    std::shared_ptr<const seal::Plaintext> one;
+};
+
+struct PreparedSoftmaxPacking : PreparedBlock2Program {
+    std::string signature;
+    HePackingPlan scores;
+    PhysicalSlotMap score_map;
+    PhysicalSlotMap exponent_map;
+    PhysicalSlotMap boundary_map;
+};
+
+struct PreparedBoundary : PreparedBlock2Program {
+    std::string signature;
+    seal::Plaintext fresh_phase;
+    seal::Plaintext terminal_phase;
+};
+
+template <class Program>
+Result<std::shared_ptr<const Program>> GetProgram(
+    const std::string &tag, const std::string &signature,
+    const std::function<Result<std::shared_ptr<const Program>>()>& compile)
+{
+    const auto scope = ModelPlaintextCacheScope::Current();
+    if (scope.first) {
+        const auto key = scope.second + "/softmax/" + tag;
+        auto found = scope.first->GetPreparedBlock2Program(key);
+        if (found.ok()) {
+            auto program = std::dynamic_pointer_cast<const Program>(found.value());
+            if (!program || program->signature != signature)
+                return Status::FailedPrecondition("prepared Softmax contract mismatch");
+            return program;
+        }
+        if (!scope.first->preparing_plaintexts()) return found.status();
+        auto compiled = compile();
+        if (!compiled.ok()) return compiled.status();
+        auto stored = scope.first->PutPreparedBlock2Program(key, compiled.value());
+        if (!stored.ok()) return stored.status();
+        return compiled;
+    }
+    // Standalone kernels have no model store. Bound their immutable cache so
+    // changing model geometries cannot retain unbounded packing/plaintext data.
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<const Program>> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = cache.find(signature);
+    if (found != cache.end()) return found->second;
+    auto compiled = compile();
+    if (!compiled.ok()) return compiled.status();
+    if (cache.size() >= 8) cache.erase(cache.begin());
+    cache.emplace(signature, compiled.value());
+    return compiled;
+}
+
+Result<std::shared_ptr<const PreparedExponent>> GetExponentProgram(
+    const HeContext &context, const SoftmaxConfig &config,
+    bool doubled_input = false)
+{
+    auto valid = Block3LevelPlanner::Validate(context.parameters, config);
+    if (!valid.ok()) return valid.status();
+    std::ostringstream key;
+    key << context.profile << '/' << context.parameters.input_scale_bits << '/'
+        << context.parameters.default_scale_bits << '/' << config.exp_divisor_bits
+        << '/' << config.exp_squarings << '/' << doubled_input;
+    for (auto word : context.context->first_parms_id()) key << '/' << word;
+    const auto signature = key.str();
+    return GetProgram<PreparedExponent>("exponent", signature, [&]()
+        -> Result<std::shared_ptr<const PreparedExponent>> {
+        auto program = std::make_shared<PreparedExponent>();
+        program->signature = signature;
+        seal::CKKSEncoder encoder(*context.context);
+        const auto input_id = context.context->first_parms_id();
+        const auto next_id = context.context->first_context_data()
+                                ->next_context_data()->parms_id();
+        const double target = std::ldexp(1.0, context.parameters.default_scale_bits);
+        const double plain_scale = target * DroppedPrime(context, input_id) /
+            std::ldexp(1.0, context.parameters.input_scale_bits);
+        auto divisor = CompileModelPlaintext(encoder,
+            std::vector<std::complex<double>>(context.slot_count(),
+                std::ldexp(1.0, -config.exp_divisor_bits - int(doubled_input))),
+            input_id, plain_scale, doubled_input ? "softmax/divisor_doubled" : "softmax/divisor");
+        if (!divisor.ok()) return divisor.status();
+        auto one = CompileModelPlaintext(encoder,
+            std::vector<std::complex<double>>(context.slot_count(), 1.0),
+            next_id, target, "softmax/one");
+        if (!one.ok()) return one.status();
+        program->divisor = divisor.take_value();
+        program->one = one.take_value();
+        return std::shared_ptr<const PreparedExponent>(std::move(program));
+    });
+}
+
+Result<std::shared_ptr<const PreparedBoundary>> GetBoundaryProgram(const HeContext &context)
+{
+    std::ostringstream key;
+    key << context.profile;
+    for (auto word : context.context->first_parms_id()) key << '/' << word;
+    const auto signature = key.str();
+    return GetProgram<PreparedBoundary>("boundary", signature, [&]()
+        -> Result<std::shared_ptr<const PreparedBoundary>> {
+        auto program = std::make_shared<PreparedBoundary>();
+        program->signature = signature;
+        const auto compile_phase = [&](seal::parms_id_type id) {
+            const auto data = context.context->get_context_data(id);
+            const auto degree = data->parms().poly_modulus_degree();
+            const auto primes = data->parms().coeff_modulus().size();
+            seal::Plaintext phase(degree * primes);
+            std::fill_n(phase.data(), phase.coeff_count(), std::uint64_t{0});
+            for (std::size_t rns = 0; rns < primes; ++rns) {
+                phase[rns * degree + degree / 2] = 1;
+                seal::util::ntt_negacyclic_harvey(
+                    phase.data() + rns * degree, data->small_ntt_tables()[rns]);
+            }
+            phase.parms_id() = id;
+            phase.scale() = 1.0;
+            return phase;
+        };
+        // SEAL's generator 3 slot order evaluates X^(N/2) as i*(-1)^slot.
+        program->fresh_phase = compile_phase(context.context->first_parms_id());
+        program->terminal_phase = compile_phase(context.context->last_parms_id());
+        return std::shared_ptr<const PreparedBoundary>(std::move(program));
+    });
+}
+
+Result<std::shared_ptr<const PreparedSoftmaxPacking>> GetPackingProgram(
+    const TransformerLayerConfig &layer, const HeContext &scores,
+    const HeContext &exponent, const SoftmaxConfig &config)
+{
+    const auto signature = std::to_string(layer.tokens) + '/' +
+        std::to_string(layer.q_heads) + '/' + std::to_string(layer.kv_heads) + '/' +
+        std::to_string(layer.qk_head_width) + '/' + std::to_string(scores.slot_count()) +
+        '/' + std::to_string(exponent.slot_count()) + '/' +
+        std::to_string(config.pad_rows_to_power_of_two);
+    return GetProgram<PreparedSoftmaxPacking>("packing", signature, [&]()
+        -> Result<std::shared_ptr<const PreparedSoftmaxPacking>> {
+        auto packing = MultiHeadPackingPlan::AttentionDiagonal(layer, scores.slot_count());
+        if (!packing.ok()) return packing.status();
+        auto score_map = ToConversionMap(packing.value());
+        if (!score_map.ok()) return score_map.status();
+        auto exponent_map = SoftmaxPackingPlanner::RealRows(
+            layer, exponent.slot_count(), config.pad_rows_to_power_of_two);
+        if (!exponent_map.ok()) return exponent_map.status();
+        auto program = std::make_shared<PreparedSoftmaxPacking>();
+        program->signature = signature;
+        program->scores = packing.take_value();
+        program->score_map = score_map.take_value();
+        program->exponent_map = exponent_map.take_value();
+        auto paired = SoftmaxPackingPlanner::PairedRealRows(program->exponent_map);
+        if (!paired.ok()) return paired.status();
+        program->boundary_map = paired.take_value();
+        return std::shared_ptr<const PreparedSoftmaxPacking>(std::move(program));
+    });
 }
 
 } // namespace
@@ -320,10 +474,67 @@ Result<PhysicalSlotMap> SoftmaxPackingPlanner::RealRows(
     return map;
 }
 
+Result<PhysicalSlotMap> SoftmaxPackingPlanner::PairedRealRows(const PhysicalSlotMap &real)
+{
+    auto valid = real.Validate();
+    if (!valid.ok()) return valid.status();
+    PhysicalSlotMap paired;
+    paired.ciphertext_count = (real.ciphertext_count + 1) / 2;
+    paired.slots_per_ciphertext = real.slots_per_ciphertext;
+    paired.logical_element_count = real.logical_element_count;
+    paired.assignments.resize(paired.ciphertext_count * paired.slots_per_ciphertext);
+    std::size_t tail_extent = 0;
+    if (real.ciphertext_count & 1U)
+        for (std::size_t slot = 0; slot < real.slots_per_ciphertext; ++slot)
+            if (real.assignments[(real.ciphertext_count - 1) * real.slots_per_ciphertext + slot].real_logical_index != kUnusedLogicalIndex)
+                tail_extent = slot + 1;
+    for (std::size_t ct = 0; ct < real.ciphertext_count; ++ct)
+        for (std::size_t slot = 0; slot < real.slots_per_ciphertext; ++slot) {
+            const auto &entry = real.assignments[ct * real.slots_per_ciphertext + slot];
+            if (entry.imaginary_logical_index != kUnusedLogicalIndex)
+                return Status::Invalid("paired boundary requires a real source map");
+            auto &target = paired.assignments[(ct / 2) * real.slots_per_ciphertext + slot];
+            if ((ct & 1U) || ((real.ciphertext_count & 1U) && ct == real.ciphertext_count - 1 && slot >= (tail_extent + 1) / 2))
+                target.imaginary_logical_index = entry.real_logical_index;
+            else target.real_logical_index = entry.real_logical_index;
+        }
+    valid = paired.Validate();
+    if (!valid.ok()) return valid.status();
+    return paired;
+}
+
 Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
     const SealCipherBatch &shifted_scores, const HeContext &context,
     const SoftmaxConfig &config, SoftmaxExecutionReport *report,
     std::size_t he_workers)
+{
+    return Evaluate(SealCipherBatch(shifted_scores), context, config, report, he_workers);
+}
+
+Result<void> SoftmaxExponentKernel::Prepare(
+    const HeContext &context, const SoftmaxConfig &config)
+{
+    try {
+        auto program = GetExponentProgram(context, config);
+        if (!program.ok()) return program.status();
+        return {};
+    } catch (const std::exception &error) {
+        return Status::Internal(std::string("Softmax exponent preparation: ") + error.what());
+    }
+}
+
+Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
+    SealCipherBatch &&shifted_scores, const HeContext &context,
+    const SoftmaxConfig &config, SoftmaxExecutionReport *report,
+    std::size_t he_workers)
+{
+    return EvaluateReal(std::move(shifted_scores), context, config, false, report, he_workers);
+}
+
+Result<SealCipherBatch> SoftmaxExponentKernel::EvaluateReal(
+    SealCipherBatch &&shifted_scores, const HeContext &context,
+    const SoftmaxConfig &config, bool doubled_input,
+    SoftmaxExecutionReport *report, std::size_t he_workers)
 {
     const auto started = Clock::now();
     try {
@@ -343,14 +554,15 @@ Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
                 return Status::Invalid(
                     "Block-3 exponent requires real-only CKKS packing");
 
-        SealCipherBatch output = shifted_scores;
+        auto program = GetExponentProgram(context, config, doubled_input);
+        if (!program.ok()) return program.status();
+        SealCipherBatch output = std::move(shifted_scores);
         const double target = std::ldexp(
             1.0, context.parameters.default_scale_bits);
         auto parallel = detail::ParallelRanges(
-            output.ciphertexts.size(), std::min<std::size_t>(he_workers, 4),
+            output.ciphertexts.size(), he_workers,
             1, [&](std::size_t begin, std::size_t end) -> Result<void> {
                 seal::Evaluator evaluator(*context.context);
-                seal::CKKSEncoder encoder(*context.context);
                 for (std::size_t index = begin; index < end; ++index) {
                     auto &ciphertext = output.ciphertexts[index];
                     auto level = LevelOf(context, ciphertext.parms_id());
@@ -361,19 +573,12 @@ Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
                         return Status::FailedPrecondition(
                             "Block-3 exponent input must be fresh at input scale");
 
-                    const double plain_scale = target * DroppedPrime(
-                        context, ciphertext.parms_id()) / ciphertext.scale();
-                    seal::Plaintext divisor;
-                    encoder.encode(std::ldexp(1.0, -config.exp_divisor_bits),
-                                   ciphertext.parms_id(), plain_scale, divisor);
-                    evaluator.multiply_plain_inplace(ciphertext, divisor);
+                    evaluator.multiply_plain_inplace(ciphertext, *program.value()->divisor);
                     evaluator.rescale_to_next_inplace(ciphertext);
                     auto normalized = NormalizeScale(ciphertext, target);
                     if (!normalized.ok()) return normalized.status();
 
-                    seal::Plaintext one;
-                    encoder.encode(1.0, ciphertext.parms_id(), target, one);
-                    evaluator.add_plain_inplace(ciphertext, one);
+                    evaluator.add_plain_inplace(ciphertext, *program.value()->one);
                     for (std::size_t i = 0; i < config.exp_squarings; ++i) {
                         evaluator.square_inplace(ciphertext);
                         evaluator.relinearize_inplace(
@@ -414,10 +619,123 @@ Result<SealCipherBatch> SoftmaxExponentKernel::Evaluate(
     }
 }
 
+Result<SealCipherBatch> SoftmaxExponentKernel::EvaluatePaired(
+    SealCipherBatch &&shifted_scores, const PhysicalSlotMap &real_map,
+    const HeContext &context, const SoftmaxConfig &config,
+    SoftmaxExecutionReport *report, std::size_t he_workers)
+{
+    const auto started = Clock::now();
+    try {
+        auto expected = SoftmaxPackingPlanner::PairedRealRows(real_map);
+        if (!expected.ok()) return expected.status();
+        if (shifted_scores.parameter_profile != context.profile ||
+            shifted_scores.logical_layout != Layout::kSoftmaxRows ||
+            shifted_scores.slot_map.ciphertext_count != expected.value().ciphertext_count ||
+            shifted_scores.slot_map.slots_per_ciphertext != expected.value().slots_per_ciphertext ||
+            shifted_scores.slot_map.logical_element_count != expected.value().logical_element_count ||
+            shifted_scores.slot_map.assignments != expected.value().assignments ||
+            shifted_scores.ciphertexts.size() != expected.value().ciphertext_count)
+            return Status::Invalid("paired exponent boundary has incompatible packing");
+        if (!context.galois_keys.has_key(2 * context.parameters.polynomial_degree - 1))
+            return Status::FailedPrecondition("paired exponent requires a conjugation key");
+        auto phase = GetBoundaryProgram(context);
+        if (!phase.ok()) return phase.status();
+        SealCipherBatch real{shifted_scores.parameter_profile,
+            std::vector<seal::Ciphertext>(real_map.ciphertext_count),
+            shifted_scores.logical_shape, shifted_scores.logical_layout, real_map};
+        auto parallel = detail::ParallelRanges(
+            shifted_scores.ciphertexts.size(), he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator evaluator(*context.context);
+                for (std::size_t pair = begin; pair < end; ++pair) {
+                    auto &source = shifted_scores.ciphertexts[pair];
+                    if (source.parms_id() != context.context->first_parms_id() ||
+                        !CloseScale(source.scale(), std::ldexp(1.0, context.parameters.input_scale_bits)))
+                        return Status::FailedPrecondition("paired exponent must start fresh at input scale");
+                    seal::Ciphertext conjugated;
+                    evaluator.complex_conjugate(source, context.galois_keys, conjugated);
+                    seal::Ciphertext imaginary;
+                    evaluator.sub(conjugated, source, imaginary);
+                    evaluator.multiply_plain_inplace(imaginary, phase.value()->fresh_phase);
+                    evaluator.add(source, conjugated, real.ciphertexts[2 * pair]);
+                    if (2 * pair + 1 < real.ciphertexts.size())
+                        real.ciphertexts[2 * pair + 1] = std::move(imaginary);
+                    else evaluator.add_inplace(real.ciphertexts[2 * pair], imaginary);
+                }
+                return {};
+            }, detail::EstimatedHeWorkerBytes(context.parameters.polynomial_degree,
+                context.parameters.coefficient_modulus_bits.size(), 12));
+        if (!parallel.ok()) return parallel.status();
+        if (report) {
+            report->conjugations += shifted_scores.ciphertexts.size();
+            report->phase_multiplications += real.ciphertexts.size() / 2;
+            report->ciphertext_plain_multiplications += real.ciphertexts.size() / 2;
+            report->he_milliseconds += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        }
+        // Both recovered lanes equal 2*x. Fuse their 1/2 into the existing
+        // divisor plaintext; this adds no rescale or multiplication depth.
+        return EvaluateReal(std::move(real), context, config, true, report, he_workers);
+    } catch (const std::exception &error) {
+        return Status::Internal(std::string("paired exponent: ") + error.what());
+    }
+}
+
+Result<SealCipherBatch> SoftmaxExponentKernel::PackPaired(
+    SealCipherBatch &&real, const HeContext &context,
+    SoftmaxExecutionReport *report, std::size_t he_workers)
+{
+    const auto started = Clock::now();
+    try {
+        auto map = SoftmaxPackingPlanner::PairedRealRows(real.slot_map);
+        if (!map.ok()) return map.status();
+        if (real.parameter_profile != context.profile ||
+            real.logical_layout != Layout::kSoftmaxRows ||
+            real.ciphertexts.size() != real.slot_map.ciphertext_count)
+            return Status::Invalid("terminal pair input has incompatible metadata");
+        auto phase = GetBoundaryProgram(context);
+        if (!phase.ok()) return phase.status();
+        SealCipherBatch output{real.parameter_profile,
+            std::vector<seal::Ciphertext>(map.value().ciphertext_count),
+            real.logical_shape, real.logical_layout, map.take_value()};
+        auto parallel = detail::ParallelRanges(
+            output.ciphertexts.size(), he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator evaluator(*context.context);
+                for (std::size_t pair = begin; pair < end; ++pair) {
+                    auto &first = real.ciphertexts[2 * pair];
+                    if (first.parms_id() != context.context->last_parms_id())
+                        return Status::FailedPrecondition("packing requires terminal exponent ciphertexts");
+                    if (2 * pair + 1 < real.ciphertexts.size()) {
+                        auto &second = real.ciphertexts[2 * pair + 1];
+                        if (second.parms_id() != first.parms_id() || !CloseScale(first.scale(), second.scale()))
+                            return Status::FailedPrecondition("pair ciphertext levels/scales differ");
+                        evaluator.multiply_plain_inplace(second, phase.value()->terminal_phase);
+                        evaluator.add_inplace(first, second);
+                    } else {
+                        auto imaginary = first;
+                        evaluator.multiply_plain_inplace(imaginary, phase.value()->terminal_phase);
+                        evaluator.add_inplace(first, imaginary);
+                    }
+                    output.ciphertexts[pair] = std::move(first);
+                }
+                return {};
+            }, detail::EstimatedHeWorkerBytes(context.parameters.polynomial_degree, 1, 8));
+        if (!parallel.ok()) return parallel.status();
+        if (report) {
+            report->phase_multiplications += real.ciphertexts.size() / 2;
+            report->ciphertext_plain_multiplications += real.ciphertexts.size() / 2;
+            report->he_milliseconds += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        }
+        return output;
+    } catch (const std::exception &error) {
+        return Status::Internal(std::string("terminal pair packing: ") + error.what());
+    }
+}
+
 class MpcSoftmaxRuntime::Impl {
 public:
-    explicit Impl(std::shared_ptr<SharedMpcSession> session)
-        : session_(std::move(session)), native_(session_->Acquire()),
+    explicit Impl(std::shared_ptr<SharedMpcSession> session, std::size_t worker = 0)
+        : session_(std::move(session)), native_(session_->Acquire(worker)),
           party_(native_->party())
     {}
 
@@ -443,11 +761,52 @@ public:
     }
 
     std::uint64_t communication() const
-    { return native_->communication_bytes(); }
-    std::uint64_t rounds() const { return native_->rounds(); }
+    { return session_->communication_bytes(); }
+    std::uint64_t rounds() const { return session_->rounds(); }
     void Cancel() noexcept { session_->Cancel(); }
     int party() const { return party_; }
     FixOp &fix() { return native_->fix(); }
+
+    std::vector<std::uint64_t> MaximumRows(
+        std::vector<std::uint64_t> candidates,
+        std::vector<std::size_t> widths, const NumericFormat &numeric)
+    {
+        const auto mask = RingMask(numeric.ring_bits);
+        for (auto &share : candidates) share &= mask;
+        for (;;) {
+            std::size_t pairs = 0;
+            for (auto width : widths) pairs += width / 2;
+            if (pairs == 0) return candidates;
+            std::vector<std::uint64_t> left(pairs), right(pairs), maximum(pairs);
+            std::size_t offset = 0, pair = 0;
+            for (auto width : widths) {
+                for (std::size_t i = 0; i + 1 < width; i += 2, ++pair) {
+                    left[pair] = candidates[offset + i]; right[pair] = candidates[offset + i + 1];
+                }
+                offset += width;
+            }
+            constexpr std::size_t batch_limit = 262144;
+            for (std::size_t begin = 0; begin < pairs; begin += batch_limit) {
+                const auto end = std::min(pairs, begin + batch_limit);
+                auto a = Secret({left.begin() + begin, left.begin() + end}, numeric);
+                auto b = Secret({right.begin() + begin, right.begin() + end}, numeric);
+                auto chosen = fix().if_else(fix().GT(a, b), a, b);
+                std::copy_n(chosen.data, end - begin, maximum.begin() + begin);
+            }
+            std::vector<std::uint64_t> next;
+            next.reserve(pairs + widths.size());
+            offset = 0;
+            pair = 0;
+            for (auto &width : widths) {
+                for (std::size_t i = 0; i < width / 2; ++i)
+                    next.push_back(maximum[pair++]);
+                if (width & 1U) next.push_back(candidates[offset + width - 1]);
+                offset += width;
+                width = (width + 1) / 2;
+            }
+            candidates = std::move(next);
+        }
+    }
 
     FixArray MultiplyUnsigned(const FixArray &left, const FixArray &right,
                               int output_bits)
@@ -457,7 +816,14 @@ public:
             output_bits >= 64)
             throw std::invalid_argument(
                 "unsupported unsigned multiplication contract");
-        auto product = fix().mul(left, right, output_bits);
+        // These operands are the clipped unit-interval exponential and its
+        // row reciprocal, not arbitrary unsigned values. A guard bit makes
+        // their reconstructed MSB public zero despite random local shares.
+        const bool bounded = left.ell > left.s + 1 && right.ell > right.s + 1;
+        std::vector<std::uint8_t> zero_msb(bounded ? left.size : 0, 0);
+        auto product = fix().mul(left, right, output_bits,
+                                 bounded ? zero_msb.data() : nullptr,
+                                 bounded ? zero_msb.data() : nullptr);
         product.s = left.s + right.s;
         product.signed_ = false;
         return product;
@@ -493,22 +859,29 @@ public:
         auto take = fix().GT(remainder, divisor_minus_one);
         auto difference = fix().sub(remainder, divisor);
         remainder = fix().if_else(take, difference, remainder);
-        auto quotient = fix().B2A(take, false, output_bits);
-        quotient = fix().mul(
-            quotient, std::uint64_t{1} << output_scale, output_bits);
+        // Boolean quotient bits need not become arithmetic shares until all
+        // restoring-division steps finish. Batch that independent conversion.
+        BoolArray quotient_bits(party_, denominator.size * (output_scale + 1));
+        std::copy_n(take.data, denominator.size,
+                    quotient_bits.data + denominator.size * output_scale);
 
         for (int bit = output_scale - 1; bit >= 0; --bit) {
             auto doubled = fix().mul(remainder, std::uint64_t{2}, work_bits);
             take = fix().GT(doubled, divisor_minus_one);
             difference = fix().sub(doubled, divisor);
             remainder = fix().if_else(take, difference, doubled);
-            auto quotient_bit = fix().B2A(take, false, output_bits);
-            auto contribution = fix().mul(
-                quotient_bit, std::uint64_t{1} << bit, output_bits);
-            quotient = fix().add(quotient, contribution);
+            std::copy_n(take.data, denominator.size,
+                        quotient_bits.data + denominator.size * bit);
         }
-        quotient.s = output_scale;
-        quotient.signed_ = false;
+        auto arithmetic_bits = fix().B2A(quotient_bits, false, output_bits);
+        FixArray quotient(party_, denominator.size, false, output_bits, output_scale);
+        const auto quotient_mask = RingMask(output_bits);
+        for (int row = 0; row < denominator.size; ++row) {
+            std::uint64_t value = 0;
+            for (int bit = 0; bit <= output_scale; ++bit)
+                value += arithmetic_bits.data[denominator.size * bit + row] << bit;
+            quotient.data[row] = value & quotient_mask;
+        }
         return quotient;
     }
 
@@ -518,17 +891,23 @@ public:
         NumericFormat format{values.ell, values.s, values.signed_};
         auto secret_zero = Secret(zero_shares, format);
         auto zero = fix().EQ(values, secret_zero);
-        BoolArray any_zero(party_, 1);
-        any_zero.data[0] = zero.data[0];
-        for (int i = 1; i < zero.size; ++i) {
-            BoolArray next(party_, 1);
-            next.data[0] = zero.data[i];
-            auto either = fix().bool_op->XOR(any_zero, next);
-            auto both = fix().bool_op->AND(any_zero, next);
-            any_zero = fix().bool_op->XOR(either, both);
+        while (zero.size > 1) {
+            const int pairs = zero.size / 2;
+            BoolArray left(party_, pairs), right(party_, pairs);
+            for (int i = 0; i < pairs; ++i) {
+                left.data[i] = zero.data[2 * i];
+                right.data[i] = zero.data[2 * i + 1];
+            }
+            auto either = fix().bool_op->XOR(left, right);
+            auto both = fix().bool_op->AND(left, right);
+            auto combined = fix().bool_op->XOR(either, both);
+            BoolArray next(party_, pairs + (zero.size & 1));
+            std::copy_n(combined.data, pairs, next.data);
+            if (zero.size & 1) next.data[pairs] = zero.data[zero.size - 1];
+            zero = std::move(next);
         }
         auto server_result = fix().bool_op->output(
-            sci::ALICE, any_zero);
+            sci::ALICE, zero);
         std::uint8_t any = 0;
         if (party_ == sci::ALICE) {
             any = server_result.data[0] & std::uint8_t{1};
@@ -590,7 +969,7 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::CenterAndMask(
             !scores.numeric.is_signed)
             return Status::Invalid(
                 "MPC Softmax scores require signed [tokens,heads,tokens]");
-        auto validity = ValidMask(layer, mask);
+        auto validity = GetMaskPlan(layer, mask);
         if (!validity.ok()) return validity.status();
         const auto before_comm = impl_->communication();
         const auto before_rounds = impl_->rounds();
@@ -598,33 +977,26 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::CenterAndMask(
         const auto rows = layer.tokens * layer.q_heads;
         std::vector<std::uint64_t> maxima(rows);
         std::size_t comparisons = 0;
-        // SCI FixOp::max treats each input FixArray as one row and batches
-        // comparisons across rows. Group by public valid-column count so
-        // padding never enters the maximum, yet rows with the same shape
-        // share the same compare/mux rounds.
-        std::map<std::size_t, std::vector<FixArray>> grouped_rows;
-        std::map<std::size_t, std::vector<std::size_t>> grouped_indices;
-        for (std::size_t row = 0; row < layer.tokens; ++row) {
-            for (std::size_t head = 0; head < layer.q_heads; ++head) {
+        for (const auto &columns : validity.value()->columns)
+            comparisons += (columns.size() - 1) * layer.q_heads;
+        // Partition complete rows. Ragged masks and odd candidates retain
+        // exactly the same comparison tree within each row.
+        session_->ForEachRange(rows, 1,
+            [&](std::size_t worker, std::size_t begin, std::size_t end) {
+                Impl local(session_, worker);
                 std::vector<std::uint64_t> candidates;
-                for (std::size_t column = 0; column < layer.tokens; ++column)
-                    if (validity.value()[row * layer.tokens + column])
-                        candidates.push_back(scores.local_share[
-                            RowMajorIndex(row, head, column, layer)]);
-                const auto width = candidates.size();
-                grouped_rows[width].push_back(
-                    impl_->Secret(candidates, scores.numeric));
-                grouped_indices[width].push_back(
-                    row * layer.q_heads + head);
-                comparisons += candidates.size() - 1;
-            }
-        }
-        for (auto &group : grouped_rows) {
-            auto maximum = impl_->fix().max(group.second);
-            const auto &indices = grouped_indices.at(group.first);
-            for (std::size_t i = 0; i < indices.size(); ++i)
-                maxima[indices[i]] = maximum.data[i];
-        }
+                candidates.reserve((end - begin) * layer.tokens);
+                std::vector<std::size_t> widths;
+                widths.reserve(end - begin);
+                for (std::size_t row = begin; row < end; ++row) {
+                    const auto &columns = validity.value()->columns[row / layer.q_heads];
+                    for (auto column : columns)
+                        candidates.push_back(scores.local_share[row * layer.tokens + column]);
+                    widths.push_back(columns.size());
+                }
+                const auto values = local.MaximumRows(std::move(candidates), std::move(widths), scores.numeric);
+                std::copy(values.begin(), values.end(), maxima.begin() + begin);
+            });
 
         const auto masked_value = EncodeFixed(config.masked_shift,
                                               scores.numeric);
@@ -634,7 +1006,7 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::CenterAndMask(
                 const auto max_share = maxima[row * layer.q_heads + head];
                 for (std::size_t column = 0; column < layer.tokens; ++column) {
                     const auto index = RowMajorIndex(row, head, column, layer);
-                    if (validity.value()[row * layer.tokens + column])
+                    if (validity.value()->valid[row * layer.tokens + column])
                         shifted[index] =
                             (scores.local_share[index] - max_share) & ring_mask;
                     else
@@ -669,9 +1041,6 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::ClipAndNormalize(
 {
     const auto started = Clock::now();
     try {
-        if (!std::atomic_load(&impl_))
-            std::atomic_store(&impl_, std::make_shared<Impl>(
-                session_));
         auto shifted_valid = shifted_scores.Validate();
         if (!shifted_valid.ok()) return shifted_valid.status();
         auto exp_valid = exponentials.Validate();
@@ -687,79 +1056,100 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::ClipAndNormalize(
             !shifted_scores.numeric.is_signed ||
             exponentials.numeric.is_signed)
             return Status::Invalid("MPC Softmax normalization contract mismatch");
-        auto validity = ValidMask(layer, mask);
+        auto validity = GetMaskPlan(layer, mask);
         if (!validity.ok()) return validity.status();
 
+        auto accumulator = detail::SoftmaxAccumulatorBits(layer.tokens,
+            exponentials.numeric.ring_bits, exponentials.numeric.scale_bits);
+        if (!accumulator.ok()) return accumulator.status();
+        const int accumulator_bits = accumulator.value();
+        if (!std::atomic_load(&impl_))
+            std::atomic_store(&impl_, std::make_shared<Impl>(
+                session_));
         const auto before_comm = impl_->communication();
         const auto before_rounds = impl_->rounds();
-        auto shifted = impl_->Secret(shifted_scores.local_share,
-                                     shifted_scores.numeric);
-        auto exp = impl_->Secret(exponentials.local_share,
-                                 exponentials.numeric);
-        std::vector<std::uint64_t> threshold_shares(
-            shifted_scores.local_share.size(), 0);
-        if (impl_->party() == sci::ALICE)
-            std::fill(threshold_shares.begin(), threshold_shares.end(),
-                      EncodeFixed(config.clip_threshold -
-                                      std::ldexp(1.0,
-                                          -shifted_scores.numeric.scale_bits),
-                                  shifted_scores.numeric));
-        auto threshold = impl_->Secret(threshold_shares,
-                                       shifted_scores.numeric);
-        // This SCI fork's BoolOp::NOT toggles both XOR shares, so its GE
-        // wrapper is not share-correct. On the discrete fixed-point grid,
-        // x >= T is exactly x > (T - 1 ULP), which uses the proven LT/GT
-        // primitive without a boolean negation.
-        auto keep = impl_->fix().GT(shifted, threshold);
-        auto clipped = impl_->fix().if_else(keep, exp, std::uint64_t{0});
-
-        int token_bits = 0;
-        for (std::size_t value = layer.tokens - 1; value != 0; value >>= 1U)
-            ++token_bits;
-        // One sign-free integer guard bit plus ceil(log2(tokens)) is enough
-        // for a sum of probabilities represented at scale 2^s.  This is the
-        // dynamic counterpart of BLB-SCI's exp_ell=19 choice for 32 tokens.
-        const int accumulator_bits = std::min(
-            exponentials.numeric.ring_bits,
-            std::max(19, exponentials.numeric.scale_bits + token_bits + 1));
-        auto clipped_short = impl_->fix().reduce(clipped, accumulator_bits);
-        const auto ring_mask = RingMask(accumulator_bits);
+        NumericFormat accumulator_numeric{accumulator_bits, exponentials.numeric.scale_bits, false};
+        constexpr std::size_t batch_limit = 262144;
+        const auto elements = shifted_scores.local_share.size();
         const auto rows = layer.tokens * layer.q_heads;
+        std::vector<std::uint64_t> clipped(elements);
+        session_->ForEachRange(rows, 1,
+            [&](std::size_t worker, std::size_t row_begin, std::size_t row_end) {
+                Impl local(session_, worker);
+                for (std::size_t begin = row_begin * layer.tokens; begin < row_end * layer.tokens; begin += batch_limit) {
+                    const auto end = std::min(row_end * layer.tokens, begin + batch_limit);
+                    auto shifted = local.Secret({shifted_scores.local_share.begin() + begin,
+                        shifted_scores.local_share.begin() + end}, shifted_scores.numeric);
+                    auto exp = local.Secret({exponentials.local_share.begin() + begin,
+                        exponentials.local_share.begin() + end}, exponentials.numeric);
+                    std::vector<std::uint64_t> threshold_shares(end - begin);
+                    if (local.party() == sci::ALICE)
+                        std::fill(threshold_shares.begin(), threshold_shares.end(), EncodeFixed(
+                            config.clip_threshold - std::ldexp(1., -shifted_scores.numeric.scale_bits),
+                            shifted_scores.numeric));
+                    auto threshold = local.Secret(threshold_shares, shifted_scores.numeric);
+                    // GT(T - 1 ULP) preserves the inclusive fixed-point threshold.
+                    auto keep = local.fix().GT(shifted, threshold);
+                    auto exp_short = local.fix().reduce(exp, accumulator_bits);
+                    auto selected = local.fix().if_else(keep, exp_short, std::uint64_t{0});
+                    std::copy_n(selected.data, end - begin, clipped.begin() + begin);
+                }
+            });
+        const auto ring_mask = RingMask(accumulator_bits);
         std::vector<std::uint64_t> sums(rows, 0);
         for (std::size_t row = 0; row < layer.tokens; ++row) {
             for (std::size_t head = 0; head < layer.q_heads; ++head) {
                 auto &sum = sums[row * layer.q_heads + head];
                 for (std::size_t column = 0; column < layer.tokens; ++column)
-                    sum = (sum + clipped_short.data[
+                    sum = (sum + clipped[
                         RowMajorIndex(row, head, column, layer)]) & ring_mask;
             }
         }
-        NumericFormat accumulator_numeric{
-            accumulator_bits, exponentials.numeric.scale_bits, false};
-        auto denominator = impl_->Secret(sums, accumulator_numeric);
-        if (impl_->RevealAnyZero(denominator))
+        // Preserve the original single aggregate validity bit. Revealing a
+        // separate zero flag per shard would expose additional row information.
+        bool any_zero = false;
+        session_->ForEachRange(1, 1, [&](std::size_t, std::size_t, std::size_t) {
+            auto denominator = impl_->Secret(sums, accumulator_numeric);
+            any_zero = impl_->RevealAnyZero(denominator);
+        });
+        if (any_zero)
             return Status::FailedPrecondition(
                 "Softmax denominator is zero after clipping");
 
-        auto reciprocal = impl_->ReciprocalUnitInterval(
-            denominator, accumulator_numeric.ring_bits,
-            accumulator_numeric.scale_bits);
-        std::vector<std::uint64_t> reciprocal_shares(
-            shifted_scores.local_share.size());
-        for (std::size_t row = 0; row < rows; ++row)
-            std::fill_n(reciprocal_shares.begin() + row * layer.tokens,
-                        layer.tokens, reciprocal.data[row]);
-        auto reciprocal_expanded = impl_->Secret(
-            reciprocal_shares, accumulator_numeric);
-        auto product = impl_->MultiplyUnsigned(
-            clipped_short, reciprocal_expanded,
-            accumulator_numeric.ring_bits +
-                accumulator_numeric.scale_bits);
-        auto probabilities_short = impl_->fix().truncate_reduce(
-            product, accumulator_numeric.scale_bits);
-        auto probabilities = impl_->fix().extend(
-            probabilities_short, exponentials.numeric.ring_bits);
-        probabilities.signed_ = false;
+        std::vector<std::uint64_t> reciprocals(rows);
+        session_->ForEachRange(rows, 1,
+            [&](std::size_t worker, std::size_t begin, std::size_t end) {
+                Impl local(session_, worker);
+                auto denominator = local.Secret({sums.begin() + begin, sums.begin() + end}, accumulator_numeric);
+                auto reciprocal = local.ReciprocalUnitInterval(denominator,
+                    accumulator_numeric.ring_bits, accumulator_numeric.scale_bits);
+                std::copy_n(reciprocal.data, end - begin, reciprocals.begin() + begin);
+            });
+        std::vector<std::uint64_t> probability_shares(elements);
+        // truncate_reduce returns an accumulator_bits-wide value; the
+        // subsequent narrow-to-wide extension can only reconstruct x or
+        // x-2^accumulator_bits. Thus this conservative signed bound follows
+        // from the operation widths, even before using probability <= 1.
+        const int probability_bound_bits = accumulator_bits;
+        session_->ForEachRange(rows, 1,
+            [&](std::size_t worker, std::size_t row_begin, std::size_t row_end) {
+                Impl local(session_, worker);
+                for (std::size_t begin = row_begin * layer.tokens; begin < row_end * layer.tokens; begin += batch_limit) {
+                    const auto end = std::min(row_end * layer.tokens, begin + batch_limit);
+                    std::vector<std::uint64_t> inverse(end - begin);
+                    for (std::size_t i = begin; i < end; ++i) inverse[i - begin] = reciprocals[i / layer.tokens];
+                    auto expanded = local.Secret(inverse, accumulator_numeric);
+                    auto selected = local.Secret({clipped.begin() + begin, clipped.begin() + end}, accumulator_numeric);
+                    auto product = local.MultiplyUnsigned(selected, expanded,
+                        accumulator_bits + accumulator_numeric.scale_bits);
+                    auto short_result = local.fix().truncate_reduce(product, accumulator_numeric.scale_bits);
+                    const bool bounded = short_result.ell > short_result.s + 1;
+                    std::vector<std::uint8_t> zero_msb(bounded ? short_result.size : 0, 0);
+                    auto extended = local.fix().extend(short_result, exponentials.numeric.ring_bits,
+                        bounded ? zero_msb.data() : nullptr);
+                    std::copy_n(extended.data, end - begin, probability_shares.begin() + begin);
+                }
+            });
 
         NumericFormat unsigned_numeric = exponentials.numeric;
         unsigned_numeric.is_signed = false;
@@ -781,11 +1171,36 @@ Result<MpcShareTensor> MpcSoftmaxRuntime::ClipAndNormalize(
             report->mpc_milliseconds += std::chrono::duration<double,
                 std::milli>(Clock::now() - started).count();
         }
-        return MpcShareTensor{impl_->Shares(probabilities), expected,
-                              unsigned_numeric, ComplexComponent::kReal};
+        return MpcShareTensor{std::move(probability_shares), expected,
+                              unsigned_numeric, ComplexComponent::kReal,
+                              probability_bound_bits < unsigned_numeric.ring_bits - 1
+                                  ? std::optional<int>{probability_bound_bits}
+                                  : std::nullopt};
     } catch (const std::exception &error) {
         return Status::Internal(std::string("MPC Softmax normalization: ") +
                                 error.what());
+    }
+}
+
+Result<void> SealSciSoftmaxExecutor::Prepare(
+    const TransformerLayerConfig &layer, const HeContext &score_context,
+    const HeContext &exponent_context, const SoftmaxConfig &config,
+    bool prepare_exponent)
+{
+    try {
+        auto program = GetPackingProgram(layer, score_context, exponent_context, config);
+        if (!program.ok()) return program.status();
+        if (!prepare_exponent) return {};
+        const bool paired = true;
+        auto exponent = GetExponentProgram(exponent_context, config, paired);
+        if (!exponent.ok()) return exponent.status();
+        if (paired) {
+            auto boundary = GetBoundaryProgram(exponent_context);
+            if (!boundary.ok()) return boundary.status();
+        }
+        return {};
+    } catch (const std::exception &error) {
+        return Status::Internal(std::string("Softmax preparation: ") + error.what());
     }
 }
 
@@ -813,7 +1228,7 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
             !handle.spec.he_parameter_profile)
             return Status::Invalid(
                 "Softmax input is not a Block-2 attention score tensor");
-        auto mask_valid = ValidMask(layer_, inputs.mask);
+        auto mask_valid = GetMaskPlan(layer_, inputs.mask);
         if (!mask_valid.ok()) return mask_valid.status();
 
         const auto *execution = FindLayerExecution(config_, layer_.id);
@@ -830,27 +1245,31 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
             block3_context.parameters, config_.softmax);
         if (!block3_valid.ok()) return block3_valid.status();
 
-        auto score_packing = MultiHeadPackingPlan::AttentionDiagonal(
-            layer_, block2_context.slot_count());
-        if (!score_packing.ok()) return score_packing.status();
-        auto score_map = ToConversionMap(score_packing.value());
-        if (!score_map.ok()) return score_map.status();
+        auto packing_program = GetPackingProgram(
+            layer_, block2_context, block3_context, config_.softmax);
+        if (!packing_program.ok()) return packing_program.status();
+        const auto &score_packing = packing_program.value()->scores;
+        const auto &score_map = packing_program.value()->score_map;
+        const auto &real_map = packing_program.value()->exponent_map;
+        const bool paired_boundary = true;
+        const auto &block3_map = paired_boundary
+            ? packing_program.value()->boundary_map : real_map;
         std::optional<SealCipherBatch> score_batch;
         if (contexts_.role() == PartyRole::kServer) {
-            auto tensor = he_tensors_.Get(handle.id);
+            auto tensor = he_tensors_.GetShared(handle.id);
             if (!tensor.ok()) return tensor.status();
-            auto tensor_valid = tensor.value().Validate(block2_context);
+            auto tensor_valid = tensor.value()->Validate(block2_context);
             if (!tensor_valid.ok()) return tensor_valid.status();
-            if (!SamePacking(tensor.value().physical_packing,
-                             score_packing.value()))
+            if (!SamePacking(tensor.value()->physical_packing,
+                             score_packing))
                 return Status::Invalid(
                     "Softmax ciphertext packing differs from Block-2 QK output");
             score_batch = SealCipherBatch{
-                tensor.value().parameter_profile,
-                tensor.value().ciphertexts,
-                tensor.value().logical_spec.shape,
-                tensor.value().logical_spec.layout,
-                score_map.value()};
+                tensor.value()->parameter_profile,
+                tensor.value()->ciphertexts,
+                tensor.value()->logical_spec.shape,
+                tensor.value()->logical_spec.layout,
+                score_map};
         }
 
         auto before = converter_.stats();
@@ -872,7 +1291,7 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
                                              before.internal_mod_switches;
         }
         auto scores = CompactScores(score_physical.value(),
-                                    score_packing.value(), layer_);
+                                    score_packing, layer_);
         if (!scores.ok()) return scores.status();
         auto shifted = mpc_.CenterAndMask(
             scores.value(), layer_, inputs.mask, config_.softmax, report);
@@ -882,19 +1301,15 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
         // converter uses different sockets, so rebuilding the session here
         // would only repeat its expensive setup.
 
-        auto block3_map = SoftmaxPackingPlanner::RealRows(
-            layer_, block3_context.slot_count(),
-            config_.softmax.pad_rows_to_power_of_two);
-        if (!block3_map.ok()) return block3_map.status();
-        auto shifted_pair = ScatterDenseReal(
-            shifted.value(), block3_map.value());
+        auto shifted_pair = ScatterBoundaryShares(
+            shifted.value(), block3_map);
         before = converter_.stats();
-        auto shifted_he = converter_.MpcToCkks(
+        auto shifted_he = converter_.MpcToCkksPacked(
             shifted_pair,
             {block3_context.profile, std::size_t{0},
              block3_context.parameters.input_scale_bits,
              shifted.value().physical_shape, Layout::kSoftmaxRows,
-             block3_map.value()});
+             block3_map, !paired_boundary});
         if (!shifted_he.ok()) return shifted_he.status();
         after = converter_.stats();
         if (report) {
@@ -917,11 +1332,20 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
             if (!shifted_he.value())
                 return Status::Internal(
                     "server did not receive Block-3 ciphertexts");
-            auto evaluated = SoftmaxExponentKernel::Evaluate(
-                *shifted_he.value(), block3_context, config_.softmax, report,
-                config_.threads);
+            auto evaluated = paired_boundary
+                ? SoftmaxExponentKernel::EvaluatePaired(
+                    std::move(*shifted_he.value()), real_map, block3_context,
+                    config_.softmax, report, config_.threads)
+                : SoftmaxExponentKernel::Evaluate(
+                    std::move(*shifted_he.value()), block3_context, config_.softmax,
+                    report, config_.threads);
             if (!evaluated.ok()) return evaluated.status();
-            exp_batch = evaluated.take_value();
+            if (paired_boundary) {
+                auto packed = SoftmaxExponentKernel::PackPaired(
+                    evaluated.take_value(), block3_context, report, config_.threads);
+                if (!packed.ok()) return packed.status();
+                exp_batch = packed.take_value();
+            } else exp_batch = evaluated.take_value();
         }
 
         before = converter_.stats();
@@ -942,8 +1366,8 @@ Result<SoftmaxOutputs> SealSciSoftmaxExecutor::Evaluate(
             report->internal_mod_switches += after.internal_mod_switches -
                                              before.internal_mod_switches;
         }
-        auto exponentials = CompactDenseReal(
-            exp_physical.value(), block3_map.value(),
+        auto exponentials = CompactBoundaryShares(
+            exp_physical.value(), block3_map,
             shifted.value().physical_shape,
             false);
         if (!exponentials.ok()) return exponentials.status();

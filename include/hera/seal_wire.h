@@ -17,7 +17,8 @@
 namespace hera {
 
 // Each SEAL object is a sequence of bounded chunks followed by a zero-length
-// chunk. Neither endpoint materializes a second full serialized ciphertext.
+// chunk. The application does not materialize a full serialized ciphertext;
+// SEAL's compression codec may allocate its own whole-object workspace.
 constexpr std::size_t kSealWireChunkBytes = 256 * 1024;
 constexpr std::uint64_t kMaximumSealWireBytes = std::uint64_t{1} << 34;
 
@@ -128,7 +129,7 @@ private:
 template <typename SealObject>
 void SendSealObject(IProtocolTransport &transport, const SealObject &object,
                     seal::compr_mode_type compression =
-                        seal::compr_mode_type::none)
+                        seal::Serialization::compr_mode_default)
 {
     if (!seal::Serialization::IsSupportedComprMode(compression))
         throw std::invalid_argument("requested SEAL compression is unavailable");

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <complex>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <numeric>
@@ -29,7 +30,7 @@ struct Options {
     std::string profile;
     int port{19100};
     std::size_t threads{1};
-    std::string seal_compression{"none"};
+    std::string seal_compression{"zstd"};
 #ifdef HERA_CONVERSION_BENCHMARK
     bool benchmark{true};
     std::size_t warmup{1};
@@ -38,6 +39,9 @@ struct Options {
     std::size_t warmup{0};
 #endif
     std::size_t iterations{1};
+    std::size_t ciphertexts{1};
+    std::size_t batch_elements{};
+    bool dense{};
 };
 
 Options Parse(int argc, char **argv)
@@ -64,6 +68,9 @@ Options Parse(int argc, char **argv)
             result.iterations = std::stoull(*text);
         else if (auto text = value("--warmup="))
             result.warmup = std::stoull(*text);
+        else if (auto text = value("--ciphertexts=")) result.ciphertexts = std::stoull(*text);
+        else if (auto text = value("--batch-elements=")) result.batch_elements = std::stoull(*text);
+        else if (argument == "--dense") result.dense = true;
         else throw std::invalid_argument("unknown option: " + argument);
     }
     if (result.config.empty())
@@ -75,6 +82,8 @@ Options Parse(int argc, char **argv)
         throw std::invalid_argument("conversion port range is invalid");
     if (result.threads < 1 || result.threads > 16)
         throw std::invalid_argument("--threads must be in [1,16]");
+    if (!result.ciphertexts || result.ciphertexts > 256 || result.batch_elements > (1U << 20))
+        throw std::invalid_argument("invalid ciphertext count or coefficient batch budget");
     if (result.iterations == 0 || result.iterations > 10000 ||
         result.warmup > 10000)
         throw std::invalid_argument("iterations/warmup count is invalid");
@@ -134,17 +143,20 @@ seal::Ciphertext ReceiveCiphertext(hera::IProtocolTransport &transport,
     return hera::ReceiveSealObject<seal::Ciphertext>(transport, context);
 }
 
-hera::PhysicalSlotMap DemoMap(std::size_t slots)
+hera::PhysicalSlotMap DemoMap(std::size_t slots, const Options &options)
 {
+    if (options.dense)
+        return hera::PhysicalSlotMap::DenseComplex(2 * slots * options.ciphertexts, slots);
     hera::PhysicalSlotMap map;
-    map.ciphertext_count = 1;
+    map.ciphertext_count = options.ciphertexts;
     map.slots_per_ciphertext = slots;
-    map.logical_element_count = 8;
-    map.assignments.resize(slots);
-    for (std::size_t i = 0; i < 4; ++i) {
-        map.assignments[i].real_logical_index = 2 * i;
-        map.assignments[i].imaginary_logical_index = 2 * i + 1;
-    }
+    map.logical_element_count = 8 * options.ciphertexts;
+    map.assignments.resize(slots * options.ciphertexts);
+    for (std::size_t ct = 0; ct < options.ciphertexts; ++ct)
+        for (std::size_t i = 0; i < 4; ++i) {
+            map.assignments[ct * slots + i].real_logical_index = 8 * ct + 2 * i;
+            map.assignments[ct * slots + i].imaginary_logical_index = 8 * ct + 2 * i + 1;
+        }
     return map;
 }
 
@@ -158,12 +170,12 @@ std::string SelectedProfile(const Options &options,
     return profile;
 }
 
-hera::ConversionConfig ProtocolConfig(const hera::HeraConfig &config)
+hera::ConversionConfig ProtocolConfig(const hera::HeraConfig &config, const Options &options)
 {
     return {config.mpc_numeric.ring_bits, config.mpc_numeric.scale_bits,
             config.conversion.statistical_security_bits,
             config.conversion.fft_scale_bits,
-            config.conversion.allow_internal_mod_switch};
+            config.conversion.allow_internal_mod_switch, options.batch_elements};
 }
 
 using BenchmarkClock = std::chrono::steady_clock;
@@ -175,7 +187,32 @@ struct ConversionBenchmarkTimes {
     std::uint64_t mpc_to_ckks_bytes{};
     std::uint64_t ckks_to_mpc_rounds{};
     std::uint64_t mpc_to_ckks_rounds{};
+    hera::ConversionStageTimes ckks_to_mpc_stages;
+    hera::ConversionStageTimes mpc_to_ckks_stages;
 };
+
+using StageMember = double hera::ConversionStageTimes::*;
+const std::pair<const char *, StageMember> kStageMembers[]{
+    {"PREPARATION", &hera::ConversionStageTimes::preparation},
+    {"HANDSHAKE", &hera::ConversionStageTimes::handshake},
+    {"SAMPLING", &hera::ConversionStageTimes::sampling},
+    {"MASK_ENCODE", &hera::ConversionStageTimes::mask_encode},
+    {"FIELD_TO_RING", &hera::ConversionStageTimes::field_to_ring},
+    {"SIGNED_EXTEND", &hera::ConversionStageTimes::signed_extend},
+    {"SLOT_ENCODE", &hera::ConversionStageTimes::slot_encode},
+    {"SLOT_DECODE", &hera::ConversionStageTimes::slot_decode},
+    {"RNS", &hera::ConversionStageTimes::rns},
+    {"HE", &hera::ConversionStageTimes::he},
+    {"CIPHERTEXT_TRANSPORT", &hera::ConversionStageTimes::ciphertext_transport},
+};
+
+void AccumulateStages(hera::ConversionStageTimes &total,
+                      const hera::ConversionStageTimes &before,
+                      const hera::ConversionStageTimes &after)
+{
+    for (const auto &[name, member] : kStageMembers)
+        total.*member += after.*member - before.*member;
+}
 
 void PrintBenchmark(const Options &options, const std::string &party,
                     const ConversionBenchmarkTimes &times)
@@ -185,10 +222,14 @@ void PrintBenchmark(const Options &options, const std::string &party,
         return std::accumulate(values.begin(), values.end(), 0.0) /
                values.size();
     };
-    std::cout << "HERA_CONVERSION_BENCHMARK_PARTY=" << party << '\n'
+    std::cout << std::setprecision(9)
+              << "HERA_CONVERSION_BENCHMARK_PARTY=" << party << '\n'
               << "BOUNDARY=established_two_party_session_to_conversion_output\n"
               << "WARMUP=" << options.warmup << '\n'
               << "ITERATIONS=" << options.iterations << '\n'
+              << "CIPHERTEXTS=" << options.ciphertexts << '\n'
+              << "CONVERSION_WORKERS=" << options.threads << '\n'
+              << "BATCH_ELEMENTS=" << (options.batch_elements ? options.batch_elements : hera::ConversionConfig::DefaultBatchElements(options.threads)) << '\n'
               << "CKKS_TO_MPC_MEAN_MS=" << mean(times.ckks_to_mpc) << '\n'
               << "MPC_TO_CKKS_MEAN_MS=" << mean(times.mpc_to_ckks) << '\n'
               << "CKKS_TO_MPC_COMMUNICATION_BYTES="
@@ -196,14 +237,30 @@ void PrintBenchmark(const Options &options, const std::string &party,
               << "MPC_TO_CKKS_COMMUNICATION_BYTES="
               << times.mpc_to_ckks_bytes << '\n'
               << "CKKS_TO_MPC_ROUNDS=" << times.ckks_to_mpc_rounds << '\n'
-              << "MPC_TO_CKKS_ROUNDS=" << times.mpc_to_ckks_rounds << '\n'
-              << std::flush;
+              << "MPC_TO_CKKS_ROUNDS=" << times.mpc_to_ckks_rounds << '\n';
+    for (const auto &[name, member] : kStageMembers) {
+        std::cout << "CKKS_TO_MPC_STAGE_" << name << "_MEAN_MS="
+                  << times.ckks_to_mpc_stages.*member / options.iterations << '\n'
+                  << "MPC_TO_CKKS_STAGE_" << name << "_MEAN_MS="
+                  << times.mpc_to_ckks_stages.*member / options.iterations << '\n';
+    }
+    const auto print_samples = [](const char *name, const std::vector<double> &values) {
+        std::cout << name << '=';
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (i != 0) std::cout << ',';
+            std::cout << values[i];
+        }
+        std::cout << '\n';
+    };
+    print_samples("CKKS_TO_MPC_SAMPLES_MS", times.ckks_to_mpc);
+    print_samples("MPC_TO_CKKS_SAMPLES_MS", times.mpc_to_ckks);
+    std::cout << std::flush;
 }
 
 int RunClient(const Options &options, const hera::HeraConfig &config)
 {
     hera::HeContextRegistry contexts;
-    Check(contexts.CreateClientProfiles(config));
+    Check(contexts.CreateClientProfiles(config, false));
     auto serialized = contexts.ExportSerializedPublicBundle(
         CompressionMode(options));
     if (!serialized.ok()) throw std::runtime_error(serialized.status().message());
@@ -214,30 +271,49 @@ int RunClient(const Options &options, const hera::HeraConfig &config)
     const std::string profile_name = SelectedProfile(options, config);
     const auto &profile = contexts.Require(profile_name,
                                            hera::PartyRole::kClient);
-    std::vector<std::complex<double>> clear(profile.slot_count());
-    clear[0] = {0.125, -0.25};
-    clear[1] = {-1.5, 0.75};
-    clear[2] = {2.0, -1.0};
-    clear[3] = {-0.0625, 0.03125};
+    std::vector<std::vector<std::complex<double>>> clear(options.ciphertexts,
+        std::vector<std::complex<double>>(profile.slot_count()));
     seal::CKKSEncoder encoder(*profile.context);
     seal::Plaintext plain;
-    encoder.encode(clear, std::ldexp(1.0, profile.parameters.output_scale_bits),
-                   plain);
     seal::Encryptor encryptor(*profile.context, profile.secret_key.value());
-    seal::Ciphertext input;
-    encryptor.encrypt_symmetric(plain, input);
     SendString(*control, profile_name);
-    SendCiphertext(*control, input, CompressionMode(options));
+    const std::uint64_t wire_count = options.ciphertexts;
+    control->Send(&wire_count, sizeof(wire_count));
+    for (std::size_t ct = 0; ct < options.ciphertexts; ++ct) {
+        auto &values = clear[ct];
+        if (options.dense) {
+            for (std::size_t i = 0; i < values.size(); ++i)
+                values[i] = {static_cast<double>(static_cast<int>((i + 3 * ct) % 33) - 16) / 8.,
+                    static_cast<double>(static_cast<int>((7 * i + ct) % 25) - 12) / 8.};
+        } else {
+            values[0] = {0.125, -0.25}; values[1] = {-1.5, 0.75};
+            values[2] = {2.0, -1.0}; values[3] = {-0.0625, 0.03125};
+        }
+        encoder.encode(values, options.dense ? profile.context->last_parms_id() : profile.context->first_parms_id(),
+            std::ldexp(1., profile.parameters.output_scale_bits), plain);
+        seal::Ciphertext input;
+        encryptor.encrypt_symmetric(plain, input);
+        if (options.dense) {
+            // Isolate conversion error from source encryption/encoding noise.
+            seal::Decryptor reference_decryptor(*profile.context, profile.secret_key.value());
+            seal::Plaintext reference_plain;
+            reference_decryptor.decrypt(input, reference_plain);
+            encoder.decode(reference_plain, values);
+        }
+        SendCiphertext(*control, input, CompressionMode(options));
+    }
 
     hera::CkksMpcConverter converter(
-        hera::PartyRole::kClient, ProtocolConfig(config), contexts, control,
+        hera::PartyRole::kClient, ProtocolConfig(config, options), contexts, control,
         hera::MakeProductionRandomSource(), options.ip, options.port + 200,
         options.threads, CompressionMode(options));
-    const auto map = DemoMap(profile.slot_count());
+    const auto map = DemoMap(profile.slot_count(), options);
     hera::MpcToCkksTarget target{
         profile_name, 0, profile.parameters.input_scale_bits,
-        hera::TensorShape{{8}}, hera::Layout::kSpatial, map};
+        hera::TensorShape{{map.logical_element_count}}, hera::Layout::kSpatial, map};
     ConversionBenchmarkTimes times;
+    auto validation = options.dense ? hera::MakeNetIoTransport(hera::PartyRole::kClient, options.ip, options.port + 1) : nullptr;
+    double maximum_c2m_error = 0;
     for (std::size_t iteration = 0;
          iteration < options.warmup + options.iterations; ++iteration) {
         const auto before_c2m = converter.stats();
@@ -246,6 +322,27 @@ int RunClient(const Options &options, const hera::HeraConfig &config)
         const auto c2m_stop = BenchmarkClock::now();
         if (!shares.ok()) throw std::runtime_error(shares.status().message());
         const auto after_c2m = converter.stats();
+        if (validation) {
+            std::vector<std::uint64_t> real(shares.value().real.local_share.size()), imag(real.size());
+            validation->Receive(real.data(), real.size() * sizeof(real[0]));
+            validation->Receive(imag.data(), imag.size() * sizeof(imag[0]));
+            const int bits = config.mpc_numeric.ring_bits;
+            const auto mask = (std::uint64_t{1} << bits) - 1;
+            const auto decode = [&](std::uint64_t value) {
+                value &= mask;
+                const auto signed_value = static_cast<std::int64_t>(value & (std::uint64_t{1} << (bits - 1)) ? value | ~mask : value);
+                return std::ldexp(static_cast<double>(signed_value), -config.mpc_numeric.scale_bits);
+            };
+            for (std::size_t i = 0; i < real.size(); ++i) {
+                const auto reference = clear[i / profile.slot_count()][i % profile.slot_count()];
+                maximum_c2m_error = std::max({maximum_c2m_error,
+                    std::abs(decode(real[i] + shares.value().real.local_share[i]) - reference.real()),
+                    std::abs(decode(imag[i] + shares.value().imag.local_share[i]) - reference.imag())});
+            }
+            const std::uint8_t ok = maximum_c2m_error <= std::ldexp(2., -config.mpc_numeric.scale_bits);
+            validation->Send(&ok, sizeof(ok));
+            if (!ok) throw std::runtime_error("dense C2M exceeds 2 ULP");
+        }
         const auto m2c_start = BenchmarkClock::now();
         auto converted = converter.MpcToCkks(shares.value(), target);
         const auto m2c_stop = BenchmarkClock::now();
@@ -255,6 +352,10 @@ int RunClient(const Options &options, const hera::HeraConfig &config)
             throw std::runtime_error("client received server-only ciphertext");
         const auto after_m2c = converter.stats();
         if (iteration >= options.warmup) {
+            AccumulateStages(times.ckks_to_mpc_stages, before_c2m.ckks_to_mpc,
+                             after_c2m.ckks_to_mpc);
+            AccumulateStages(times.mpc_to_ckks_stages, after_c2m.mpc_to_ckks,
+                             after_m2c.mpc_to_ckks);
             times.ckks_to_mpc.push_back(
                 std::chrono::duration<double, std::milli>(
                     c2m_stop - c2m_start).count());
@@ -269,23 +370,25 @@ int RunClient(const Options &options, const hera::HeraConfig &config)
             times.mpc_to_ckks_rounds += after_m2c.rounds - after_c2m.rounds;
         }
     }
-    auto result = ReceiveCiphertext(*control, *profile.context);
     seal::Decryptor decryptor(*profile.context, profile.secret_key.value());
     seal::Plaintext result_plain;
-    decryptor.decrypt(result, result_plain);
-    std::vector<std::complex<double>> decoded;
-    encoder.decode(result_plain, decoded);
     double maximum_error = 0;
-    for (std::size_t i = 0; i < 4; ++i) {
-        maximum_error = std::max(maximum_error,
-            std::abs(decoded[i].real() - clear[i].real()));
-        maximum_error = std::max(maximum_error,
-            std::abs(decoded[i].imag() - clear[i].imag()));
+    for (std::size_t ct = 0; ct < options.ciphertexts; ++ct) {
+        auto result = ReceiveCiphertext(*control, *profile.context);
+        decryptor.decrypt(result, result_plain);
+        std::vector<std::complex<double>> decoded;
+        encoder.decode(result_plain, decoded);
+        for (std::size_t i = 0; i < (options.dense ? decoded.size() : 4); ++i)
+            maximum_error = std::max({maximum_error,
+                std::abs(decoded[i].real() - clear[ct][i].real()),
+                std::abs(decoded[i].imag() - clear[ct][i].imag())});
     }
     const auto stats = converter.stats();
-    if (maximum_error > 48.0 / 8192.0)
+    if (maximum_error > std::ldexp(options.dense ? 4. : 48., -config.mpc_numeric.scale_bits))
         throw std::runtime_error(
-            "conversion round-trip exceeds current 48-ULP smoke bound");
+            "conversion round-trip exceeds " + std::to_string(options.dense ? 4 : 48) + "-ULP bound");
+    std::cout << "MAX_C2M_ULP=" << std::ldexp(maximum_c2m_error, config.mpc_numeric.scale_bits)
+              << "\nMAX_ROUNDTRIP_ULP=" << std::ldexp(maximum_error, config.mpc_numeric.scale_bits) << '\n';
     std::cout << "party=client profile=" << profile_name
               << " max_error=" << maximum_error
               << " communication_bytes=" << stats.communication_bytes
@@ -312,19 +415,25 @@ int RunServer(const Options &options, const hera::HeraConfig &config)
         throw std::runtime_error("client/server selected profiles differ");
     const auto &profile = contexts.Require(profile_name,
                                            hera::PartyRole::kServer);
-    auto input = ReceiveCiphertext(*control, *profile.context);
-    const auto map = DemoMap(profile.slot_count());
+    std::uint64_t wire_count{};
+    control->Receive(&wire_count, sizeof(wire_count));
+    if (wire_count != options.ciphertexts) throw std::invalid_argument("client/server ciphertext counts differ");
+    std::vector<seal::Ciphertext> inputs;
+    for (std::size_t ct = 0; ct < options.ciphertexts; ++ct)
+        inputs.push_back(ReceiveCiphertext(*control, *profile.context));
+    const auto map = DemoMap(profile.slot_count(), options);
     hera::SealCipherBatch batch{
-        profile_name, {std::move(input)}, hera::TensorShape{{8}},
+        profile_name, std::move(inputs), hera::TensorShape{{map.logical_element_count}},
         hera::Layout::kSpatial, map};
     hera::CkksMpcConverter converter(
-        hera::PartyRole::kServer, ProtocolConfig(config), contexts, control,
+        hera::PartyRole::kServer, ProtocolConfig(config, options), contexts, control,
         hera::MakeProductionRandomSource(), "", options.port + 200,
         options.threads, CompressionMode(options));
     hera::MpcToCkksTarget target{
         profile_name, 0, profile.parameters.input_scale_bits,
-        hera::TensorShape{{8}}, hera::Layout::kSpatial, map};
+        hera::TensorShape{{map.logical_element_count}}, hera::Layout::kSpatial, map};
     ConversionBenchmarkTimes times;
+    auto validation = options.dense ? hera::MakeNetIoTransport(hera::PartyRole::kServer, "", options.port + 1) : nullptr;
     std::optional<hera::SealCipherBatch> output;
     for (std::size_t iteration = 0;
          iteration < options.warmup + options.iterations; ++iteration) {
@@ -334,6 +443,13 @@ int RunServer(const Options &options, const hera::HeraConfig &config)
         const auto c2m_stop = BenchmarkClock::now();
         if (!shares.ok()) throw std::runtime_error(shares.status().message());
         const auto after_c2m = converter.stats();
+        if (validation) {
+            validation->Send(shares.value().real.local_share.data(), shares.value().real.local_share.size() * sizeof(std::uint64_t));
+            validation->Send(shares.value().imag.local_share.data(), shares.value().imag.local_share.size() * sizeof(std::uint64_t));
+            std::uint8_t ok{};
+            validation->Receive(&ok, sizeof(ok));
+            if (!ok) throw std::runtime_error("dense C2M validation failed");
+        }
         const auto m2c_start = BenchmarkClock::now();
         auto converted = converter.MpcToCkks(shares.value(), target);
         const auto m2c_stop = BenchmarkClock::now();
@@ -344,6 +460,10 @@ int RunServer(const Options &options, const hera::HeraConfig &config)
         output = std::move(*converted.value());
         const auto after_m2c = converter.stats();
         if (iteration >= options.warmup) {
+            AccumulateStages(times.ckks_to_mpc_stages, before_c2m.ckks_to_mpc,
+                             after_c2m.ckks_to_mpc);
+            AccumulateStages(times.mpc_to_ckks_stages, after_c2m.mpc_to_ckks,
+                             after_m2c.mpc_to_ckks);
             times.ckks_to_mpc.push_back(
                 std::chrono::duration<double, std::milli>(
                     c2m_stop - c2m_start).count());
@@ -358,8 +478,8 @@ int RunServer(const Options &options, const hera::HeraConfig &config)
             times.mpc_to_ckks_rounds += after_m2c.rounds - after_c2m.rounds;
         }
     }
-    SendCiphertext(*control, output->ciphertexts.front(),
-                   CompressionMode(options));
+    for (const auto &ciphertext : output->ciphertexts)
+        SendCiphertext(*control, ciphertext, CompressionMode(options));
     const auto stats = converter.stats();
     std::cout << "party=server profile=" << profile_name
               << " communication_bytes=" << stats.communication_bytes
@@ -371,6 +491,10 @@ int RunServer(const Options &options, const hera::HeraConfig &config)
               << " transform_cache_misses=" << stats.transform_cache_misses
               << " local_peak_inflight="
               << stats.local_transform_peak_inflight
+              << " field_batches=" << stats.field_to_ring_batches
+              << " max_field_elements=" << stats.max_field_to_ring_elements
+              << " extension_batches=" << stats.signed_extension_batches
+              << " max_extension_elements=" << stats.max_signed_extension_elements
               << '\n';
     PrintBenchmark(options, "server", times);
     return 0;
@@ -382,6 +506,9 @@ int main(int argc, char **argv)
 {
     try {
         const Options options = Parse(argc, argv);
+        (void)CompressionMode(options);
+        std::cout << "HERA_SEAL_COMPRESSION=" << options.seal_compression
+                  << '\n' << std::flush;
         auto config_result = hera::LoadHeraConfig(options.config);
         if (!config_result.ok())
             throw std::runtime_error(config_result.status().message());

@@ -48,15 +48,27 @@ protected:
     std::streamsize xsputn(const char *source,
                            std::streamsize size) override
     {
-        if (size < 0 || size > epptr() - pptr() ||
-            size > std::numeric_limits<int>::max()) return 0;
-        std::memcpy(pptr(), source, static_cast<std::size_t>(size));
-        pbump(static_cast<int>(size));
+        if (size < 0 || size > epptr() - pptr()) return 0;
+        // SEAL can write a compressed Galois-key array exceeding INT_MAX in
+        // one call. std::streambuf::pbump takes int, but the buffer and write
+        // length use wider types; advance in bounded pieces without rejecting
+        // an otherwise valid key or allocating another serialized copy.
+        std::streamsize remaining = size;
+        while (remaining != 0) {
+            const auto part = std::min<std::streamsize>(
+                remaining, std::numeric_limits<int>::max());
+            std::memcpy(pptr(), source, static_cast<std::size_t>(part));
+            pbump(static_cast<int>(part));
+            source += part;
+            remaining -= part;
+        }
         return size;
     }
 
     int_type overflow(int_type value) override
     {
+        if (traits_type::eq_int_type(value, traits_type::eof()))
+            return traits_type::not_eof(value);
         if (pptr() == epptr()) return traits_type::eof();
         *pptr() = traits_type::to_char_type(value);
         pbump(1);
@@ -106,7 +118,8 @@ SealObject Deserialize(const std::vector<std::uint8_t> &bytes,
     return object;
 }
 
-Result<void> HeContextRegistry::CreateClientProfiles(const HeraConfig &config)
+Result<void> HeContextRegistry::CreateClientProfiles(
+    const HeraConfig &config, bool require_relinearization_keys)
 {
     if (initialized_)
         return Status::FailedPrecondition(
@@ -126,7 +139,11 @@ Result<void> HeContextRegistry::CreateClientProfiles(const HeraConfig &config)
             value.context = std::move(context);
             value.secret_key = keygen.secret_key();
             keygen.create_public_key(value.public_key);
-            keygen.create_relin_keys(value.relinearization_keys);
+            if (require_relinearization_keys) {
+                seal::MMProfGuard evaluation_pool(new seal::MMProfFixed(
+                    seal::MemoryPoolHandle::New()));
+                keygen.create_relin_keys(value.relinearization_keys);
+            }
             // Conversion itself does not rotate. Rotation keys are populated
             // later by the HE backend's compiled rotation plan.
             contexts_.emplace(entry.first, std::move(value));
@@ -172,8 +189,9 @@ HeContextRegistry::ExportSerializedPublicBundle(
             material.profile = entry.first;
             material.public_key = Serialize(entry.second.public_key,
                                             compression);
-            material.relinearization_keys =
-                Serialize(entry.second.relinearization_keys, compression);
+            if (entry.second.relinearization_keys.size() != 0)
+                material.relinearization_keys =
+                    Serialize(entry.second.relinearization_keys, compression);
             // An empty GaloisKeys object is valid for the conversion-only
             // build; a later HE kernel may populate it before export.
             if (entry.second.galois_keys.size() != 0)
@@ -216,8 +234,9 @@ Result<void> HeContextRegistry::CreateServerProfiles(
             value.context = std::move(context);
             if (material->public_key.parms_id() !=
                     value.context->key_parms_id() ||
-                material->relinearization_keys.parms_id() !=
-                    value.context->key_parms_id() ||
+                (material->relinearization_keys.size() != 0 &&
+                 material->relinearization_keys.parms_id() !=
+                     value.context->key_parms_id()) ||
                 (material->galois_keys.size() != 0 &&
                  material->galois_keys.parms_id() !=
                      value.context->key_parms_id()))
@@ -269,8 +288,9 @@ Result<void> HeContextRegistry::CreateServerProfiles(
             value.context = std::move(context);
             value.public_key = Deserialize<seal::PublicKey>(
                 material->public_key, *value.context);
-            value.relinearization_keys = Deserialize<seal::RelinKeys>(
-                material->relinearization_keys, *value.context);
+            if (!material->relinearization_keys.empty())
+                value.relinearization_keys = Deserialize<seal::RelinKeys>(
+                    material->relinearization_keys, *value.context);
             if (!material->galois_keys.empty())
                 value.galois_keys = Deserialize<seal::GaloisKeys>(
                     material->galois_keys, *value.context);
@@ -307,18 +327,36 @@ Result<void> HeContextRegistry::CompileRotationKeys(
     try {
         std::set<int> unique(steps.begin(), steps.end());
         std::vector<int> normalized(unique.begin(), unique.end());
-        seal::KeyGenerator keygen(*found->second.context,
-                                  *found->second.secret_key);
-        if (normalized.empty())
+        if (normalized.empty()) {
             found->second.galois_keys = seal::GaloisKeys{};
-        else
+        } else {
+            // Generation is a setup operation. The returned keys retain this
+            // private pool; discarding them can return the storage to the OS
+            // rather than retaining it in SEAL's global scratch pool.
+            seal::MMProfGuard evaluation_pool(new seal::MMProfFixed(
+                seal::MemoryPoolHandle::New()));
+            seal::KeyGenerator keygen(*found->second.context,
+                                      *found->second.secret_key);
             keygen.create_galois_keys(normalized,
                                       found->second.galois_keys);
+        }
         return {};
     } catch (const std::exception &error) {
         return Status::Invalid(std::string("cannot create Galois keys: ") +
                                error.what());
     }
+}
+
+Result<void> HeContextRegistry::ReleaseClientEvaluationKeys()
+{
+    if (!initialized_ || role_ != PartyRole::kClient)
+        return Status::FailedPrecondition(
+            "only an initialized client registry releases evaluation keys");
+    for (auto &entry : contexts_) {
+        entry.second.galois_keys = seal::GaloisKeys{};
+        entry.second.relinearization_keys = seal::RelinKeys{};
+    }
+    return {};
 }
 
 const HeContext &HeContextRegistry::Require(std::string_view profile,

@@ -17,7 +17,9 @@ public:
     static Result<std::unique_ptr<RuntimeCoordinator>> Connect(
         PartyRole role, const std::string &peer_address, int port,
         std::chrono::milliseconds heartbeat = std::chrono::seconds(2),
-        std::chrono::milliseconds timeout = std::chrono::seconds(30));
+        std::chrono::milliseconds timeout = std::chrono::seconds(30),
+        // Zero preserves the heartbeat timeout as the stage deadline.
+        std::chrono::milliseconds stage_timeout = std::chrono::milliseconds(0));
 
     ~RuntimeCoordinator();
     RuntimeCoordinator(const RuntimeCoordinator &) = delete;

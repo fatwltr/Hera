@@ -22,8 +22,13 @@ struct CliOptions {
     std::size_t threads{1};
     std::size_t he_threads{1};
     std::size_t conversion_workers{1};
+    std::size_t conversion_batch_elements{};
+    std::size_t mpc_workers{};
     std::size_t he_memory_mib{512};
-    std::string seal_compression{"none"};
+    std::size_t projection_baby_steps{};
+    std::size_t plaintext_cache_mib{256};
+    std::size_t stage_timeout_seconds{30};
+    std::string seal_compression{"zstd"};
     std::uint64_t input_seed{1};
     std::uint64_t weight_seed{2};
     bool virtual_weights{};
@@ -54,11 +59,21 @@ hera::Result<CliOptions> ParseCli(int argc, char **argv)
             options.port = std::stoi(argument.substr(7));
         else if (argument.rfind("--threads=", 0) == 0)
             options.threads = options.he_threads =
-                options.conversion_workers = std::stoul(argument.substr(10));
+                options.mpc_workers = options.conversion_workers = std::stoul(argument.substr(10));
         else if (argument.rfind("--he-threads=", 0) == 0)
             options.he_threads = std::stoul(argument.substr(13));
         else if (argument.rfind("--conversion-workers=", 0) == 0)
             options.conversion_workers = std::stoul(argument.substr(21));
+        else if (argument.rfind("--conversion-batch-elements=", 0) == 0)
+            options.conversion_batch_elements = std::stoul(argument.substr(std::string("--conversion-batch-elements=").size()));
+        else if (argument.rfind("--mpc-workers=", 0) == 0)
+            options.mpc_workers = std::stoul(argument.substr(14));
+        else if (argument.rfind("--plaintext-cache-mib=", 0) == 0)
+            options.plaintext_cache_mib = std::stoul(argument.substr(std::string("--plaintext-cache-mib=").size()));
+        else if (argument.rfind("--projection-baby-steps=", 0) == 0)
+            options.projection_baby_steps = std::stoul(argument.substr(std::string("--projection-baby-steps=").size()));
+        else if (argument.rfind("--stage-timeout-seconds=", 0) == 0)
+            options.stage_timeout_seconds = std::stoul(argument.substr(std::string("--stage-timeout-seconds=").size()));
         else if (argument.rfind("--he-memory-mib=", 0) == 0)
             options.he_memory_mib = std::stoul(argument.substr(16));
         else if (argument.rfind("--seal-compression=", 0) == 0)
@@ -192,6 +207,8 @@ int main(int argc, char **argv)
         runtime_options.he_threads = options.value().he_threads;
         runtime_options.conversion_workers =
             options.value().conversion_workers;
+        runtime_options.conversion_batch_elements = options.value().conversion_batch_elements;
+        runtime_options.mpc_workers = options.value().mpc_workers;
         runtime_options.he_memory_mib = options.value().he_memory_mib;
         runtime_options.seal_compression = options.value().seal_compression;
         runtime_options.input_seed = options.value().input_seed;
@@ -200,6 +217,9 @@ int main(int argc, char **argv)
         runtime_options.weight_template_count =
             options.value().weight_template_count;
         runtime_options.warmup = options.value().warmup;
+        runtime_options.plaintext_cache_mib = options.value().plaintext_cache_mib;
+        runtime_options.stage_timeout_seconds = options.value().stage_timeout_seconds;
+        runtime_options.projection_baby_steps = options.value().projection_baby_steps;
         runtime_options.repeat = options.value().repeat;
         runtime_options.verify = options.value().verify;
         return hera::RunPrivateRuntimeCli(runtime_options);

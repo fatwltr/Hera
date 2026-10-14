@@ -43,10 +43,12 @@ inline TensorSpec BooleanShareSpec(const TensorSpec &source,
 }
 
 inline TensorId HeToMpc(GraphBuilder &graph, TensorId input, Layout layout,
-                        const std::string &name)
+                        const std::string &name,
+                        std::optional<int> output_scale_bits = std::nullopt)
 {
     const auto &source = graph.Spec(input);
     auto output = ArithmeticShareSpec(source, source.shape, layout);
+    if (output_scale_bits) output.numeric.scale_bits = *output_scale_bits;
     ConversionAttributes attributes;
     attributes.source_domain = Domain::kHeCiphertext;
     attributes.target_domain = Domain::kMpcArithmeticShare;
@@ -58,11 +60,13 @@ inline TensorId HeToMpc(GraphBuilder &graph, TensorId input, Layout layout,
 inline TensorId MpcToHe(GraphBuilder &graph, TensorId input,
                         HeRegionId region, Layout layout,
                         const std::string &name,
-                        std::optional<std::size_t> target_level = std::nullopt)
+                        std::optional<std::size_t> target_level = std::nullopt,
+                        std::optional<int> target_scale_bits = std::nullopt)
 {
     const auto &source = graph.Spec(input);
     auto output = HeSpec(source, source.shape, layout, region);
     output.planned_level = target_level;
+    output.planned_scale_bits = target_scale_bits.value_or(graph.ActiveParameters(region).input_scale_bits);
     ConversionAttributes attributes;
     attributes.source_domain = Domain::kMpcArithmeticShare;
     attributes.target_domain = Domain::kHeCiphertext;
@@ -75,7 +79,9 @@ inline TensorId MpcToHe(GraphBuilder &graph, TensorId input,
 
 inline TensorId EnsureRegion(GraphBuilder &graph, TensorId input,
                              HeRegionId region, Layout layout,
-                             const std::string &prefix)
+                             const std::string &prefix,
+                             std::optional<std::size_t> target_level = std::nullopt,
+                             std::optional<int> target_scale_bits = std::nullopt)
 {
     const auto &source = graph.Spec(input);
     if (source.domain == Domain::kHeCiphertext &&
@@ -84,14 +90,14 @@ inline TensorId EnsureRegion(GraphBuilder &graph, TensorId input,
         return input;
     if (source.domain == Domain::kMpcArithmeticShare)
         return MpcToHe(graph, input, region, layout,
-                       prefix + ".bridge.mpc_to_he");
+                       prefix + ".bridge.mpc_to_he", target_level, target_scale_bits);
     if (source.domain != Domain::kHeCiphertext)
         throw std::invalid_argument(
             prefix + ": only HE ciphertext or arithmetic shares can enter an HE region");
     const auto share = HeToMpc(graph, input, layout,
                                prefix + ".bridge.he_to_mpc");
     return MpcToHe(graph, share, region, layout,
-                   prefix + ".bridge.mpc_to_he");
+                   prefix + ".bridge.mpc_to_he", target_level, target_scale_bits);
 }
 
 } // namespace hera::module_internal

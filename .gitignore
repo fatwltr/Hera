@@ -1,10 +1,39 @@
+# Generated builds and downloaded third-party dependencies.
 /build*/
+build/
+build-*/
 cmake-build-*/
-/.deps/
-/.cache/
-/.idea/
-/.vscode/
+.deps/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Local documentation and standalone BLB/debug comparison tools.
+/docs/
+/scripts/benchmark_blb_he.py
+/scripts/benchmark_private_cost.py
+/tests/blb_he_warm_benchmark.cpp
+
+# Interpreter/editor caches and temporary runtime output.
+.cache/
+.idea/
+.vscode/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+*.tmp
 *.swp
 *.swo
-*.log
-compile_commands.json
+*~
+.DS_Store

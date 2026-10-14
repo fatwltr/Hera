@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hera/block5_bridge.h"
+#include "hera/pre_ln_entry.h"
 #include "hera/execution_plan.h"
 #include "hera/private_transformer.h"
 #include "hera/runtime_coordinator.h"
@@ -19,55 +20,6 @@ struct LayerWeightData {
 
 struct TransformerWeightData {
     std::vector<LayerWeightData> layers;
-};
-
-struct RuntimeTensorArena {
-    TensorIdAllocator ids;
-    SealCipherTensorStore he;
-    CryptoTensorStore mpc;
-};
-
-struct PreLnEntryOutputs {
-    Block2HeOutputs block2;
-    TensorHandle attention_residual;
-};
-
-struct PreLnEntryExecutionReport {
-    std::size_t ckks_to_mpc_calls{};
-    std::size_t mpc_to_ckks_calls{};
-    std::uint64_t conversion_communication_bytes{};
-    std::uint64_t conversion_rounds{};
-    double conversion_milliseconds{};
-    double mpc_milliseconds{};
-    double he_milliseconds{};
-    Block2ExecutionReport block2;
-};
-
-// Turns an encrypted hidden state into fresh Block-2 inputs and preserves a
-// separately refreshed attention residual. It accepts the first-layer
-// Region-1 ciphertext or a previous layer's shared-profile hidden state.
-class SealSciPreLnEntryExecutor {
-public:
-    SealSciPreLnEntryExecutor(
-        const HeraConfig &config, std::size_t layer_index,
-        HeContextRegistry &contexts, RuntimeTensorArena &arena,
-        SealPlainParameterStore &parameters, CkksMpcConverter &converter,
-        MpcLayerNormRuntime &mpc_layer_norm,
-        const CompiledLayerExecutionPlan *plan = nullptr);
-
-    Result<PreLnEntryOutputs> Evaluate(
-        const TensorHandle &hidden, const LayerWeightHandles &weights,
-        PreLnEntryExecutionReport *report = nullptr);
-
-private:
-    const HeraConfig &config_;
-    std::size_t layer_index_{};
-    HeContextRegistry &contexts_;
-    RuntimeTensorArena &arena_;
-    SealPlainParameterStore &parameters_;
-    CkksMpcConverter &converter_;
-    MpcLayerNormRuntime &mpc_layer_norm_;
-    const CompiledLayerExecutionPlan *plan_{};
 };
 
 // Concrete fused-stage implementation behind PrivateTransformer::Evaluate.
@@ -126,8 +78,13 @@ struct PrivateRuntimeCliOptions {
     int port{20500};
     std::size_t he_threads{1};
     std::size_t conversion_workers{1};
+    std::size_t conversion_batch_elements{};
+    std::size_t mpc_workers{}; // zero selects min(HE workers, 50 socket lanes)
     std::size_t he_memory_mib{512};
-    std::string seal_compression{"none"};
+    std::size_t projection_baby_steps{};
+    std::size_t plaintext_cache_mib{256};
+    std::size_t stage_timeout_seconds{30};
+    std::string seal_compression{"zstd"};
     std::uint64_t input_seed{1};
     std::uint64_t weight_seed{2};
     bool virtual_weights{};

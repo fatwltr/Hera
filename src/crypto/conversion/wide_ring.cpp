@@ -1,8 +1,5 @@
 #include "hera/wide_ring.h"
 
-#include <iomanip>
-#include <sstream>
-
 namespace hera {
 namespace {
 
@@ -97,31 +94,12 @@ WideRingShare WideMultiplyAccumulateShift(
     return Split(static_cast<U128>(result), bits);
 }
 
-WideRingShare WideMultiplySignedPublic(WideRingShare value,
-                                       std::int64_t multiplier, int bits)
-{
-    U128 magnitude = multiplier < 0
-                         ? static_cast<U128>(-(static_cast<I128>(multiplier)))
-                         : static_cast<U128>(multiplier);
-    U128 product = Raw(value) * magnitude;
-    if (multiplier < 0) product = U128{0} - product;
-    return Split(product, bits);
-}
-
 std::uint64_t WideModuloPrime(WideRingShare value, int bits,
                               std::uint64_t prime)
 {
     if (prime < 2) return 0;
     const U128 mask = (U128{1} << bits) - 1;
     return static_cast<std::uint64_t>((Raw(value) & mask) % prime);
-}
-
-std::string WideToHex(WideRingShare value)
-{
-    std::ostringstream stream;
-    stream << "0x" << std::hex << value.high << std::setfill('0')
-           << std::setw(16) << value.low;
-    return stream.str();
 }
 
 } // namespace hera
