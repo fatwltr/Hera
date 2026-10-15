@@ -46,9 +46,10 @@ struct AttentionLn2ExecutionReport {
     std::size_t attention_probability_rotations{};
     std::size_t attention_value_rotations{};
     std::size_t attention_recovery_rotations{};
-    // Statistics uses at most two workers; encoding count excludes cache hits.
+    // Actual statistics workers; encoding count excludes cache hits.
     std::size_t layer_norm_plaintext_encodings{};
     std::size_t layer_norm_workers{};
+    std::size_t reciprocal_sqrt_workers{};
     std::size_t attention_value_plaintext_encodings{};
     // Real Wo BSGS only; counts actual executed operations.
     std::size_t wo_baby_rotations{};
@@ -179,8 +180,8 @@ public:
         const HeContext &context,
         AttentionLn2ExecutionReport *report = nullptr,
         std::optional<int> output_scale_bits = std::nullopt);
-    // Caps requested workers at two and falls back to serial execution when
-    // the shared HE memory budget cannot support parallel scratch buffers.
+    // Uses the requested workers up to the input count and shared HE memory
+    // budget. Nested calls on the HE pool execute serially.
     static Result<LayerNormStatisticsOutputs> Evaluate(
         const SealCipherTensor &input,
         const TransformerLayerConfig &layer,

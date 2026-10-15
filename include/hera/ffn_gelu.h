@@ -34,6 +34,7 @@ struct FfnGeluExecutionReport {
     std::size_t modulus_switches{};
     std::size_t comparisons{};
     std::size_t muxes{};
+    std::size_t mpc_workers{};
     std::uint64_t conversion_communication_bytes{};
     std::uint64_t conversion_rounds{};
     std::uint64_t mpc_communication_bytes{};

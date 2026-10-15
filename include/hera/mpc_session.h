@@ -18,8 +18,8 @@ class SharedMpcSession {
 public:
     class Impl;
 
-    // IOPack uses p, p+50, p+100. Consecutive worker ports are disjoint
-    // for at most 50 workers; reserve the complete p..p+149 range.
+    // IOPack uses p, p+50, p+100. Workers use disjoint 150-port blocks
+    // of 50 lanes; reserve detail::MpcWorkerPortSpan(workers) ports.
     SharedMpcSession(PartyRole role, std::string peer_address, int port,
                      std::size_t workers = 1);
     ~SharedMpcSession();

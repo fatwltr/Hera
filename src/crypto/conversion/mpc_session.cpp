@@ -1,4 +1,5 @@
 #include "hera/detail/mpc_session_internal.h"
+#include "hera/detail/worker_ports.h"
 
 #include <exception>
 #include <algorithm>
@@ -59,9 +60,7 @@ SharedMpcSession::SharedMpcSession(
     PartyRole role, std::string peer_address, int port, std::size_t workers)
     : role_(role), peer_address_(std::move(peer_address)), port_(port), worker_count_(workers)
 {
-    if (workers == 0 || workers > 50 || port < 1024 ||
-        port > 65535 - 100 - static_cast<int>(workers - 1))
-        throw std::invalid_argument("invalid MPC worker count or socket range");
+    detail::ValidateWorkerPortRange(port, detail::MpcWorkerPortSpan(workers));
 }
 
 SharedMpcSession::~SharedMpcSession() = default;
@@ -75,7 +74,8 @@ std::shared_ptr<SharedMpcSession::Impl> SharedMpcSession::Acquire(std::size_t wo
         first->NegotiateWorkers(worker_count_);
         workers_.push_back(std::move(first));
         for (std::size_t i = 1; i < worker_count_; ++i)
-            workers_.push_back(std::make_shared<Impl>(role_, peer_address_, port_ + static_cast<int>(i)));
+            workers_.push_back(std::make_shared<Impl>(role_, peer_address_,
+                port_ + static_cast<int>(detail::MpcWorkerPortOffset(i))));
     }
     if (workers_.size() != worker_count_)
         throw std::runtime_error("MPC pool initialization did not complete");

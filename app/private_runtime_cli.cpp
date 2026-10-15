@@ -1,6 +1,7 @@
 #include "hera/private_runtime.h"
 #include "hera/mpc_session.h"
 #include "hera/detail/parallel_ranges.h"
+#include "hera/detail/worker_ports.h"
 #include "hera/seal_wire.h"
 
 #include <seal/seal.h>
@@ -14,6 +15,7 @@
 #include <complex>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 namespace hera {
@@ -21,14 +23,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Each SCI IOPack owns three sockets at p, p+50, and p+100. Keep complete
-// ranges disjoint. Nonlinear workers use the former Softmax range, with
-// p+i, p+i+50, p+i+100 for worker i (at most 50 lanes).
+// Each SCI IOPack owns three sockets at p, p+50, and p+100. Expand the
+// nonlinear range after conversion sockets when more workers are requested.
 constexpr int kConversionWorkerOffset = 100;
-constexpr int kSoftmaxOffset = 300;
-// Keep the historical +500/+700 ranges reserved so deployments can upgrade
-// without changing their firewall allowance.
-constexpr int kRuntimePortExtent = 800;
 
 seal::compr_mode_type CompressionMode(const std::string &name)
 {
@@ -61,7 +58,7 @@ std::uint64_t RuntimeFingerprint(const HeraConfig &config,
         }
     };
     auto scalar = [&](const auto &value) { mix(&value, sizeof(value)); };
-    constexpr std::uint32_t wire_protocol_version = 8;
+    constexpr std::uint32_t wire_protocol_version = 9;
     scalar(wire_protocol_version);
     scalar(config.schema_version);
     scalar(config.mpc_numeric.ring_bits);
@@ -142,7 +139,7 @@ std::uint64_t RuntimeFingerprint(const HeraConfig &config,
     scalar(options.he_threads);
     scalar(options.conversion_workers);
     scalar(options.conversion_batch_elements ? options.conversion_batch_elements : ConversionConfig::DefaultBatchElements(options.conversion_workers));
-    scalar(options.mpc_workers ? options.mpc_workers : std::min(options.he_threads, std::size_t{50}));
+    scalar(options.mpc_workers ? options.mpc_workers : options.he_threads);
     scalar(options.stage_timeout_seconds);
     mix(options.seal_compression.data(), options.seal_compression.size());
     return hash;
@@ -365,8 +362,9 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
         options.port + kConversionWorkerOffset,
         options.conversion_workers, compression);
     auto nonlinear_session = std::make_shared<SharedMpcSession>(
-        role, options.ip, options.port + kSoftmaxOffset,
-        options.mpc_workers ? options.mpc_workers : std::min(options.he_threads, std::size_t{50}));
+        role, options.ip, detail::RuntimeMpcPort(options.port, options.conversion_workers,
+            options.mpc_workers ? options.mpc_workers : options.he_threads),
+        options.mpc_workers ? options.mpc_workers : options.he_threads);
     MpcSoftmaxRuntime softmax(nonlinear_session);
     MpcLayerNormRuntime norm(nonlinear_session);
     MpcGeluRuntime gelu(nonlinear_session);
@@ -497,7 +495,14 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
                   << ",CT_CT_MUL=" << metrics.ciphertext_multiplications
                   << ",RELIN=" << metrics.relinearizations
                   << ",RESCALE=" << metrics.rescales
-                  << ",MPC_OPS=" << metrics.mpc_operations << '\n';
+                  << ",MPC_OPS=" << metrics.mpc_operations;
+        if (metrics.layer_norm_he_workers)
+            std::cout << ",LN_HE_WORKERS=" << metrics.layer_norm_he_workers;
+        if (metrics.layer_norm_mpc_workers)
+            std::cout << ",LN_MPC_WORKERS=" << metrics.layer_norm_mpc_workers;
+        if (metrics.gelu_mpc_workers)
+            std::cout << ",GELU_MPC_WORKERS=" << metrics.gelu_mpc_workers;
+        std::cout << '\n';
     }
     std::cout << "HERA_PARTY="
               << (role == PartyRole::kClient ? "client" : "server")
@@ -507,6 +512,8 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
               << "\nHERA_CONVERSION_WORKERS=" << options.conversion_workers
               << "\nHERA_CONVERSION_BATCH_ELEMENTS=" << conversion_protocol.batch_elements
               << "\nHERA_MPC_WORKERS=" << nonlinear_session->worker_count()
+              << "\nHERA_MPC_BASE_PORT=" << detail::RuntimeMpcPort(options.port,
+                    options.conversion_workers, nonlinear_session->worker_count())
               << "\nHERA_STAGE_TIMEOUT_SECONDS=" << options.stage_timeout_seconds
               << "\nHERA_HE_MEMORY_BUDGET_MIB=" << options.he_memory_mib
               << "\nHERA_HE_POOL_WORKERS="
@@ -583,19 +590,15 @@ int RunPrivateRuntimeCli(const PrivateRuntimeCliOptions &options)
         if (options.verify && options.party != "local")
             throw std::invalid_argument(
                 "--verify is restricted to --party=local test runs");
-        if (options.port < 1024 ||
-            options.port + kRuntimePortExtent >= 32768)
-            throw std::invalid_argument("runtime port range is invalid");
-        if (options.he_threads == 0 || options.he_threads > 64 ||
-            options.conversion_workers == 0 ||
-            options.conversion_workers > 16 ||
-            options.conversion_batch_elements > (1U << 20) ||
-            options.mpc_workers > 50 ||
-            options.he_memory_mib == 0 || options.he_memory_mib > 1048576 ||
-            options.plaintext_cache_mib == 0 || options.plaintext_cache_mib > 1048576 ||
+        if (options.he_threads == 0 || options.conversion_workers == 0 ||
+            options.conversion_batch_elements > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            options.he_memory_mib == 0 || options.he_memory_mib > (std::numeric_limits<std::size_t>::max() >> 20) ||
+            options.plaintext_cache_mib == 0 || options.plaintext_cache_mib > (std::numeric_limits<std::size_t>::max() >> 20) ||
             options.stage_timeout_seconds == 0 || options.stage_timeout_seconds > 86400 ||
             options.repeat == 0)
             throw std::invalid_argument("invalid thread, memory or repeat budget");
+        (void)detail::RuntimeMpcPort(options.port, options.conversion_workers,
+            options.mpc_workers ? options.mpc_workers : options.he_threads);
         if (options.weight_template_count == 0)
             throw std::invalid_argument(
                 "--weight-template-count must be positive");

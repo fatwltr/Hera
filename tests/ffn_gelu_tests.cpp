@@ -993,8 +993,10 @@ void RunMpcChild(hera::PartyRole role,
         auto session = std::make_shared<hera::SharedMpcSession>(role, "127.0.0.1", kMpcPort, workers);
         hera::MpcGeluRuntime runtime(session);
         for (int repeat = 0; repeat < 2; ++repeat) {
-            auto result = runtime.Evaluate(tx, t0, t1, 2.7);
+            hera::FfnGeluExecutionReport report;
+            auto result = runtime.Evaluate(tx, t0, t1, 2.7, &report);
             if (!result.ok()) _exit(92);
+            if (report.mpc_workers != std::min(workers, x.size())) _exit(93);
             results.insert(results.end(), result.value().local_share.begin(), result.value().local_share.end());
             runtime.ReleaseSession();
         }
@@ -1003,15 +1005,16 @@ void RunMpcChild(hera::PartyRole role,
     _exit(0);
 }
 
-void TestMpcGelu(std::size_t workers = 1)
+void TestMpcGelu(std::size_t workers = 1, bool small = false)
 {
     const hera::GeluConfig gelu;
     const double ulp = std::ldexp(1., -13);
     const std::vector<double> cases{-40., -4., -2.7 - ulp, -2.7,
         -2.7 + ulp, -1., -ulp, 0., ulp, 1., 2.7 - ulp, 2.7, 2.7 + ulp, 4., 40.,
         -std::ldexp(1., 29), -std::ldexp(1., 29) + ulp, std::ldexp(1., 29) - ulp};
-    // Three uneven element shards; enough work to activate the parallel path.
-    std::vector<double> x(workers == 1 ? cases.size() : 65539);
+    // Cover both a large uneven batch and a small batch that previously
+    // failed to use requested workers because of the fixed 32768 grain.
+    std::vector<double> x(workers == 1 ? cases.size() : small ? cases.size() + 1 : 65539);
     for (std::size_t i = 0; i < x.size(); ++i) x[i] = cases[i % cases.size()];
     std::vector<std::uint64_t> encoded_x, encoded_f0, encoded_f1;
     for (const auto value : x) {
@@ -1312,6 +1315,7 @@ int main()
         TestParallelColumnProjection();
         TestMpcGelu();
         TestMpcGelu(3);
+        TestMpcGelu(3, true);
         TestIntegratedExecutor();
         std::cout << "FFN_GELU_STATUS=PASS\n";
         return EXIT_SUCCESS;

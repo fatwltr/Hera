@@ -52,7 +52,8 @@ ExecutionReport::StageMetrics Metrics(const PreLnEntryExecutionReport &value,
             value.block2.ciphertext_plain_multiplications + value.statistics.ciphertext_plain_multiplications,
             value.block2.ciphertext_multiplications + value.statistics.ciphertext_multiplications,
             value.block2.relinearizations + value.statistics.relinearizations,
-            value.block2.rescales + value.statistics.rescales, tokens};
+            value.block2.rescales + value.statistics.rescales, tokens,
+            value.statistics.layer_norm_workers, value.statistics.reciprocal_sqrt_workers};
 }
 
 ExecutionReport::StageMetrics Metrics(const SoftmaxExecutionReport &value)
@@ -76,7 +77,8 @@ ExecutionReport::StageMetrics Metrics(
             value.ckks_to_mpc_calls + value.mpc_to_ckks_calls,
             value.rotations, value.ciphertext_plain_multiplications,
             value.ciphertext_multiplications, value.relinearizations,
-            value.rescales, value.reciprocal_square_roots};
+            value.rescales, value.reciprocal_square_roots,
+            value.layer_norm_workers, value.reciprocal_sqrt_workers};
 }
 
 ExecutionReport::StageMetrics Metrics(const FfnGeluExecutionReport &value)
@@ -87,7 +89,7 @@ ExecutionReport::StageMetrics Metrics(const FfnGeluExecutionReport &value)
             value.ckks_to_mpc_calls + value.mpc_to_ckks_calls,
             value.rotations, value.ciphertext_plain_multiplications,
             value.ciphertext_multiplications, value.relinearizations,
-            value.rescales, value.comparisons + value.muxes};
+            value.rescales, value.comparisons + value.muxes, 0, 0, value.mpc_workers};
 }
 
 ExecutionReport::StageMetrics Metrics(

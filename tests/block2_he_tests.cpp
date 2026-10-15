@@ -1623,21 +1623,10 @@ void TestBlock2(bool qkv_bias, bool mixed_gamma = false)
 
 } // namespace
 
-int main(int argc, char **argv)
+int main()
 {
     try {
-        if (argc == 2 && std::string(argv[1]) == "--layer-norm-tail-only") {
-            TestRealLayerNormTail();
-            return EXIT_SUCCESS;
-        }
         TestColumnBsgsPlanning();
-        if (argc == 2 && std::string(argv[1]) == "--qkv-projection-only") {
-            TestRealInputComplexProjection();
-            TestRealInputComplexProjection(true);
-            TestRealInputComplexProjection(false, true);
-            std::cout << "HERA_REAL_X_COMPLEX_W_STATUS=PASS\n";
-            return EXIT_SUCCESS;
-        }
         TestRealLayerNormTail();
         TestRealInputComplexProjection();
         TestRealInputComplexProjection(true);

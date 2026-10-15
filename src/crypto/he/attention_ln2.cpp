@@ -1542,12 +1542,9 @@ Result<LayerNormStatisticsOutputs> ComputeLayerNormStatistics(
         context.parameters.polynomial_degree,
         context.context->get_context_data(input.ciphertexts.front().parms_id())
             ->parms().coeff_modulus().size(), 8);
-    // At most one background worker plus the caller. Respect the shared pool's
-    // budget, with an additional 128 MiB limit for estimated parallel scratch.
-    const auto budget = std::min<std::size_t>(
-        detail::HeWorkerPool::Instance().MemoryBudget(), 128ULL << 20);
+    const auto budget = detail::HeWorkerPool::Instance().MemoryBudget();
     auto workers = std::max<std::size_t>(1, std::min({he_workers, count,
-        std::size_t{2}, std::max<std::size_t>(1, budget / worker_bytes)}));
+        std::max<std::size_t>(1, budget / worker_bytes)}));
     if (detail::HeWorkerPool::OnWorkerThread()) workers = 1;
     std::size_t encodings = 0;
     const auto plains = PrepareStatisticsPlaintexts(
@@ -2070,14 +2067,14 @@ Result<void> LayerNormStatisticsKernel::Prepare(
 
 class MpcLayerNormRuntime::Impl {
 public:
-    explicit Impl(std::shared_ptr<SharedMpcSession> session)
-        : session_(std::move(session)), native_(session_->Acquire()),
+    explicit Impl(std::shared_ptr<SharedMpcSession> session, std::size_t worker = 0)
+        : session_(std::move(session)), native_(session_->Acquire(worker)),
           party_(native_->party())
     {}
 
-    Result<MpcShareTensor> ReciprocalSqrt(
+    Result<void> ValidateVariance(
         const MpcShareTensor &variance, int configured_bits,
-        int output_scale, AttentionLn2ExecutionReport *report)
+        int output_scale)
     {
         auto valid = variance.Validate();
         if (!valid.ok()) return valid.status();
@@ -2092,7 +2089,7 @@ public:
             variance.numeric.scale_bits, configured_bits, output_scale);
         if (!planned.ok()) return planned.status();
         const auto &plan = planned.value();
-        const int input_bits = plan.input_bits, output_bits = plan.output_bits;
+        const int input_bits = plan.input_bits;
         auto &fix = native_->fix();
         const auto size = static_cast<int>(variance.local_share.size());
         // 0 < v < U iff (v-1) mod 2^ring_bits < U-1. SCI LT only
@@ -2128,6 +2125,21 @@ public:
         if (party_ == sci::ALICE) fix.iopack->io->send_data(&any, sizeof(any));
         else fix.iopack->io->recv_data(&any, sizeof(any));
         if (any) return Status::FailedPrecondition("LayerNorm variance must be positive and fit the rsqrt working range");
+        return {};
+    }
+
+    // The complete tensor has already passed one aggregate validity check.
+    // Shards never reveal their individual validity bits.
+    Result<MpcShareTensor> ReciprocalSqrt(
+        const MpcShareTensor &variance, int configured_bits, int output_scale)
+    {
+        auto planned = detail::PlanLayerNormRsqrt(variance.numeric.ring_bits,
+            variance.numeric.scale_bits, configured_bits, output_scale);
+        if (!planned.ok()) return planned.status();
+        const auto &plan = planned.value();
+        const int output_bits = plan.output_bits;
+        const auto size = static_cast<int>(variance.local_share.size());
+        auto &fix = native_->fix();
         // SCI's inverse-sqrt exponent adjustment can overflow its half-width
         // workspace at the smallest quantum when the scale/width is odd.
         // Lift an odd scale exactly, and use an even native width. The public
@@ -2150,11 +2162,6 @@ public:
             native_bits, output_bits, input.s, output_scale, true);
         auto widened = output_bits == variance.numeric.ring_bits
             ? output : native_->math().fix->extend(output, variance.numeric.ring_bits);
-        if (report) {
-            report->variance_scale_bits = variance.numeric.scale_bits;
-            report->rsqrt_input_ring_bits = native_bits;
-            report->rsqrt_output_ring_bits = output_bits;
-        }
         return MpcShareTensor{
             std::vector<std::uint64_t>(widened.data, widened.data + widened.size),
             variance.physical_shape,
@@ -2211,23 +2218,46 @@ Result<MpcShareTensor> MpcLayerNormRuntime::ReciprocalSqrt(
         if (!std::atomic_load(&impl_))
             std::atomic_store(&impl_, std::make_shared<Impl>(
                 session_));
-        const auto before_bytes = impl_->communication();
-        const auto before_rounds = impl_->rounds();
-        Result<MpcShareTensor> result = Status::Internal("LayerNorm MPC did not execute");
+        const auto before_bytes = session_->communication_bytes();
+        const auto before_rounds = session_->rounds();
+        const int output_scale = output_scale_bits.value_or(variance.numeric.scale_bits);
+        Result<void> validated = Status::Internal("LayerNorm validation did not execute");
+        // Reveal just the original global validity bit before starting any
+        // shard. This preserves the failure and information-release contract.
         session_->ForEachRange(1, 1, [&](std::size_t, std::size_t, std::size_t) {
-            result = impl_->ReciprocalSqrt(variance, working_ring_bits,
-                output_scale_bits.value_or(variance.numeric.scale_bits), report);
+            validated = impl_->ValidateVariance(variance, working_ring_bits, output_scale);
         });
-        if (!result.ok()) return result.status();
+        if (!validated.ok()) return validated.status();
+        std::vector<std::uint64_t> output(variance.local_share.size());
+        session_->ForEachRange(output.size(), 1,
+            [&](std::size_t worker, std::size_t begin, std::size_t end) {
+                Impl local(session_, worker);
+                MpcShareTensor shard{
+                    {variance.local_share.begin() + begin, variance.local_share.begin() + end},
+                    {{end - begin, 1}}, variance.numeric, variance.component};
+                auto result = local.ReciprocalSqrt(shard, working_ring_bits, output_scale);
+                if (!result.ok()) throw std::runtime_error(result.status().message());
+                std::copy(result.value().local_share.begin(), result.value().local_share.end(),
+                    output.begin() + begin);
+            });
         if (report) {
+            report->variance_scale_bits = variance.numeric.scale_bits;
+            report->rsqrt_input_ring_bits = planned.value().native_bits;
+            report->rsqrt_output_ring_bits = planned.value().output_bits;
+            report->reciprocal_sqrt_workers = std::max(report->reciprocal_sqrt_workers,
+                std::min(session_->worker_count(), output.size()));
             report->reciprocal_square_roots += variance.local_share.size();
             report->mpc_communication_bytes +=
-                impl_->communication() - before_bytes;
-            report->mpc_rounds += impl_->rounds() - before_rounds;
+                session_->communication_bytes() - before_bytes;
+            report->mpc_rounds += session_->rounds() - before_rounds;
             report->mpc_milliseconds += std::chrono::duration<double,
                 std::milli>(Clock::now() - started).count();
         }
-        return result;
+        return MpcShareTensor{std::move(output), variance.physical_shape,
+            {variance.numeric.ring_bits, output_scale, variance.numeric.is_signed},
+            ComplexComponent::kReal,
+            planned.value().output_bits < variance.numeric.ring_bits - 1
+                ? std::optional<int>{planned.value().output_bits} : std::nullopt};
     } catch (const std::exception &error) {
         return Status::Internal(std::string("MPC reciprocal sqrt: ") +
                                 error.what());

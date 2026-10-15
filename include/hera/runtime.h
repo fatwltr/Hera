@@ -26,6 +26,9 @@ struct ExecutionReport {
         std::size_t relinearizations{};
         std::size_t rescales{};
         std::size_t mpc_operations{};
+        std::size_t layer_norm_he_workers{};
+        std::size_t layer_norm_mpc_workers{};
+        std::size_t gelu_mpc_workers{};
     };
     struct Stage {
         std::size_t layer{};

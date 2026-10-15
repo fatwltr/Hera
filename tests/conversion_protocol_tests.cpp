@@ -544,21 +544,13 @@ void TestWorkerBatchNegotiation(hera::HeContextRegistry &client_registry,
 
 } // namespace
 
-int main(int argc, char **argv)
+int main()
 {
     int result_pipe[2];
     if (pipe(result_pipe) != 0) return 1;
     try {
-        const auto compression = argc == 2 &&
-                std::string(argv[1]) == "--uncompressed"
-            ? seal::compr_mode_type::none
-            : seal::Serialization::compr_mode_default;
-        const bool small_batches = argc == 2 && std::string(argv[1]) == "--small-batches";
-        Require(argc == 1 || (argc == 2 &&
-                    (std::string(argv[1]) == "--uncompressed" || small_batches)),
-                "expected no arguments, --uncompressed or --small-batches");
+        const auto compression = seal::Serialization::compr_mode_default;
         hera::ConversionConfig protocol{43, 13, 40, 24, true};
-        if (small_batches) protocol.batch_elements = 2048;
         const auto config = TestConfig();
         Require(hera::ValidateHeraConfig(config).ok(), "test config invalid");
         hera::HeContextRegistry client_registry;

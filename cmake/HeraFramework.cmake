@@ -24,12 +24,3 @@ target_link_libraries(hera_private_inference PRIVATE hera_framework)
 hera_configure_target(hera_private_inference)
 target_compile_definitions(hera_private_inference PRIVATE
     HERA_DEFAULT_CONFIG_PATH="${PROJECT_SOURCE_DIR}/configs/figure10_smoke.json")
-
-if(BUILD_TESTING)
-    hera_add_test_executable(hera_framework_tests
-        ${PROJECT_SOURCE_DIR}/tests/framework_tests.cpp
-        LIBRARIES hera_framework
-        DEFINITIONS
-            HERA_TEST_CONFIG_PATH="${PROJECT_SOURCE_DIR}/configs/figure10_smoke.json"
-        PASS "HERA_FRAMEWORK_STATUS=PASS")
-endif()

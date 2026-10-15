@@ -79,7 +79,7 @@ struct PrivateRuntimeCliOptions {
     std::size_t he_threads{1};
     std::size_t conversion_workers{1};
     std::size_t conversion_batch_elements{};
-    std::size_t mpc_workers{}; // zero selects min(HE workers, 50 socket lanes)
+    std::size_t mpc_workers{}; // zero selects HE workers
     std::size_t he_memory_mib{512};
     std::size_t projection_baby_steps{};
     std::size_t plaintext_cache_mib{256};

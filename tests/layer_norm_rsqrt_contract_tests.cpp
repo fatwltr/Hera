@@ -1,4 +1,5 @@
 #include "hera/attention_ln2.h"
+#include "hera/mpc_session.h"
 
 #include <algorithm>
 #include <array>
@@ -36,7 +37,8 @@ void Transfer(int fd, Packet &packet, bool sending)
 
 Packet Run(hera::PartyRole role)
 {
-    hera::MpcLayerNormRuntime runtime(role, "127.0.0.1", 26580);
+    auto session = std::make_shared<hera::SharedMpcSession>(role, "127.0.0.1", 26580, 3);
+    hera::MpcLayerNormRuntime runtime(session);
     Packet packet;
     for (std::size_t variant = 0; variant < scales.size(); ++variant) {
         const int variance_scale = std::max(24, scales[variant]);
@@ -59,7 +61,21 @@ Packet Run(hera::PartyRole role)
         Check(report.rsqrt_input_ring_bits == (variant == 2 ? 40 : 32) &&
             report.rsqrt_output_ring_bits == (variant == 0 ? 27 : variant == 1 ? 34 : 44),
             "rsqrt did not use the checked native plan");
+        Check(report.reciprocal_sqrt_workers == 3,
+            "rsqrt did not shard the uneven input across requested workers");
         std::copy(output.value().local_share.begin(), output.value().local_share.end(), packet.shares[variant]);
+    }
+    // Invalid values in different shards must produce one global failure,
+    // before any shard enters the inverse-sqrt protocol.
+    for (std::size_t invalid_index : {std::size_t{0}, values.size() - 1}) {
+        std::vector<std::uint64_t> shares(values.size(),
+            role == hera::PartyRole::kServer ? (std::uint64_t{1} << 24) : 0);
+        shares[invalid_index] = 0;
+        hera::MpcShareTensor variance{std::move(shares), {{values.size(), 1}},
+            {63, 24, true}, hera::ComplexComponent::kReal};
+        auto result = runtime.ReciprocalSqrt(variance, 20, nullptr, 13);
+        Check(!result.ok() && result.status().message().find("variance must be positive") != std::string::npos,
+            "parallel rsqrt accepted a zero variance or changed its failure contract");
     }
     return packet;
 }

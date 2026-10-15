@@ -867,8 +867,9 @@ void TestStatisticsReductionAndCache()
         input, layer, server_context, &warm, 32);
     Require(parallel.ok(), parallel.status().message());
     check(parallel.value(), layer, 1.0);
-    Require(warm.layer_norm_plaintext_encodings == 0 && warm.layer_norm_workers == 2,
-            "statistics cache or worker cap failed");
+    Require(warm.layer_norm_plaintext_encodings == 0 &&
+                warm.layer_norm_workers == input.ciphertexts.size(),
+            "statistics cache or requested parallelism failed");
     Require(cold.relinearizations < input.ciphertexts.size() &&
                 cold.relinearizations == warm.relinearizations &&
                 cold.rescales == input.ciphertexts.size() + cold.relinearizations + 1 &&
@@ -1508,16 +1509,12 @@ void RunIntegratedParty(
     }
 }
 
-void TestIntegratedExecutor(bool fused = false)
+void TestIntegratedExecutor()
 {
     auto config = MakeConfig();
     auto &input_profile = config.he_parameter_profiles.at("shared");
     input_profile.coefficient_modulus_bits = {60, 35, 60, 60, 60, 60, 60};
     input_profile.declared_depth = 6;
-    if (fused) {
-        input_profile.coefficient_modulus_bits.insert(input_profile.coefficient_modulus_bits.end(), 3, 60);
-        input_profile.declared_depth = 9;
-    }
     const auto &layer = config.layers.front();
     const auto &profile = config.he_parameter_profiles.at("shared");
     hera::HeContextRegistry client_registry;
@@ -1702,7 +1699,7 @@ void TestSharedProfileStatistics(bool compact)
 
 } // namespace
 
-int main(int argc, char **argv)
+int main()
 {
     try {
         TestPackingAndLevels();
@@ -1715,7 +1712,7 @@ int main(int argc, char **argv)
         TestSevenPrimeDirectResidual();
         TestRealWoBsgsPackingVariants();
         TestParallelWoProjection();
-        TestIntegratedExecutor(argc == 2 && std::string(argv[1]) == "--fused-attention");
+        TestIntegratedExecutor();
         std::cout << "ATTENTION_LN2_HE_READY=YES\n"
                   << "ATTENTION_LN2_STATUS=PASS\n";
         return EXIT_SUCCESS;

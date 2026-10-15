@@ -1387,7 +1387,7 @@ public:
                 std::ldexp(1., input.numeric.ring_bits - 1))
             return Status::Invalid("GeLU MPC size or threshold is unsupported");
         std::vector<std::uint64_t> output(input.local_share.size());
-        session_->ForEachRange(output.size(), 32768,
+        session_->ForEachRange(output.size(), 1,
             [&](std::size_t worker, std::size_t begin, std::size_t end) {
                 Impl local(session_, worker);
                 auto values = local.EvaluateRange(input, negative, positive, threshold, begin, end);
@@ -1459,6 +1459,8 @@ Result<MpcShareTensor> MpcGeluRuntime::Evaluate(
         if (report) {
             report->comparisons += 2 * input.local_share.size();
             report->muxes += 3 * input.local_share.size();
+            report->mpc_workers = std::max(report->mpc_workers,
+                std::min(session_->worker_count(), input.local_share.size()));
             report->mpc_communication_bytes +=
                 impl_->communication() - before_bytes;
             report->mpc_rounds += impl_->rounds() - before_rounds;

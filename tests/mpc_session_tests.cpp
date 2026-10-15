@@ -1,4 +1,5 @@
 #include "hera/mpc_session.h"
+#include "hera/detail/worker_ports.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -9,6 +10,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <set>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -87,12 +90,35 @@ void Pair(int port, bool mismatch = false, bool cancel = false)
 int main()
 {
     try {
-        for (const auto workers : {std::size_t{0}, std::size_t{51}}) {
+        // Check expanded layouts without opening hundreds of expensive OT
+        // sessions. Every worker's three sockets must remain disjoint.
+        for (const auto workers : {std::size_t{1}, std::size_t{16}, std::size_t{32},
+                                  std::size_t{50}, std::size_t{51}, std::size_t{128}}) {
+            std::set<int> sockets;
+            const int base = 23900;
+            const int mpc_base = hera::detail::RuntimeMpcPort(base, workers, workers);
+            for (std::size_t i = 0; i < workers; ++i) {
+                for (int offset : {0, 50, 100}) {
+                    Require(sockets.insert(base + 100 + static_cast<int>(3 * i) + offset).second,
+                        "conversion sockets overlap");
+                    Require(sockets.insert(mpc_base + static_cast<int>(
+                        hera::detail::MpcWorkerPortOffset(i)) + offset).second,
+                        "MPC sockets overlap conversion or another worker");
+                }
+            }
+            hera::SharedMpcSession accepted(hera::PartyRole::kServer, "", mpc_base, workers);
+            Require(accepted.worker_count() == workers, "expanded worker count was capped");
+        }
+        for (const auto workers : {std::size_t{0}, std::numeric_limits<std::size_t>::max()}) {
             bool rejected = false;
             try { hera::SharedMpcSession invalid(hera::PartyRole::kServer, "", 23900, workers); }
             catch (const std::invalid_argument &) { rejected = true; }
             Require(rejected, "invalid MPC socket lane count was accepted");
         }
+        bool rejected = false;
+        try { (void)hera::detail::RuntimeMpcPort(65500, 32, 32); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        Require(rejected, "worker layout overflowed the TCP port space");
         Pair(23900);
         Pair(24100, true);
         Pair(24300, false, true);

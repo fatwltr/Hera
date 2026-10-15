@@ -4,6 +4,7 @@
 #include "hera/detail/conversion_lanes.h"
 #include "hera/seal_wire.h"
 #include "hera/detail/parallel_ranges.h"
+#include "hera/detail/worker_ports.h"
 
 #include "fixed_ckks_transform.h"
 #include "random_sampling.h"
@@ -326,12 +327,12 @@ public:
             throw std::invalid_argument("statistical bits must be in [1,63]");
         if (config_.ring_bits + config_.statistical_security_bits > 127)
             throw std::invalid_argument("wide conversion ring exceeds 127 bits");
-        if (threads < 1 || threads > 16)
-            throw std::invalid_argument("conversion threads must be in [1,16]");
+        detail::ValidateWorkerPortRange(worker_port,
+            detail::ConversionWorkerPortSpan(threads));
         if (config_.batch_elements == 0)
             config_.batch_elements = ConversionConfig::DefaultBatchElements(threads);
-        if (config_.batch_elements > (1U << 20))
-            throw std::invalid_argument("conversion batch elements must be in [0,1048576] (zero selects auto)");
+        if (config_.batch_elements > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("conversion batch exceeds SCI's integer size range");
         const int physical_party = role_ == PartyRole::kServer ? sci::ALICE
                                                                : sci::BOB;
         workers_.reserve(threads);

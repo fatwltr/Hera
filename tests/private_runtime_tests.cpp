@@ -262,88 +262,11 @@ void TestCompiledExecutionPlan()
             "unsupported Post-LN config unexpectedly compiled");
 }
 
-hera::TensorHandle EvaluateExplicitBridge(
-    const hera::HeraConfig &config, hera::HeContextRegistry &contexts,
-    hera::RuntimeTensorArena &arena, hera::SealPlainParameterStore &parameters,
-    hera::CkksMpcConverter &converter, hera::MpcSoftmaxRuntime &softmax,
-    hera::MpcLayerNormRuntime &norm, hera::MpcGeluRuntime &gelu,
-    const hera::TransformerWeightHandles &weights,
-    const hera::EncryptedTransformerInput &input)
-{
-    // Exercise the public bridge using the full runtime's frozen model cache.
-    // Its next-layer QK/V and skip are consumed directly, without a second LN1.
-    hera::SealSciPreLnEntryExecutor entry(config, 0, contexts, arena, parameters, converter, norm);
-    auto prepared = entry.Evaluate(input.hidden_states.tensor, weights.layers.front());
-    Require(prepared.ok(), prepared.status().message());
-    auto next_inputs = prepared.take_value();
-    hera::TensorHandle hidden;
-    for (std::size_t i = 0; i < config.layers.size(); ++i) {
-        const auto &layer = config.layers[i];
-        const auto &handles = weights.layers[i];
-        hera::ModelPlaintextCacheScope scope(&parameters, layer.id);
-        hera::SealSciSoftmaxExecutor softmax_stage(config, layer, contexts, arena.he,
-            arena.mpc, converter, softmax, &arena.ids);
-        auto probabilities = softmax_stage.Evaluate({next_inputs.block2.scaled_attention_scores, input.attention_mask});
-        Require(probabilities.ok(), probabilities.status().message());
-        arena.he.Erase(next_inputs.block2.scaled_attention_scores.id);
-        hera::SealSciAttentionLn2Executor attention(config, layer, contexts, arena.he,
-            parameters, arena.mpc, converter, norm, &arena.ids);
-        auto ln2 = attention.Evaluate({probabilities.value().probability_shares,
-            next_inputs.block2.value, next_inputs.attention_residual}, handles);
-        Require(ln2.ok(), ln2.status().message());
-        arena.mpc.Erase(probabilities.value().probability_shares.id);
-        arena.he.Erase(next_inputs.block2.value.id);
-        arena.he.Erase(next_inputs.attention_residual.id);
-        hera::SealSciFfnGeluExecutor ffn(config, layer, contexts, parameters, arena.mpc,
-            converter, gelu, &arena.ids, &arena.he);
-        auto activation = ffn.Evaluate({ln2.value().centered_shares, ln2.value().inverse_stddev_shares}, handles);
-        Require(activation.ok(), activation.status().message());
-        arena.mpc.Erase(ln2.value().centered_shares.id);
-        arena.mpc.Erase(ln2.value().inverse_stddev_shares.id);
-        const auto residual = !layer.ffn_residual ? std::optional<hera::TensorHandle>{}
-            : layer.norm == hera::NormPlacement::kNormalizedResidual
-            ? (activation.value().normalized_residual_he ? activation.value().normalized_residual_he
-                                                        : activation.value().normalized_residual_shares)
-            : std::optional<hera::TensorHandle>{ln2.value().ffn_residual};
-        hera::SealSciBlock5BridgeExecutor bridge(config, i, contexts, arena.he, parameters,
-            arena.mpc, converter, norm, &arena.ids);
-        hera::Block5BridgeExecutionReport report;
-        const auto following = i + 1 < config.layers.size()
-            ? std::optional<hera::LayerWeightHandles>{weights.layers[i + 1]} : std::nullopt;
-        auto result = bridge.Evaluate({activation.value().activation_shares, residual}, handles, following, &report);
-        Require(result.ok(), result.status().message());
-        arena.mpc.Erase(activation.value().activation_shares.id);
-        if (activation.value().normalized_residual_shares)
-            arena.mpc.Erase(activation.value().normalized_residual_shares->id);
-        if (activation.value().normalized_residual_he)
-            arena.he.Erase(activation.value().normalized_residual_he->id);
-        arena.he.Erase(ln2.value().ffn_residual.id);
-        hidden = result.value().hidden_states;
-        if (following) {
-            Require(result.value().next_layer.has_value(), "bridge did not return next-layer inputs");
-            const auto &next = *result.value().next_layer;
-            Require(report.ckks_to_mpc_calls == 2 && report.mpc_to_ckks_calls == 2,
-                    "shared-profile bridge did not use one centered/inverse M2C");
-            Require(next.attention_residual.valid() == config.layers[i + 1].attention_residual,
-                    "bridge skip presence differs from next-layer configuration");
-            Require(arena.mpc.GetMpcShare(next.centered_shares.id).ok() &&
-                arena.mpc.GetMpcShare(next.inverse_stddev_shares.id).ok(),
-                "bridge lost its compatibility shares");
-            arena.mpc.Erase(next.centered_shares.id);
-            arena.mpc.Erase(next.inverse_stddev_shares.id);
-            next_inputs.block2 = next.block2;
-            next_inputs.attention_residual = next.attention_residual;
-            arena.he.Erase(hidden.id);
-        }
-    }
-    return hidden;
-}
-
 PartyResult RunParty(
     hera::PartyRole role, const hera::HeraConfig &config,
     hera::HeContextRegistry &contexts, hera::RuntimeTensorArena &arena,
     hera::SealPlainParameterStore &parameters,
-    const hera::TransformerWeightHandles &weights, int base, bool explicit_bridge)
+    const hera::TransformerWeightHandles &weights, int base)
 {
     try {
         auto transport = hera::MakeNetIoTransport(
@@ -435,15 +358,6 @@ PartyResult RunParty(
         if (arena.he.Size() != expected_he || arena.mpc.Size() != 0)
             return {false, {},
                     "runtime arena retained dead intermediate tensors"};
-        if (explicit_bridge) {
-            arena.he.Erase(output.value().tensor.id);
-            output.value().tensor = EvaluateExplicitBridge(config, contexts, arena, parameters,
-                converter, softmax, norm, gelu, weights, input);
-            Require(arena.he.Size() == expected_he && arena.mpc.Size() == 0,
-                    "explicit bridge retained dead intermediate tensors");
-            Require(parameters.encoded_plaintext_count() == preparation.encoded_plaintext_count,
-                    "explicit bridge encoded new model plaintexts online");
-        }
         return {true, output.value().tensor, {}};
     } catch (const std::exception &error) {
         return {false, {}, error.what()};
@@ -538,13 +452,11 @@ std::vector<double> PlainNormalizedResidualModel(
     return hidden;
 }
 
-void TestRuntime(hera::HeraConfig config, int base, bool explicit_bridge, bool extended_chain)
+void TestRuntime(hera::HeraConfig config, int base)
 {
-    if (!extended_chain) {
-        auto &profile = config.he_parameter_profiles.at("r5");
-        profile.coefficient_modulus_bits.pop_back();
-        profile.declared_depth = profile.coefficient_modulus_bits.size() - 1;
-    }
+    auto &profile = config.he_parameter_profiles.at("r5");
+    profile.coefficient_modulus_bits.pop_back();
+    profile.declared_depth = profile.coefficient_modulus_bits.size() - 1;
     const auto terminal = config.he_parameter_profiles.at("r5").coefficient_modulus_bits.size() - 1;
     const auto output_level = terminal - 3;
     for (auto &execution : config.layer_execution)
@@ -619,13 +531,13 @@ void TestRuntime(hera::HeraConfig config, int base, bool explicit_bridge, bool e
     if (child == 0) {
         auto result = RunParty(hera::PartyRole::kClient, config, client,
                                client_arena, client_parameters,
-                               client_weights.value(), base, explicit_bridge);
+                               client_weights.value(), base);
         if (!result.ok) std::cerr << "client runtime: " << result.error << '\n';
         _exit(result.ok ? 0 : 2);
     }
     auto server_result = RunParty(
         hera::PartyRole::kServer, config, server, server_arena,
-        server_parameters, server_weights.value(), base, explicit_bridge);
+        server_parameters, server_weights.value(), base);
     int child_status = 0;
     waitpid(child, &child_status, 0);
     Require(server_result.ok, server_result.error);
@@ -684,7 +596,7 @@ void TestRuntime(hera::HeraConfig config, int base, bool explicit_bridge, bool e
 
 } // namespace
 
-int main(int argc, char **argv)
+int main()
 {
     try {
         TestVirtualWeightPlaintextPool();
@@ -692,20 +604,8 @@ int main(int argc, char **argv)
         auto two_layers = MakeConfig();
         two_layers.layers.front().norm = hera::NormPlacement::kNormalizedResidual;
         two_layers.threads = 2;
-        const std::string variant = argc == 2 ? argv[1] : "";
-        const bool explicit_bridge = variant.find("--explicit-bridge") == 0;
-        if (variant == "--fused-attention") {
-            auto &profile = two_layers.he_parameter_profiles.at("r2");
-            profile.coefficient_modulus_bits.insert(profile.coefficient_modulus_bits.end(), 3, 60);
-            profile.declared_depth = 9;
-            two_layers.threads = 4;
-        }
         auto second_layer = two_layers.layers.front();
         second_layer.id = "layer1";
-        if (variant == "--explicit-bridge-no-next-skip") {
-            second_layer.attention_residual = false;
-            second_layer.ffn_residual = false;
-        }
         two_layers.layers.push_back(second_layer);
         auto second_execution = two_layers.layer_execution.front();
         second_execution.layer_id = second_layer.id;
@@ -713,8 +613,7 @@ int main(int argc, char **argv)
         // A two-layer run subsumes the one-layer path and, unlike two
         // back-to-back SCI process pairs in one test executable, does not
         // inherit fork-unsafe global OT state from an earlier session.
-        TestRuntime(std::move(two_layers), 21200, explicit_bridge,
-                    variant.find("extended-ffn-chain") != std::string::npos);
+        TestRuntime(std::move(two_layers), 21200);
         std::cout << "HERA_PRIVATE_RUNTIME_STATUS=PASS\n";
         return 0;
     } catch (const std::exception &error) {
