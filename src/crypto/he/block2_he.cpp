@@ -466,8 +466,8 @@ Result<std::shared_ptr<const PreparedProjectionPlan>> CompileProjection(
                             mask[adjusted_slot + token] += coefficient;
                     }
                     if (!nonzero) continue;
-                    auto encoded = CompileProjectionPlaintext(encoder, mask, prepared->input_parms_id,
-                        plain_scale, "block2.projection.diagonal", context);
+                    auto encoded = CompileModelPlaintext(encoder, mask, prepared->input_parms_id,
+                        plain_scale, "block2.projection.diagonal");
                     if (!encoded.ok()) return encoded.status();
                     group.terms.push_back({source_ct, ComplexLane::kReal,
                         static_cast<int>(baby), encoded.take_value()});
@@ -1092,18 +1092,61 @@ Result<SealCipherTensor> ComputeQk(
         const auto &tile = compiled.tile;
         const auto &plan = compiled.plan;
         const auto &routes = compiled.routes;
+        const auto active_primes = context.context->get_context_data(
+            q.ciphertexts.front().parms_id())->parms().coeff_modulus().size();
+        const auto worker_bytes = [&](std::size_t live) {
+            return detail::EstimatedHeWorkerBytes(
+                context.parameters.polynomial_degree, active_primes, live);
+        };
+        // Prepare each K base once, then rotate independent (baby, input)
+        // pairs. Pre-sized outputs and task-local counts avoid shared mutation.
+        std::vector<seal::Ciphertext> k_preprocessed(tile.input_groups);
+        std::vector<Block2ExecutionReport> preparation_reports(tile.input_groups);
+        std::size_t preparation_workers = 0;
+        auto prepared = detail::ParallelRanges(tile.input_groups, he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator worker(*context.context);
+                for (auto group = begin; group < end; ++group)
+                    k_preprocessed[group] = PreprocessQkK(
+                        k.ciphertexts[tile.input_begin + group], compiled,
+                        context, worker, &preparation_reports[group]);
+                return {};
+            }, worker_bytes(plan.preprocessing_baby_steps + 4), &preparation_workers);
+        if (!prepared.ok()) return prepared.status();
+        if (report) report->qk_preparation_workers = std::max(
+            report->qk_preparation_workers, preparation_workers);
         std::vector<std::vector<seal::Ciphertext>> k_babies(plan.baby_steps);
-        for (std::size_t group = 0; group < tile.input_groups; ++group) {
-            auto preprocessed = PreprocessQkK(
-                k.ciphertexts[tile.input_begin + group], compiled, context, evaluator, report);
-            for (std::size_t i = 0; i < plan.baby_steps; ++i)
-                k_babies[i].push_back(InnerRotateQk(
-                    preprocessed, static_cast<long long>(i), layer, context,
-                    evaluator, compiled.k_masks[i], k_preprocessed_scale, report));
+        for (auto &baby : k_babies) baby.resize(tile.input_groups);
+        std::vector<Block2ExecutionReport> baby_reports(plan.baby_steps * tile.input_groups);
+        prepared = detail::ParallelRanges(baby_reports.size(), he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator worker(*context.context);
+                for (auto job = begin; job < end; ++job) {
+                    const auto baby = job / tile.input_groups;
+                    const auto group = job % tile.input_groups;
+                    k_babies[baby][group] = InnerRotateQk(
+                        k_preprocessed[group], static_cast<long long>(baby),
+                        layer, context, worker, compiled.k_masks[baby],
+                        k_preprocessed_scale, &baby_reports[job]);
+                }
+                return {};
+            }, worker_bytes(4), &preparation_workers);
+        if (!prepared.ok()) return prepared.status();
+        k_preprocessed.clear();
+        if (report) {
+            report->qk_preparation_workers = std::max(
+                report->qk_preparation_workers, preparation_workers);
+            for (const auto *reports : {&preparation_reports, &baby_reports})
+                for (const auto &counts : *reports) {
+                    report->rotations += counts.rotations;
+                    report->ciphertext_plain_multiplications += counts.ciphertext_plain_multiplications;
+                    report->rescales += counts.rescales;
+                }
         }
 
         std::vector<std::vector<seal::Ciphertext>> giant_outputs(plan.giant_steps);
         std::vector<Block2ExecutionReport> giant_reports(plan.giant_steps);
+        std::size_t product_workers = 0;
         auto ready = detail::ParallelRanges(
             plan.giant_steps, he_workers, 1,
             [&](std::size_t begin, std::size_t end) -> Result<void> {
@@ -1203,14 +1246,13 @@ Result<SealCipherTensor> ComputeQk(
                     giant_outputs[j] = std::move(outputs);
                 }
                 return {};
-            }, detail::EstimatedHeWorkerBytes(
-                context.parameters.polynomial_degree,
-                context.parameters.coefficient_modulus_bits.size(),
-                // K babies are shared, not replicated per worker. Bound the
-                // private Q batch, real diagonal sums, wrap branches, outputs
-                // and scratch ciphertexts (including size-three products).
-                16 + tile.input_groups + 5 * tile.output_groups));
+            }, worker_bytes(
+                // Use the active input level, retaining headroom for size-three
+                // products and key-switch scratch; K babies are shared.
+                16 + tile.input_groups + 5 * tile.output_groups), &product_workers);
         if (!ready.ok()) return ready.status();
+        if (report) report->qk_product_workers = std::max(
+            report->qk_product_workers, product_workers);
         std::vector<seal::Ciphertext> output(tile.output_groups);
         std::vector<bool> initialized(tile.output_groups, false);
         for (std::size_t j = 0; j < plan.giant_steps; ++j) {

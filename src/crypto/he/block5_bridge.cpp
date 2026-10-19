@@ -1,8 +1,10 @@
+#include "hera/blb_reference.h"
 #include "hera/block5_bridge.h"
 #include "hera/detail/he_level.h"
 #include "hera/detail/level_schedule.h"
 #include "hera/detail/he_packing.h"
 #include "hera/pre_ln_entry.h"
+#include "hera/detail/scoped_wall_timer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -97,7 +99,7 @@ SealSciBlock5BridgeExecutor::SealSciBlock5BridgeExecutor(
     const HeraConfig &config, std::size_t current_layer_index,
     HeContextRegistry &contexts, SealCipherTensorStore &he_tensors,
     SealPlainParameterStore &parameters, CryptoTensorStore &mpc_tensors,
-    CkksMpcConverter &converter, MpcLayerNormRuntime &mpc_layer_norm,
+    BlbReferenceConverter &converter, MpcLayerNormRuntime &mpc_layer_norm,
     TensorIdAllocator *ids)
     : config_(config), current_layer_index_(current_layer_index),
       contexts_(contexts), he_tensors_(he_tensors), parameters_(parameters),
@@ -352,11 +354,15 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
         auto activation_map = ToConversionMap(activation_plan.value());
         if (!activation_map.ok()) return activation_map.status();
         TensorShape conversion_shape{{layer.tokens, layer.ffn_width}};
+        std::vector<std::optional<int>> conversion_bounds(
+            activation_map.value().ciphertext_count, activation.value().public_value_bound_bits);
         if (residual_shares) {
             auto pair = Scatter(*residual_shares, output_plan.value());
             if (!pair.ok()) return pair.status();
             auto map = ToConversionMap(output_plan.value());
             if (!map.ok()) return map.status();
+            conversion_bounds.insert(conversion_bounds.end(), map.value().ciphertext_count,
+                                     residual_shares->public_value_bound_bits);
             const auto logical_offset = activation_map.value().logical_element_count;
             for (auto assignment : map.value().assignments) {
                 if (assignment.real_logical_index != kUnusedLogicalIndex)
@@ -378,7 +384,8 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
             activation_pair.value(),
             {shared.profile, wd_output_level - 1,
              wd_scale_bits,
-             conversion_shape, Layout::kFfn, activation_map.take_value()});
+             conversion_shape, Layout::kFfn, activation_map.take_value(),
+             false, std::nullopt, std::move(conversion_bounds)});
         if (!activation_he.ok()) return activation_he.status();
         AccumulateConversion(before, converter_.stats(), report, true);
 
@@ -392,6 +399,7 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
             wd_region, shared, hidden_level,
             wd_scale_bits, config_.mpc_numeric);
         if (contexts_.role() == PartyRole::kServer) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             if (!activation_he.value())
                 return Status::Internal("server did not receive GeLU ciphertext");
             SealCipherTensor encoded;
@@ -492,6 +500,7 @@ Result<Block5BridgeOutputs> SealSciBlock5BridgeExecutor::Evaluate(
             report->conversion_communication_bytes += next_report.conversion_communication_bytes;
             report->conversion_rounds += next_report.conversion_rounds;
             report->conversion_milliseconds += next_report.conversion_milliseconds;
+            report->he_milliseconds += next_report.he_milliseconds;
             report->layer_norm = std::move(next_report.statistics);
             report->next_block2 = std::move(next_report.block2);
         }

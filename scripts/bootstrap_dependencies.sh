@@ -18,12 +18,7 @@ jobs=${2:-2}
   exit 2
 }
 
-for tool in cmake git patch rsync; do
-  command -v "$tool" >/dev/null 2>&1 || {
-    echo "Missing required tool: $tool" >&2
-    exit 2
-  }
-done
+"$script_dir/check_prerequisites.sh" full
 
 # shellcheck source=../dependencies.lock
 source "$repo_root/dependencies.lock"
@@ -32,42 +27,7 @@ src_root="$deps_root/src"
 build_root="$deps_root/build"
 mkdir -p "$src_root" "$build_root"
 
-checkout_pinned() {
-  local name=$1
-  local repository=$2
-  local commit=$3
-  local destination="$src_root/$name"
-
-  if [[ ! -d "$destination/.git" ]]; then
-    [[ ! -e "$destination" ]] || {
-      echo "Refusing non-git dependency path: $destination" >&2
-      exit 2
-    }
-    git clone --filter=blob:none "$repository" "$destination"
-  fi
-
-  if [[ -n "$(git -C "$destination" status --porcelain)" ]]; then
-    echo "Dependency checkout has local changes: $destination" >&2
-    exit 2
-  fi
-  # A repeat build with the pinned source already present must not require
-  # GitHub access. This is also useful when dependencies were staged on a
-  # server before its compute node was disconnected from the network.
-  if [[ "$(git -C "$destination" rev-parse HEAD)" != "$commit" ]]; then
-    git -C "$destination" fetch --depth 1 origin "$commit"
-    git -C "$destination" checkout --detach "$commit"
-  fi
-  [[ "$(git -C "$destination" rev-parse HEAD)" == "$commit" ]] || {
-    echo "Failed to select pinned revision for $name" >&2
-    exit 1
-  }
-}
-
-checkout_pinned seal "$SEAL_REPOSITORY" "$SEAL_COMMIT"
-checkout_pinned blb "$BLB_REPOSITORY" "$BLB_COMMIT"
-checkout_pinned bolt "$BOLT_REPOSITORY" "$BOLT_COMMIT"
-
-git -C "$src_root/bolt" submodule update --init --depth 1 SCI/extern/eigen
+"$script_dir/download_dependencies.sh" "$deps_root"
 
 seal_output="$build_root/seal-$SEAL_VERSION"
 seal_compression=${HERA_SEAL_COMPRESSION:-zstd}
@@ -93,8 +53,8 @@ if ! grep -qx "SEAL_COMPRESSION=$seal_compression" "$seal_manifest"; then
   fi
 fi
 
-# Keep the previous ABI-compatible build intact for reproducible comparisons.
-sci_output="$build_root/hera-sci-abi-$HERA_SCI_ABI-correlated"
+# A new recipe gets a new directory; never mix headers with older SCI archives.
+sci_output="$build_root/$HERA_SCI_BUILD"
 sci_dir="$sci_output/install/lib/cmake/SCI"
 if [[ ! -f "$sci_dir/SCIConfig.cmake" ]]; then
   [[ ! -e "$sci_output" ]] || {
@@ -114,30 +74,18 @@ grep -qx "OT_BACKEND=VOLE_SILENT_OT" "$sci_manifest"
 grep -qx "OT_EXPANSION=UNROLLED_AES_PREFIX_PAD" "$sci_manifest"
 grep -qx "MPC_MEMORY=REUSABLE_SLAB_V1" "$sci_manifest"
 grep -qx "MPC_COMPARISON=CORRELATED_AND_V1" "$sci_manifest"
+grep -qx "MPC_OPENMP=DIRECTION_TASKS_V2" "$sci_manifest"
+grep -qx "RANDOM_SOURCE=OS_RANDOM_DEVICE" "$sci_manifest"
+grep -qx "EMP_SOURCE=VENDORED_HEADERS" "$sci_manifest"
 grep -qx "BLB_COMMIT=$BLB_COMMIT" "$sci_manifest"
 grep -qx "BOLT_COMMIT=$BOLT_COMMIT" "$sci_manifest"
 
-# Older installations with the same ABI/commit manifest omitted this
-# header-only transitive dependency. Repair that exact packaging omission
-# without rebuilding SCI or touching its pinned source checkout.
 emp_header="$sci_output/install/include/emp-tool/emp-tool.h"
-if [[ ! -f "$emp_header" ]]; then
-  emp_source="$sci_output/SCI/deps/emp-tool/emp-tool"
-  [[ -f "$emp_source/emp-tool.h" ]] || {
-    echo "Incomplete HERA-SCI package: emp-tool headers are absent" >&2
-    echo "Move $sci_output aside and rerun dependency bootstrap." >&2
-    exit 2
-  }
-  mkdir -p "$(dirname "$emp_header")"
-  rsync -a --exclude '*.rej' "$emp_source/" "$(dirname "$emp_header")/"
-fi
+[[ -f "$emp_header" ]] || { echo "Incomplete HERA-SCI package: $emp_header" >&2; exit 2; }
 
 env_file="$deps_root/env.sh"
-cat > "$env_file" <<EOF
-export SEAL_DIR='$seal_dir'
-export SCI_DIR='$sci_dir'
-export Eigen3_DIR='$sci_output/SCI/extern/eigen/build'
-EOF
+printf 'export SEAL_DIR=%q\nexport SCI_DIR=%q\nexport Eigen3_DIR=%q\n' \
+  "$seal_dir" "$sci_dir" "$sci_output/SCI/extern/eigen/build" > "$env_file"
 
 echo "HERA_DEPENDENCIES_STATUS=PASS"
 echo "DEPENDENCY_ENV=$env_file"

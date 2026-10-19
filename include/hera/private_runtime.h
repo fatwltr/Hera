@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hera/blb_reference.h"
+
 #include "hera/block5_bridge.h"
 #include "hera/pre_ln_entry.h"
 #include "hera/execution_plan.h"
@@ -30,7 +32,7 @@ public:
     SealSciTransformerRuntime(
         const HeraConfig &config, HeContextRegistry &contexts,
         RuntimeTensorArena &arena, SealPlainParameterStore &parameters,
-        CkksMpcConverter &converter, MpcSoftmaxRuntime &softmax_mpc,
+        BlbReferenceConverter &converter, MpcSoftmaxRuntime &softmax_mpc,
         MpcLayerNormRuntime &layer_norm_mpc, MpcGeluRuntime &gelu_mpc,
         RuntimeCoordinator *coordinator = nullptr,
         std::shared_ptr<const CompiledTransformerExecutionPlan> plan = {});
@@ -53,7 +55,7 @@ private:
     HeContextRegistry &contexts_;
     RuntimeTensorArena &arena_;
     SealPlainParameterStore &parameters_;
-    CkksMpcConverter &converter_;
+    BlbReferenceConverter &converter_;
     MpcSoftmaxRuntime &softmax_mpc_;
     MpcLayerNormRuntime &layer_norm_mpc_;
     MpcGeluRuntime &gelu_mpc_;
@@ -82,7 +84,6 @@ struct PrivateRuntimeCliOptions {
     std::size_t mpc_workers{}; // zero selects HE workers
     std::size_t he_memory_mib{512};
     std::size_t projection_baby_steps{};
-    std::size_t plaintext_cache_mib{256};
     std::size_t stage_timeout_seconds{30};
     std::string seal_compression{"zstd"};
     std::uint64_t input_seed{1};

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hera/blb_reference.h"
+
 #include "hera/attention_ln2.h"
 #include "hera/execution_plan.h"
 
@@ -43,7 +45,7 @@ public:
     SealSciPreLnEntryExecutor(
         const HeraConfig &config, std::size_t layer_index,
         HeContextRegistry &contexts, RuntimeTensorArena &arena,
-        SealPlainParameterStore &parameters, CkksMpcConverter &converter,
+        SealPlainParameterStore &parameters, BlbReferenceConverter &converter,
         MpcLayerNormRuntime &mpc_layer_norm,
         const CompiledLayerExecutionPlan *plan = nullptr);
 
@@ -51,7 +53,7 @@ public:
         const HeraConfig &config, std::size_t layer_index,
         HeContextRegistry &contexts, SealCipherTensorStore &he_tensors,
         CryptoTensorStore &mpc_tensors, SealPlainParameterStore &parameters,
-        CkksMpcConverter &converter, MpcLayerNormRuntime &mpc_layer_norm,
+        BlbReferenceConverter &converter, MpcLayerNormRuntime &mpc_layer_norm,
         TensorIdAllocator *ids = nullptr,
         const CompiledLayerExecutionPlan *plan = nullptr);
 
@@ -69,7 +71,7 @@ private:
     TensorIdAllocator *ids_{};
     TensorIdAllocator owned_ids_;
     SealPlainParameterStore &parameters_;
-    CkksMpcConverter &converter_;
+    BlbReferenceConverter &converter_;
     MpcLayerNormRuntime &mpc_layer_norm_;
     const CompiledLayerExecutionPlan *plan_{};
 };

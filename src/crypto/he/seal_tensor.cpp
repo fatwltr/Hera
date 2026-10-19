@@ -3,8 +3,6 @@
 #include "hera/detail/parallel_ranges.h"
 
 #include <limits>
-#include <cstdio>
-#include <list>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -14,89 +12,6 @@
 #include <tuple>
 
 namespace hera {
-class ProjectionPlaintextCache : public std::enable_shared_from_this<ProjectionPlaintextCache> {
-public:
-    explicit ProjectionPlaintextCache(std::size_t budget) : budget_(budget) {}
-    ~ProjectionPlaintextCache() { if (file_) std::fclose(file_); }
-    bool Contains(const std::string &key) const { return entries_.find(key) != entries_.end(); }
-    ProjectionPlaintext Handle(const std::string &key) { return {shared_from_this(), key}; }
-    void Add(const std::string &key, std::shared_ptr<const seal::Plaintext> plain,
-             std::shared_ptr<seal::SEALContext> context)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        Entry entry;
-        entry.context = std::move(context);
-        entry.bytes = plain->coeff_count() * sizeof(std::uint64_t);
-        entry.plain = std::move(plain);
-        lru_.push_front(key); entry.position = lru_.begin();
-        resident_ += entry.bytes;
-        entries_.emplace(key, std::move(entry));
-        Trim();
-    }
-    std::shared_ptr<const seal::Plaintext> Acquire(const std::string &key)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto &entry = entries_.at(key);
-        if (entry.plain) {
-            lru_.splice(lru_.begin(), lru_, entry.position);
-            return entry.plain;
-        }
-        if (!file_ || std::fseek(file_, entry.offset, SEEK_SET) != 0)
-            throw std::runtime_error("projection plaintext spill seek failed");
-        std::string bytes(entry.serialized, '\0');
-        if (std::fread(bytes.data(), 1, bytes.size(), file_) != bytes.size())
-            throw std::runtime_error("projection plaintext spill read failed");
-        auto plain = std::make_shared<seal::Plaintext>();
-        // This is our own immutable serialization, never an external input.
-        plain->load(*entry.context, reinterpret_cast<const seal::seal_byte *>(bytes.data()), bytes.size());
-        ++loads_;
-        entry.plain = plain;
-        lru_.push_front(key); entry.position = lru_.begin();
-        resident_ += entry.bytes;
-        Trim();
-        return plain;
-    }
-    std::size_t Count() const { std::lock_guard<std::mutex> lock(mutex_); return entries_.size(); }
-    std::size_t Resident() const { std::lock_guard<std::mutex> lock(mutex_); return resident_; }
-    std::size_t Spilled() const { std::lock_guard<std::mutex> lock(mutex_); return spilled_; }
-    std::size_t Loads() const { std::lock_guard<std::mutex> lock(mutex_); return loads_; }
-private:
-    struct Entry {
-        std::shared_ptr<const seal::Plaintext> plain;
-        std::shared_ptr<seal::SEALContext> context;
-        std::size_t bytes{}, serialized{};
-        long offset{-1};
-        std::list<std::string>::iterator position;
-    };
-    void Trim()
-    {
-        while (resident_ > budget_ && !lru_.empty()) {
-            auto &entry = entries_.at(lru_.back());
-            if (entry.offset < 0) {
-                if (!file_) file_ = std::tmpfile();
-                if (!file_ || std::fseek(file_, 0, SEEK_END) != 0)
-                    throw std::runtime_error("projection plaintext spill creation failed");
-                const auto length = entry.plain->save_size(seal::compr_mode_type::none);
-                std::string bytes(static_cast<std::size_t>(length), '\0');
-                const auto written = entry.plain->save(reinterpret_cast<seal::seal_byte *>(bytes.data()),
-                    bytes.size(), seal::compr_mode_type::none);
-                entry.offset = std::ftell(file_);
-                if (entry.offset < 0 || std::fwrite(bytes.data(), 1, written, file_) != static_cast<std::size_t>(written))
-                    throw std::runtime_error("projection plaintext spill write failed");
-                entry.serialized = static_cast<std::size_t>(written);
-                spilled_ += entry.serialized;
-            }
-            resident_ -= entry.bytes;
-            entry.plain.reset(); lru_.pop_back();
-        }
-    }
-    std::size_t budget_, resident_{}, spilled_{}, loads_{};
-    mutable std::mutex mutex_;
-    std::map<std::string, Entry> entries_;
-    std::list<std::string> lru_;
-    std::FILE *file_{};
-};
-
 namespace { std::atomic<bool> projection_hoisting{true}; std::atomic<std::size_t> projection_baby_steps{0}; }
 void ConfigureProjectionRotationHoisting(bool enabled) noexcept { projection_hoisting.store(enabled); }
 bool ProjectionRotationHoistingEnabled() noexcept { return projection_hoisting.load(); }
@@ -124,19 +39,6 @@ double ProjectionBsgsCost(std::size_t bases, std::size_t outputs, std::size_t co
     return babies * (baby > 2 ? .55 : 1.) + giants +
         (phase ? outputs * (columns / baby) * .04 : 0.) + penalty;
 #endif
-}
-
-std::shared_ptr<const seal::Plaintext> ProjectionPlaintext::Acquire() const
-{
-    if (direct_) return direct_;
-    if (!cache_) throw std::runtime_error("empty projection plaintext handle");
-    return cache_->Acquire(key_);
-}
-const seal::Plaintext &ProjectionPlaintext::operator*() const
-{
-    thread_local std::shared_ptr<const seal::Plaintext> view;
-    view = Acquire();
-    return *view;
 }
 
 namespace {
@@ -548,7 +450,7 @@ Result<std::vector<seal::Ciphertext>> EvaluatePreparedProjection(
                                     }
                                 }
                                 seal::Ciphertext product;
-                                auto plain = term.plaintext.Acquire();
+                                const auto &plain = term.plaintext;
                                 worker.multiply_plain(*baby, *plain, product);
                                 ++report.ciphertext_plain_multiplications;
                                 if (first) { sum = std::move(product); first = false; }
@@ -1363,71 +1265,10 @@ Result<void> SealPlainParameterStore::ConfigureVirtualWeightPlaintexts(
     return {};
 }
 
-Result<void> SealPlainParameterStore::ConfigureProjectionPlaintextMemory(std::size_t bytes)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (bytes == 0 || preparing_plaintexts_ || plaintext_cache_frozen_)
-        return Status::FailedPrecondition("projection memory budget must be positive and set before Prepare");
-    projection_memory_budget_ = bytes;
-    return {};
-}
-std::size_t SealPlainParameterStore::projection_resident_bytes() const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto &cache = preparing_plaintexts_ ? staged_projection_plaintexts_ : projection_plaintexts_;
-    return cache ? cache->Resident() : 0;
-}
-std::size_t SealPlainParameterStore::projection_spilled_bytes() const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto &cache = preparing_plaintexts_ ? staged_projection_plaintexts_ : projection_plaintexts_;
-    return cache ? cache->Spilled() : 0;
-}
-std::size_t SealPlainParameterStore::projection_plaintext_loads() const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    return projection_plaintexts_ ? projection_plaintexts_->Loads() : 0;
-}
-Result<ProjectionPlaintext> SealPlainParameterStore::PrepareProjectionPlaintext(
-    seal::CKKSEncoder &encoder, const std::vector<std::complex<double>> &values,
-    const seal::parms_id_type &id, double scale, std::string_view tag,
-    std::shared_ptr<seal::SEALContext> context)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!preparing_plaintexts_ || !staged_projection_plaintexts_)
-        return Status::FailedPrecondition("projection plaintext compilation requires Prepare");
-    const bool virtualized = virtual_weight_template_count_ != 0 && IsVirtualizableWeight(tag);
-    const auto key = virtualized ? VirtualPlaintextKey(values, id, scale, virtual_weight_template_count_)
-        : PlaintextKey(values, id, scale, tag);
-    if (virtualized) ++staged_virtual_weight_requests_;
-    if (staged_projection_plaintexts_->Contains(key)) {
-        ++staged_plaintext_cache_hits_;
-        if (virtualized) ++staged_virtual_weight_cache_hits_;
-        return staged_projection_plaintexts_->Handle(key);
-    }
-    seal::Plaintext plain;
-    encoder.encode(values, id, scale, plain);
-    staged_encoded_plaintext_bytes_ += plain.save_size(seal::compr_mode_type::none);
-    staged_projection_plaintexts_->Add(key, std::make_shared<const seal::Plaintext>(std::move(plain)), std::move(context));
-    return staged_projection_plaintexts_->Handle(key);
-}
-Result<ProjectionPlaintext> CompileProjectionPlaintext(
-    seal::CKKSEncoder &encoder, const std::vector<std::complex<double>> &values,
-    const seal::parms_id_type &id, double scale, std::string_view tag,
-    const HeContext &context)
-{
-    auto binding = ModelPlaintextCacheScope::Current();
-    if (binding.first) return binding.first->PrepareProjectionPlaintext(encoder, values, id, scale, tag, context.context);
-    seal::Plaintext plain;
-    encoder.encode(values, id, scale, plain);
-    return ProjectionPlaintext{std::make_shared<const seal::Plaintext>(std::move(plain))};
-}
-
 void SealPlainParameterStore::BeginPlaintextPreparation()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     staged_plaintexts_.clear();
-    staged_projection_plaintexts_ = std::make_shared<ProjectionPlaintextCache>(projection_memory_budget_);
     staged_projections_.clear();
     staged_block2_programs_.clear();
     staged_encoded_plaintext_bytes_ = 0;
@@ -1441,8 +1282,6 @@ void SealPlainParameterStore::FreezePlaintextCache()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!preparing_plaintexts_) return;
-    projection_plaintexts_.swap(staged_projection_plaintexts_);
-    staged_projection_plaintexts_.reset();
     encoded_plaintexts_.swap(staged_plaintexts_);
     staged_plaintexts_.clear();
     prepared_projections_.swap(staged_projections_);
@@ -1462,7 +1301,6 @@ void SealPlainParameterStore::AbortPlaintextPreparation() noexcept
 {
     std::lock_guard<std::mutex> lock(mutex_);
     staged_plaintexts_.clear();
-    staged_projection_plaintexts_.reset();
     staged_projections_.clear();
     staged_block2_programs_.clear();
     staged_encoded_plaintext_bytes_ = 0;
@@ -1487,9 +1325,7 @@ bool SealPlainParameterStore::preparing_plaintexts() const noexcept
 std::size_t SealPlainParameterStore::encoded_plaintext_count() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto &projection = preparing_plaintexts_ ? staged_projection_plaintexts_ : projection_plaintexts_;
-    return (preparing_plaintexts_ ? staged_plaintexts_.size() : encoded_plaintexts_.size()) +
-        (projection ? projection->Count() : 0);
+    return preparing_plaintexts_ ? staged_plaintexts_.size() : encoded_plaintexts_.size();
 }
 
 std::size_t SealPlainParameterStore::encoded_plaintext_bytes() const

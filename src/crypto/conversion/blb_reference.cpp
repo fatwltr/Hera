@@ -1,4 +1,4 @@
-#include "hera/conversion.h"
+#include "hera/blb_reference.h"
 #include "hera/detail/protocol_worker.h"
 #include "hera/detail/he_packing.h"
 #include "hera/detail/conversion_lanes.h"
@@ -7,12 +7,11 @@
 #include "hera/detail/worker_ports.h"
 
 #include "fixed_ckks_transform.h"
+#include "blb_encoding.h"
+#include "blb_ring_protocol.h"
 #include "random_sampling.h"
-#include "wide_b2a.h"
 
-#include "OT/split-kkot.h"
-#include "FloatingPoint/fixed-point.h"
-#include "OT/ot_pack.h"
+#include "bounded_ot.h"
 #include "utils/io_pack.h"
 
 #ifdef I
@@ -25,6 +24,7 @@
 #include <seal/util/ntt.h>
 #include <seal/util/uintarith.h>
 #include <seal/util/uintarithmod.h>
+#include <seal/util/uintarithsmallmod.h>
 #include <seal/util/uintcore.h>
 
 #include <algorithm>
@@ -56,14 +56,11 @@ double MillisecondsSince(Clock::time_point start)
 }
 
 using conversion_internal::FixedCkksTransform;
-using conversion_internal::EncodeRingMask;
 using conversion_internal::SampleUniformPrime;
-using conversion_internal::SampleUniformRing;
-using conversion_internal::SlotSharePair;
 
 constexpr std::uint64_t kFrameMagic = 0x48455241434f4e56ULL;
 // Dual-lane real boundaries negotiate lane maps and half-encoding factors.
-constexpr std::uint32_t kProtocolVersion = 14;
+constexpr std::uint32_t kProtocolVersion = 19;
 constexpr std::uint32_t kCkksToMpcDirection = 1;
 constexpr std::uint32_t kMpcToCkksDirection = 2;
 // Reserved layout bits negotiate public contracts without changing frame size.
@@ -71,6 +68,10 @@ constexpr std::uint32_t kPublicZeroImaginary = std::uint32_t{1} << 31;
 constexpr std::uint32_t kInvalidPublicContract = std::uint32_t{1} << 30;
 constexpr std::uint32_t kCanonicalLanePacking = std::uint32_t{1} << 23;
 constexpr int kPublicBoundShift = 24;
+constexpr std::uint32_t kC2mQuarterRange = std::uint32_t{1} << 22;
+constexpr std::uint32_t kM2cQuarterRange = std::uint32_t{1} << 21;
+constexpr std::uint32_t kPreparedSlots = std::uint32_t{1} << 20;
+constexpr std::uint32_t kBenchmarkUncheckedRange = std::uint32_t{1} << 19;
 
 struct ProtocolFrame {
     std::uint64_t magic{kFrameMagic};
@@ -94,6 +95,7 @@ struct ProtocolFrame {
     std::int32_t he_scale_bits{};
     std::int32_t statistical_bits{};
     std::int32_t fft_scale_bits{};
+    std::int32_t coefficient_bound_bits{-1};
     std::uint32_t profile_bytes{};
 };
 
@@ -121,60 +123,6 @@ bool ProfileAllowsScale(const HeParameterConfig &profile, int bits)
            bits == profile.input_scale_bits || bits == profile.output_scale_bits;
 }
 
-class CompositeReductionWorkspace {
-public:
-    CompositeReductionWorkspace(const std::uint64_t *modulus,
-                                std::size_t modulus_limbs,
-                                seal::MemoryPoolHandle pool)
-        : modulus_limbs_(modulus_limbs),
-          numerator_(std::max(std::size_t{2}, modulus_limbs)),
-          denominator_(numerator_.size()), quotient_(numerator_.size()),
-          pool_(std::move(pool))
-    {
-        if (modulus_limbs == 0 || seal::util::is_zero_uint(modulus, modulus_limbs))
-            throw std::invalid_argument("RNS bridge modulus is zero");
-        std::copy_n(modulus, modulus_limbs, denominator_.begin());
-        modulus_bits_ = seal::util::get_significant_bit_count_uint(
-            denominator_.data(), denominator_.size());
-    }
-
-    void Reduce(WideRingShare value, int bits, std::uint64_t *output)
-    {
-        if (bits < 1 || bits > 128)
-            throw std::invalid_argument("invalid RNS bridge input width");
-        std::fill(numerator_.begin(), numerator_.end(), 0);
-        numerator_[0] = bits < 64 ? value.low & LowMask(bits) : value.low;
-        numerator_[1] = bits <= 64 ? 0 :
-            bits < 128 ? value.high & LowMask(bits - 64) : value.high;
-        // When Q > 2^bits, all inputs fit. Otherwise a comparison also avoids
-        // division for small values. The same buffers serve every coefficient.
-        if (modulus_bits_ <= bits && !seal::util::is_less_than_uint(
-                numerator_.data(), denominator_.data(), numerator_.size())) {
-            std::fill(quotient_.begin(), quotient_.end(), 0);
-            seal::util::divide_uint_inplace(
-                numerator_.data(), denominator_.data(), numerator_.size(),
-                quotient_.data(), pool_);
-        }
-        std::copy_n(numerator_.data(), modulus_limbs_, output);
-    }
-
-    void PowerOfTwo(int bits, std::uint64_t *output)
-    {
-        if (bits < 0 || bits > 127)
-            throw std::invalid_argument("RNS bridge exponent must be in [0,127]");
-        WideRingShare power{};
-        if (bits < 64) power.low = std::uint64_t{1} << bits;
-        else power.high = std::uint64_t{1} << (bits - 64);
-        Reduce(power, bits + 1, output);
-    }
-
-private:
-    std::size_t modulus_limbs_{};
-    int modulus_bits_{};
-    std::vector<std::uint64_t> numerator_, denominator_, quotient_;
-    seal::MemoryPoolHandle pool_;
-};
-
 using detail::ProtocolWorkerThread;
 
 bool SameFrame(const ProtocolFrame &left, const ProtocolFrame &right)
@@ -200,6 +148,7 @@ bool SameFrame(const ProtocolFrame &left, const ProtocolFrame &right)
            left.he_scale_bits == right.he_scale_bits &&
            left.statistical_bits == right.statistical_bits &&
            left.fft_scale_bits == right.fft_scale_bits &&
+           left.coefficient_bound_bits == right.coefficient_bound_bits &&
            left.profile_bytes == right.profile_bytes;
 }
 
@@ -270,13 +219,13 @@ seal::parms_id_type ResolveTargetParmsId(const HeContext &profile,
 
 } // namespace
 
-class CkksMpcConverter::Impl {
+class BlbReferenceConverter::Impl {
 public:
     struct Worker {
         int effective_party{};
         std::unique_ptr<sci::IOPack> io;
-        std::unique_ptr<sci::OTPack> ot;
-        std::unique_ptr<FixOp> fix;
+        std::array<sci::NetIO *,1> ot_channels{};
+        std::unique_ptr<conversion_internal::ConversionOt> ot;
         // Destroy/join the executor before releasing the SCI objects it uses.
         std::unique_ptr<ProtocolWorkerThread> executor;
     };
@@ -348,8 +297,11 @@ public:
                 // Reject different pool sizes/batch boundaries before opening
                 // the extra sockets or consuming stateful OT streams.
                 const std::uint64_t contract[] = {kFrameMagic, kProtocolVersion,
-                    threads, config_.batch_elements};
-                std::uint64_t peer[4]{};
+                    threads, config_.batch_elements,
+                    static_cast<std::uint64_t>(config_.public_c2m_quarter_range) |
+                        (static_cast<std::uint64_t>(config_.benchmark_unchecked_range) << 1),
+                    config_.public_m2c_quarter_range};
+                std::uint64_t peer[6]{};
                 if (role_ == PartyRole::kServer) {
                     worker->io->io->send_data(contract, sizeof(contract));
                     worker->io->io->recv_data(peer, sizeof(peer));
@@ -360,13 +312,14 @@ public:
                 if (!std::equal(std::begin(contract), std::end(contract), std::begin(peer)))
                     throw std::invalid_argument("conversion worker/batch contracts differ");
             }
-            worker->ot = std::make_unique<sci::OTPack>(
-                worker->io.get(), worker->effective_party);
-            worker->fix = std::make_unique<FixOp>(
-                worker->effective_party, worker->io.get(), worker->ot.get());
+            worker->ot_channels[0] = worker->io->io;
+            worker->ot = std::make_unique<conversion_internal::ConversionOt>(
+                worker->effective_party, 1, worker->ot_channels.data(), false, true, "");
             workers_.push_back(std::move(worker));
         }
     }
+
+    const ConversionConfig &config() const noexcept { return config_; }
 
     ConversionStats stats() const noexcept
     {
@@ -376,8 +329,17 @@ public:
         for (const auto &worker : workers_) {
             result.communication_bytes += worker->io->get_comm();
             result.rounds += worker->io->get_rounds();
+            result.forward_ot_capacity += worker->ot->ferret->ot_limit;
+            result.forward_ot_used += worker->ot->ferret->ot_used;
         }
         return result;
+    }
+
+    std::uint64_t RingBytes() const noexcept
+    {
+        std::uint64_t bytes = 0;
+        for (const auto &worker : workers_) bytes += worker->io->get_comm();
+        return bytes;
     }
 
     std::size_t CiphertextBatchSize(std::size_t degree, std::size_t count) const
@@ -428,72 +390,32 @@ public:
         if (first_error) std::rethrow_exception(first_error);
     }
 
-    // Conversion uses SCI's correlated-AND comparison tree at public radix 4.
-    // It preserves the full-width carry predicate for prime and binary rings.
-    void ComputeWrap(Worker &worker, std::vector<std::uint64_t> &values,
-                     std::vector<std::uint8_t> &wrap, int bits,
-                     std::uint64_t prime = 0)
-    {
-        const auto size = static_cast<int>(values.size());
-        std::vector<std::uint64_t> comparison(values.size());
-        const auto ceiling = prime ? prime - 1 : LowMask(bits);
-        for (std::size_t i = 0; i < values.size(); ++i) {
-            const auto value = prime ? values[i] % prime : values[i] & ceiling;
-            comparison[i] = worker.effective_party == sci::ALICE ? value : ceiling - value;
-        }
-        worker.fix->aux->mill->compare_correlated(wrap.data(), comparison.data(), size,
-            bits, true, false, 4);
-    }
-
-    // Lift the centered prime-field value directly into the FFT working ring.
-    // This is BLB's field-to-ring boundary, without an intermediate narrow
-    // arithmetic sharing and a second sign/wrap protocol.
+    // The wrapper selects a PUBLIC range mode and schedules workers. The
+    // actual field/ring protocols live in blb_ring_protocol.cpp, independently
+    // of model, HE framing, packing and performance counters.
     std::vector<WideRingShare> CenteredFieldToRing(
         const std::vector<std::uint64_t> &field_share, std::uint64_t modulus,
-        int output_bits)
+        int output_bits, std::optional<int> public_bound_bits, bool public_quarter_range)
     {
         const int field_bits = seal::util::get_significant_bit_count(modulus);
         if (output_bits < field_bits || output_bits > 127)
             throw std::invalid_argument("invalid centered field-to-ring width");
-        const std::uint64_t center = modulus / 2;
         ++stats_.field_to_ring_batches;
         stats_.max_field_to_ring_elements = std::max(stats_.max_field_to_ring_elements, field_share.size());
-        if (output_bits > 64) stats_.wide_b2a_elements += field_share.size();
-        stats_.correlated_comparison_elements += field_share.size();
+        const bool bounded = config_.benchmark_unchecked_range || public_quarter_range || (public_bound_bits &&
+            *public_bound_bits >= 0 && *public_bound_bits <= 62 &&
+            (std::uint64_t{1} << *public_bound_bits) <= modulus / 4);
+        if (!bounded) throw std::invalid_argument("BLB C2M requires a public quarter-range contract");
+        stats_.bounded_field_to_ring_elements += field_share.size();
+        const auto before_bytes = RingBytes();
         std::vector<WideRingShare> output(field_share.size());
-        Parallel(field_share.size(), [&](Worker &worker, std::size_t begin,
-                                         std::size_t end) {
-            const int size = static_cast<int>(end - begin);
-            std::vector<std::uint64_t> adjusted(size);
-            for (int i = 0; i < size; ++i) {
-                adjusted[i] = field_share[begin + i] % modulus;
-                if (worker.effective_party == sci::ALICE)
-                    adjusted[i] = static_cast<std::uint64_t>(
-                        (static_cast<unsigned __int128>(adjusted[i]) + center) % modulus);
-            }
-            std::vector<std::uint8_t> wrap(size);
-            ComputeWrap(worker, adjusted, wrap, field_bits, modulus);
-            std::vector<WideRingShare> arithmetic(size);
-            if (output_bits <= 64) {
-                std::vector<std::uint64_t> narrow(size);
-                worker.fix->aux->B2A(wrap.data(), narrow.data(), size, output_bits);
-                for (int i = 0; i < size; ++i) arithmetic[i] = WideFromLow(narrow[i], output_bits);
-            } else {
-                arithmetic = conversion_internal::BooleanToWideArithmetic(
-                    worker.effective_party, *worker.ot, wrap, output_bits);
-            }
-            for (int i = 0; i < size; ++i) {
-                // Unsigned multiplication modulo 2^128 followed by reduction
-                // to 2^w; no signed 160-bit intermediate is required.
-                const auto carry = (static_cast<unsigned __int128>(arithmetic[i].high) << 64) | arithmetic[i].low;
-                const auto correction = carry * modulus;
-                auto value = WideSubtract(WideFromLow(adjusted[i], output_bits),
-                    {static_cast<std::uint64_t>(correction), static_cast<std::uint64_t>(correction >> 64)}, output_bits);
-                if (worker.effective_party == sci::ALICE)
-                    value = WideSubtract(value, WideFromLow(center, output_bits), output_bits);
-                output[begin + i] = value;
-            }
+        Parallel(field_share.size(), [&](Worker &worker, std::size_t begin, std::size_t end) {
+            conversion_internal::blb::RingProtocol protocol(worker.effective_party, *worker.ot);
+            std::vector<std::uint64_t> local(field_share.begin() + begin, field_share.begin() + end);
+            auto converted = protocol.FieldToRing(local, modulus, output_bits);
+            std::copy(converted.begin(), converted.end(), output.begin() + begin);
         });
+        stats_.field_to_ring_communication_bytes += RingBytes() - before_bytes;
         return output;
     }
 
@@ -505,51 +427,21 @@ public:
             output_bits > 127 || output_bits - input_bits > 63)
             throw std::invalid_argument("unsupported secure signed extension");
         ++stats_.signed_extension_batches;
-        stats_.max_signed_extension_elements =
-            std::max(stats_.max_signed_extension_elements, shares.size());
-        const int extension_bits = output_bits - input_bits;
-        const bool bounded = public_bound_bits &&
-            *public_bound_bits >= 0 && *public_bound_bits <= input_bits - 2;
-        if (bounded) stats_.bounded_signed_extension_elements += shares.size();
-        else {
-            stats_.generic_signed_extension_elements += shares.size();
-            stats_.correlated_comparison_elements += shares.size();
-        }
-        const std::uint64_t input_mask = LowMask(input_bits);
-        std::vector<WideRingShare> result(shares.size());
-        Parallel(shares.size(), [&](Worker &worker, std::size_t begin,
-                                    std::size_t end) {
-            const int size = static_cast<int>(end - begin);
-            std::vector<std::uint64_t> local(size);
-            for (int i = 0; i < size; ++i)
-                local[i] = shares[begin + i] & input_mask;
-            // SCI/BLB signed extension: offset the secret by 2^(ell-1),
-            // unsigned-extend with one carry, then remove the public offset.
-            // This replaces separate MSB and sign+wrap B2A operations.
-            // A quarter-ring bias maps a publicly bounded signed value to
-            // [0,2^(ell-1)), giving a genuine known MSB. The generic path
-            // uses the half-ring signed-to-unsigned mapping instead.
-            const auto center = std::uint64_t{1} << (input_bits - (bounded ? 2 : 1));
-            if (worker.effective_party == sci::ALICE)
-                for (auto &value : local) value = (value + center) & input_mask;
-            std::vector<std::uint8_t> wrap(size);
-            if (bounded) {
-                std::vector<std::uint8_t> zero_msb(size, 0);
-                worker.fix->aux->MSB_to_Wrap(local.data(), zero_msb.data(),
-                                           wrap.data(), size, input_bits);
-            } else ComputeWrap(worker, local, wrap, input_bits);
-            std::vector<std::uint64_t> arithmetic(size);
-            worker.fix->aux->B2A(wrap.data(), arithmetic.data(), size, extension_bits);
-            for (int i = 0; i < size; ++i) {
-                const auto correction = WideShiftLeft(
-                    WideFromLow(arithmetic[i], extension_bits), input_bits, output_bits);
-                auto value = WideSubtract(WideFromLow(local[i], output_bits), correction, output_bits);
-                if (worker.effective_party == sci::ALICE)
-                    value = WideSubtract(value, WideFromLow(center, output_bits), output_bits);
-                result[begin + i] = value;
-            }
+        stats_.max_signed_extension_elements = std::max(stats_.max_signed_extension_elements, shares.size());
+        const bool bounded = config_.benchmark_unchecked_range || config_.public_m2c_quarter_range || (public_bound_bits &&
+            *public_bound_bits >= 0 && *public_bound_bits <= input_bits - 2);
+        if (!bounded) throw std::invalid_argument("BLB M2C requires a public quarter-range contract");
+        stats_.bounded_signed_extension_elements += shares.size();
+        const auto before_bytes = RingBytes();
+        std::vector<WideRingShare> output(shares.size());
+        Parallel(shares.size(), [&](Worker &worker, std::size_t begin, std::size_t end) {
+            conversion_internal::blb::RingProtocol protocol(worker.effective_party, *worker.ot);
+            std::vector<std::uint64_t> local(shares.begin() + begin, shares.begin() + end);
+            auto extended = protocol.ExtendSigned(local, input_bits, output_bits);
+            std::copy(extended.begin(), extended.end(), output.begin() + begin);
         });
-        return result;
+        stats_.signed_extension_communication_bytes += RingBytes() - before_bytes;
+        return output;
     }
 
     std::shared_ptr<const std::vector<std::uint64_t>> GetRnsWrapCorrection(
@@ -558,11 +450,8 @@ public:
         const auto key = std::make_pair(context_data.parms_id(), bits);
         const auto found = rns_wrap_corrections_.find(key);
         if (found != rns_wrap_corrections_.end()) return found->second;
-        const auto count = context_data.parms().coeff_modulus().size();
-        auto correction = std::make_shared<std::vector<std::uint64_t>>(count);
-        CompositeReductionWorkspace workspace(context_data.total_coeff_modulus(),
-                                              count, seal::MemoryManager::GetPool());
-        workspace.PowerOfTwo(bits, correction->data());
+        auto correction = std::make_shared<const std::vector<std::uint64_t>>(
+            conversion_internal::blb::RnsWrapCorrection(bits, context_data));
         rns_wrap_corrections_.emplace(key, correction);
         return correction;
     }
@@ -572,52 +461,14 @@ public:
         const seal::SEALContext::ContextData &context_data,
         const std::vector<std::uint64_t> &wrap_correction)
     {
-        const auto &parms = context_data.parms();
-        const auto &moduli = parms.coeff_modulus();
-        const std::size_t degree = parms.poly_modulus_degree();
-        const std::size_t modulus_limbs = moduli.size();
-        if (coefficients.size() != degree || modulus_limbs == 0)
-            throw std::invalid_argument(
-                "BLB RNS bridge coefficient/profile size mismatch");
-
-        // BLB converts the encoded coefficient share to one field modulo the
-        // target coefficient modulus Q, and only then expands that field
-        // element into the target RNS base. Unlike the artifact's uint64_t Q,
-        // this implementation retains every limb of Q = product(q_j), which
-        // is required when a target level contains more than one data prime.
-        const auto *composite_modulus = context_data.total_coeff_modulus();
-        auto pool = seal::MemoryManager::GetPool();
-        CompositeReductionWorkspace workspace(composite_modulus, modulus_limbs, pool);
-
-        seal::Plaintext plaintext(degree * modulus_limbs);
-        std::vector<std::uint64_t> adjusted_share(modulus_limbs);
-        for (std::size_t coefficient = 0; coefficient < degree;
-             ++coefficient) {
-            auto *bridge_share = plaintext.data() + coefficient * modulus_limbs;
-            workspace.Reduce(coefficients[coefficient], bits, bridge_share);
-            if (role_ == PartyRole::kServer) {
-                seal::util::sub_uint_uint_mod(
-                    bridge_share, wrap_correction.data(),
-                    composite_modulus, modulus_limbs,
-                    adjusted_share.data());
-                std::copy_n(adjusted_share.data(), modulus_limbs, bridge_share);
-            }
-        }
-
-        // Convert all full-Q integers at once into prime-major RNS arrays.
-        // The ring-to-field boundary and server correction remain unchanged.
-        context_data.rns_tool()->base_q()->decompose_array(plaintext.data(), degree, pool);
-
-        for (std::size_t prime = 0; prime < modulus_limbs; ++prime)
-            seal::util::ntt_negacyclic_harvey(
-                plaintext.data() + prime * degree,
-                context_data.small_ntt_tables()[prime]);
-        return plaintext;
+        return conversion_internal::blb::ProjectExtendedRingToRns(
+            coefficients, bits, context_data, wrap_correction, role_ == PartyRole::kServer);
     }
 
     Result<ComplexMpcSharePair> CkksToMpc(
         const std::optional<SealCipherBatch> &server_input,
-        std::optional<int> output_scale_bits)
+        std::optional<int> output_scale_bits,
+        std::optional<int> public_coefficient_bound_bits)
     {
         const auto started = Clock::now();
         try {
@@ -706,6 +557,8 @@ public:
                     ShapeFingerprint(server_input->logical_shape);
                 frame.logical_layout = static_cast<std::uint32_t>(
                     server_input->logical_layout);
+                if (config_.public_c2m_quarter_range) frame.logical_layout |= kC2mQuarterRange;
+                if (config_.benchmark_unchecked_range) frame.logical_layout |= kBenchmarkUncheckedRange;
                 frame.parameter_fingerprint =
                     ParameterFingerprint(*profile->context);
                 frame.terminal_modulus =
@@ -716,6 +569,16 @@ public:
                 frame.he_scale_bits = he_scale;
                 frame.statistical_bits = config_.statistical_security_bits;
                 frame.fft_scale_bits = fft_bits_for(*profile);
+                // -1 denotes ABSENT only. Encode an explicitly invalid -1
+                // differently so a peer with no contract cannot accept it.
+                frame.coefficient_bound_bits = public_coefficient_bound_bits
+                    ? (*public_coefficient_bound_bits >= 0 && *public_coefficient_bound_bits <= 62
+                        ? *public_coefficient_bound_bits : -2) : -1;
+                if (!config_.benchmark_unchecked_range && !config_.public_c2m_quarter_range &&
+                    (!public_coefficient_bound_bits || *public_coefficient_bound_bits < 0 ||
+                     *public_coefficient_bound_bits > 62 ||
+                     (std::uint64_t{1} << *public_coefficient_bound_bits) > frame.terminal_modulus / 4))
+                    frame.logical_layout |= kInvalidPublicContract;
                 frame.profile_bytes = static_cast<std::uint32_t>(profile_name.size());
                 handshake_started = Clock::now();
                 stats_.ckks_to_mpc.preparation +=
@@ -766,8 +629,18 @@ public:
                     !std::equal(std::begin(frame.parms_id),
                                 std::end(frame.parms_id),
                                 profile->context->last_parms_id().begin()) ||
+                    ((frame.logical_layout & kC2mQuarterRange) != 0) != config_.public_c2m_quarter_range ||
+                    ((frame.logical_layout & kBenchmarkUncheckedRange) != 0) != config_.benchmark_unchecked_range ||
+                    (frame.logical_layout & kInvalidPublicContract) != 0 ||
+                    (!config_.benchmark_unchecked_range && !config_.public_c2m_quarter_range &&
+                     (!public_coefficient_bound_bits || *public_coefficient_bound_bits < 0 ||
+                      *public_coefficient_bound_bits > 62 ||
+                      (std::uint64_t{1} << *public_coefficient_bound_bits) > frame.terminal_modulus / 4)) ||
                     frame.ring_bits != config_.ring_bits ||
                     frame.share_scale_bits != share_scale_bits ||
+                    frame.coefficient_bound_bits != public_coefficient_bound_bits.value_or(-1) ||
+                    (public_coefficient_bound_bits &&
+                        (*public_coefficient_bound_bits < 0 || *public_coefficient_bound_bits > 62)) ||
                     frame.statistical_bits !=
                         config_.statistical_security_bits ||
                     frame.fft_scale_bits != fft_bits_for(*profile)) {
@@ -804,25 +677,16 @@ public:
             if (scale_shift < 0)
                 return Status::FailedPrecondition(
                     "CkksToMpc cannot increase the target share scale");
-            const int mask_value_bits = config_.ring_bits + scale_shift +
-                seal::util::get_power_of_two(degree) + 2;
-            const int max_transform_bits = 127 - fft_bits - 2;
-            if (mask_value_bits > max_transform_bits)
-                return Status::FailedPrecondition(
-                    "CkksToMpc Z-mask encoding exceeds 127-bit workspace");
-            const int mask_working_bits =
-                std::max(wide_bits + guard_bits, mask_value_bits);
-            const int mask_guard_bits =
-                std::min(20, mask_working_bits - mask_value_bits);
-            std::shared_ptr<const FixedCkksTransform> mask_transform;
-            if (role_ == PartyRole::kServer) {
-                auto mask_transform_result = GetTransform(
-                    degree, fft_bits, mask_working_bits);
-                if (!mask_transform_result.ok())
-                    return mask_transform_result.status();
-                mask_transform = mask_transform_result.take_value();
-            }
-
+            auto coefficient_bound = public_coefficient_bound_bits;
+            if (config_.public_c2m_quarter_range)
+                coefficient_bound = coefficient_bound
+                    ? std::min(*coefficient_bound, field_bits - 2) : field_bits - 2;
+            // Simulation output is not a proved producer bound, even when
+            // the caller happened to supply calibration metadata.
+            if (config_.benchmark_unchecked_range) coefficient_bound.reset();
+            auto slot_bound = coefficient_bound ? transform->DecodedSlotBoundBits(
+                *coefficient_bound, guard_bits, scale_shift) : std::nullopt;
+            if (slot_bound && *slot_bound >= config_.ring_bits) slot_bound.reset();
             std::vector<std::uint64_t> output_real(count * slots);
             std::vector<std::uint64_t> output_imag(count * slots);
             struct LocalDecoded {
@@ -875,34 +739,11 @@ public:
                                                        modulus);
                         stats_.a_mask_bytes += degree * sizeof(std::uint64_t);
 
-                        auto real_stream = randomness_->OpenStream(
-                            "hera/c2m/Z-real/" + SessionLabel(frame) + "/" +
-                            std::to_string(ct_index));
-                        auto imag_stream = randomness_->OpenStream(
-                            "hera/c2m/Z-imag/" + SessionLabel(frame) + "/" +
-                            std::to_string(ct_index));
-                        if (!real_stream.ok()) return real_stream.status();
-                        if (!imag_stream.ok()) return imag_stream.status();
-                        auto z_real = SampleUniformRing(*real_stream.value(), slots,
-                                                       config_.ring_bits);
-                        auto z_imag = SampleUniformRing(*imag_stream.value(), slots,
-                                                       config_.ring_bits);
-                        stats_.z_mask_bytes += 2 * slots * sizeof(std::uint64_t);
+                        // A single uniform coefficient mask is sufficient:
+                        // adding an independently encoded Z mask leaves its
+                        // distribution unchanged, and Z has no later use.
                         stats_.ckks_to_mpc.sampling += MillisecondsSince(sampling_started);
-                        const auto mask_encode_started = Clock::now();
-                        auto encoded_z = EncodeRingMask(
-                            z_real, z_imag, config_.ring_bits, scale_shift,
-                            mask_guard_bits, *mask_transform, modulus);
-                        if (!encoded_z.ok()) return encoded_z.status();
-                        stats_.ckks_to_mpc.mask_encode +=
-                            MillisecondsSince(mask_encode_started);
                         const auto he_started = Clock::now();
-                        // Sample A and Z independently, then use their sum for
-                        // both the ciphertext mask and the server's negative share.
-                        for (std::size_t i = 0; i < degree; ++i)
-                            mask[i] = static_cast<std::uint64_t>(
-                                (static_cast<unsigned __int128>(mask[i]) +
-                                 encoded_z.value()[i]) % modulus);
                         seal::Plaintext mask_plain(degree);
                         std::copy(mask.begin(), mask.end(), mask_plain.data());
                         seal::util::ntt_negacyclic_harvey(
@@ -920,7 +761,7 @@ public:
                             field_share[i] = mask[i] == 0 ? 0 : modulus - mask[i];
                     } else {
                         // This is the only decrypt call in the protocol. The
-                        // received ciphertext is hidden by r_A + Encode(r_Z).
+                        // received ciphertext is hidden by the uniform coefficient mask.
                         const auto receive_started = Clock::now();
                         auto masked = ReceiveSealObject<seal::Ciphertext>(
                             *transport_, *profile->context);
@@ -943,7 +784,9 @@ public:
                               fields.begin() + (ct_index - base) * degree);
                 }
                 const auto field_started = Clock::now();
-                auto batch_wide = CenteredFieldToRing(fields, modulus, wide_bits);
+                auto batch_wide = CenteredFieldToRing(fields, modulus, wide_bits,
+                                                       public_coefficient_bound_bits,
+                                                       config_.public_c2m_quarter_range);
                 stats_.ckks_to_mpc.field_to_ring += MillisecondsSince(field_started);
                 for (std::size_t ct_index = base; ct_index < base + batch; ++ct_index) {
                     const auto offset = (ct_index - base) * degree;
@@ -999,9 +842,9 @@ public:
             const NumericFormat numeric{config_.ring_bits, share_scale_bits};
             ComplexMpcSharePair result{
                 {std::move(output_real), physical_shape, numeric,
-                 ComplexComponent::kReal},
+                 ComplexComponent::kReal, slot_bound},
                 {std::move(output_imag), physical_shape, numeric,
-                 ComplexComponent::kImaginary}};
+                 ComplexComponent::kImaginary, slot_bound}};
             stats_.milliseconds += std::chrono::duration<double, std::milli>(
                 Clock::now() - started).count();
             return result;
@@ -1014,7 +857,8 @@ public:
     Result<std::optional<SealCipherBatch>> MpcToCkks(
         const ComplexMpcSharePair &local_shares,
         const MpcToCkksTarget &target,
-        const std::vector<bool> &half_values = {}, bool canonical_padding = false)
+        const std::vector<bool> &half_values = {}, bool canonical_padding = false,
+        const PreparedBlbSlots *wide_input = nullptr)
     {
         const auto started = Clock::now();
         try {
@@ -1064,6 +908,20 @@ public:
                 return Status::FailedPrecondition(
                     "MpcToCkks scale/FFT workspace exceeds 127 bits");
 
+            auto encoding_plan_result = conversion_internal::blb::PlanM2cEncoding(
+                degree, config_.ring_bits, config_.scale_bits, target.scale_bits,
+                config_.statistical_security_bits, config_.fft_scale_bits, any_half);
+            if (!encoding_plan_result.ok()) return encoding_plan_result.status();
+            const auto encoding_plan = encoding_plan_result.take_value();
+            const int guard_bits = encoding_plan.guard_bits;
+            const int coefficient_precision_bits = encoding_plan.coefficient_precision_bits;
+            const int coefficient_ring_bits = encoding_plan.coefficient_ring_bits;
+            auto transform_result = GetTransform(
+                degree, config_.fft_scale_bits, base_bits + guard_bits);
+            if (!transform_result.ok()) return transform_result.status();
+            const auto transform = transform_result.take_value();
+            const int coefficient_work_bits = encoding_plan.coefficient_work_bits;
+
             ProtocolFrame frame;
             frame.direction = kMpcToCkksDirection;
             frame.call_sequence = call_sequence_++;
@@ -1074,6 +932,20 @@ public:
             frame.shape_fingerprint = ShapeFingerprint(target.logical_shape);
             frame.logical_layout =
                 static_cast<std::uint32_t>(target.logical_layout);
+            if (config_.public_m2c_quarter_range) frame.logical_layout |= kM2cQuarterRange;
+            if (config_.benchmark_unchecked_range) frame.logical_layout |= kBenchmarkUncheckedRange;
+            if (wide_input) frame.logical_layout |= kPreparedSlots;
+            const auto expected_size = count * slots;
+            const bool prepared_valid = !wide_input ||
+                (wide_input->ring_bits == base_bits && wide_input->scale_bits == config_.scale_bits &&
+                 wide_input->real.size() == expected_size && wide_input->imag.size() == expected_size &&
+                 std::all_of(wide_input->real.begin(), wide_input->real.end(), [base_bits](auto x) {
+                     const auto reduced = WideAdd(x, {}, base_bits);
+                     return reduced.low == x.low && reduced.high == x.high;
+                 }) && std::all_of(wide_input->imag.begin(), wide_input->imag.end(), [base_bits](auto x) {
+                     const auto reduced = WideAdd(x, {}, base_bits);
+                     return reduced.low == x.low && reduced.high == x.high;
+                 }));
             const bool imaginary_contract_valid = !target.public_zero_imaginary ||
                 (std::all_of(target.slot_map.assignments.begin(),
                              target.slot_map.assignments.end(),
@@ -1088,7 +960,7 @@ public:
             bool bound_contract_valid = !target.public_value_bound_bits ||
                 (*target.public_value_bound_bits >= 0 &&
                  *target.public_value_bound_bits < config_.ring_bits &&
-                 (!local_shares.real.public_value_bound_bits ||
+                 (config_.benchmark_unchecked_range || !local_shares.real.public_value_bound_bits ||
                   local_shares.real.public_value_bound_bits == target.public_value_bound_bits));
             if (!target.public_ciphertext_bound_bits.empty()) {
                 bound_contract_valid &= target.public_ciphertext_bound_bits.size() == count;
@@ -1099,13 +971,30 @@ public:
                     fingerprint ^= bound ? static_cast<std::uint64_t>(*bound) + 1 : 0;
                     fingerprint *= 1099511628211ULL;
                     if (bound && (*bound < 0 || *bound >= config_.ring_bits ||
-                        (local_shares.real.public_value_bound_bits &&
+                        (!config_.benchmark_unchecked_range && local_shares.real.public_value_bound_bits &&
                          *bound < *local_shares.real.public_value_bound_bits)))
                         bound_contract_valid = false;
                 }
                 fingerprint ^= target.public_ciphertext_bound_bits.size();
                 frame.shape_fingerprint ^= fingerprint;
             }
+            bound_contract_valid &= prepared_valid;
+            // Source and post-Encode contracts must both be established before OT.
+            for (std::size_t ct = 0; ct < count; ++ct) {
+                auto bound = target.public_value_bound_bits;
+                if (!target.public_ciphertext_bound_bits.empty() &&
+                    ct < target.public_ciphertext_bound_bits.size() && target.public_ciphertext_bound_bits[ct])
+                    bound = target.public_ciphertext_bound_bits[ct];
+                if (!config_.benchmark_unchecked_range && !config_.public_m2c_quarter_range) {
+                    const auto coefficient_bound = bound ? transform->EncodedCoefficientBoundBits(
+                        *bound, guard_bits, coefficient_precision_bits) : std::nullopt;
+                    bound_contract_valid &= bound && *bound >= 0 && *bound <= config_.ring_bits - 2 &&
+                        coefficient_bound && *coefficient_bound <= coefficient_ring_bits - 2;
+                }
+            }
+            if (wide_input && target.public_zero_imaginary && prepared_valid)
+                bound_contract_valid &= std::all_of(wide_input->imag.begin(), wide_input->imag.end(),
+                    [](auto x) { return x.low == 0 && x.high == 0; });
             bool periods_valid = target.public_slot_periods.empty() || target.public_slot_periods.size() == count;
             for (const auto &periods : target.public_slot_periods)
                 for (const auto period : periods) {
@@ -1114,7 +1003,7 @@ public:
                     periods_valid &= period == 0 || (period <= slots && (period & (period - 1)) == 0);
                 }
             frame.shape_fingerprint ^= target.public_slot_periods.size();
-            if (periods_valid && !target.public_slot_periods.empty())
+            if (periods_valid && prepared_valid && !target.public_slot_periods.empty())
                 for (std::size_t ct = 0; ct < count; ++ct)
                     for (std::size_t plane = 0; plane < 2; ++plane) {
                         const auto period = target.public_slot_periods[ct][plane];
@@ -1126,7 +1015,11 @@ public:
                             if ((plane ? entry.imaginary_logical_index : entry.real_logical_index) == kUnusedLogicalIndex) continue;
                             auto &representative = first[slot % period];
                             if (representative == kUnusedLogicalIndex) representative = slot;
-                            else periods_valid &= values[ct * slots + slot] == values[ct * slots + representative];
+                            else if (wide_input) {
+                                const auto &wide_values = plane ? wide_input->imag : wide_input->real;
+                                const auto x = wide_values[ct * slots + slot], y = wide_values[ct * slots + representative];
+                                periods_valid &= x.low == y.low && x.high == y.high;
+                            } else periods_valid &= values[ct * slots + slot] == values[ct * slots + representative];
                         }
                     }
             bound_contract_valid &= periods_valid;
@@ -1191,22 +1084,6 @@ public:
             }
             stats_.mpc_to_ckks.handshake += MillisecondsSince(handshake_started);
 
-            const int guard_bits = std::min(
-                20, 127 - base_bits - config_.fft_scale_bits - 2);
-            // Retain fractional coefficient bits already available in the
-            // guarded FFT. Rounding coefficients at the slot-share scale and
-            // shifting afterwards amplifies one coefficient ULP by sqrt(N)
-            // when decoded, even if the target HE scale is much higher.
-            const int coefficient_precision_bits = std::min(
-                {8, shift - static_cast<int>(any_half), guard_bits, 63 - config_.ring_bits});
-            const int coefficient_ring_bits =
-                config_.ring_bits + coefficient_precision_bits;
-            const int coefficient_work_bits =
-                base_bits + coefficient_precision_bits;
-            auto transform_result = GetTransform(
-                degree, config_.fft_scale_bits, base_bits + guard_bits);
-            if (!transform_result.ok()) return transform_result.status();
-            const auto transform = transform_result.take_value();
             const auto wrap_correction = GetRnsWrapCorrection(work_bits, *context_data);
             const auto half_wrap_correction = any_half
                 ? GetRnsWrapCorrection(work_bits - 1, *context_data) : wrap_correction;
@@ -1291,10 +1168,18 @@ public:
                 else stats_.public_zero_imaginary_ciphertexts += batch;
                 const auto extend_started = Clock::now();
                 const auto lane_plan = detail::PlanSlotExtensions(target, base, batch, canonical_padding);
-                stats_.slot_extension_input_elements += lanes.size();
-                stats_.slot_extension_padding_elements += lane_plan.padding;
+                if (!wide_input) {
+                    stats_.slot_extension_input_elements += lanes.size();
+                    stats_.slot_extension_padding_elements += lane_plan.padding;
+                }
                 std::vector<WideRingShare> wide_lanes;
-                if (lane_plan.identity) {
+                if (wide_input) {
+                    wide_lanes.assign(wide_input->real.begin() + begin,
+                        wide_input->real.begin() + begin + real_count);
+                    if (!target.public_zero_imaginary)
+                        wide_lanes.insert(wide_lanes.end(), wide_input->imag.begin() + begin,
+                            wide_input->imag.begin() + begin + real_count);
+                } else if (lane_plan.identity) {
                     stats_.slot_extension_unique_elements += lanes.size();
                     wide_lanes = SignedExtend(lanes, config_.ring_bits, base_bits, slot_bound);
                 } else {
@@ -1308,27 +1193,27 @@ public:
                         if (lane_plan.inverse[i] != kUnusedLogicalIndex)
                             wide_lanes[i] = extended[lane_plan.inverse[i]];
                 }
-                stats_.mpc_to_ckks.signed_extend += MillisecondsSince(extend_started);
+                const auto prepare_ms = MillisecondsSince(extend_started);
+                stats_.mpc_to_ckks.slot_prepare += prepare_ms;
+                stats_.mpc_to_ckks.signed_extend += prepare_ms;
                 std::vector<std::uint64_t> coefficient_ring(batch * degree);
                 const auto encode_started = Clock::now();
                 for (std::size_t part = 0; part < batch; ++part) {
-                    SlotSharePair pair;
-                    pair.real.resize(slots);
-                    pair.imag.resize(slots);
+                    conversion_internal::blb::PreparedSlotShares prepared;
+                    prepared.ring_bits = base_bits;
+                    prepared.scale_bits = config_.scale_bits;
+                    prepared.values.real.resize(slots);
+                    prepared.values.imag.resize(slots);
                     for (std::size_t slot = 0; slot < slots; ++slot) {
-                        pair.real[slot] = WideShiftLeft(wide_lanes[part * slots + slot],
-                            guard_bits, base_bits + guard_bits);
+                        prepared.values.real[slot] = wide_lanes[part * slots + slot];
                         if (!target.public_zero_imaginary)
-                            pair.imag[slot] = WideShiftLeft(wide_lanes[real_count + part * slots + slot],
-                                guard_bits, base_bits + guard_bits);
+                            prepared.values.imag[slot] = wide_lanes[real_count + part * slots + slot];
                     }
-                    auto encoded = transform->Encode(pair);
+                    auto encoded = conversion_internal::blb::EncodePreparedSlots(
+                        prepared, encoding_plan, *transform, role_ == PartyRole::kClient);
                     if (!encoded.ok()) return encoded.status();
-                    for (std::size_t i = 0; i < degree; ++i)
-                        coefficient_ring[part * degree + i] = WideLocalTruncate(
-                            encoded.value()[i], guard_bits - coefficient_precision_bits,
-                            base_bits + guard_bits, role_ == PartyRole::kClient).low &
-                            LowMask(coefficient_ring_bits);
+                    std::copy(encoded.value().values.begin(), encoded.value().values.end(),
+                              coefficient_ring.begin() + part * degree);
                 }
                 stats_.mpc_to_ckks.slot_encode += MillisecondsSince(encode_started);
                 // Re-extend coefficients before the fixed R2F correction.
@@ -1338,7 +1223,13 @@ public:
                 auto wide_coefficients = SignedExtend(coefficient_ring,
                     coefficient_ring_bits, coefficient_work_bits,
                     coefficient_bound_bits);
-                stats_.mpc_to_ckks.signed_extend += MillisecondsSince(coefficient_extend_started);
+                stats_.coefficient_extension_elements += coefficient_ring.size();
+                if (config_.benchmark_unchecked_range || config_.public_m2c_quarter_range ||
+                    (coefficient_bound_bits && *coefficient_bound_bits <= coefficient_ring_bits - 2))
+                    stats_.bounded_coefficient_extension_elements += coefficient_ring.size();
+                const auto coefficient_ms = MillisecondsSince(coefficient_extend_started);
+                stats_.mpc_to_ckks.coefficient_extend += coefficient_ms;
+                stats_.mpc_to_ckks.signed_extend += coefficient_ms;
                 for (std::size_t ct = base; ct < base + batch; ++ct) {
                     const auto offset = (ct - base) * degree;
                     std::vector<WideRingShare> coefficients(
@@ -1417,7 +1308,7 @@ public:
                  std::any_of(local.imag.local_share.begin(), local.imag.local_share.end(),
                     [](auto value) { return value != 0; })))
                 return MpcToCkks(local, target);
-            if (local.real.public_value_bound_bits &&
+            if (!config_.benchmark_unchecked_range && local.real.public_value_bound_bits &&
                 ((target.public_value_bound_bits && *target.public_value_bound_bits < *local.real.public_value_bound_bits) ||
                  std::any_of(target.public_ciphertext_bound_bits.begin(), target.public_ciphertext_bound_bits.end(),
                     [&](const auto &range) { return range && *range < *local.real.public_value_bound_bits; })))
@@ -1541,7 +1432,7 @@ private:
     ConversionStats stats_;
 };
 
-CkksMpcConverter::CkksMpcConverter(
+BlbReferenceConverter::BlbReferenceConverter(
     PartyRole role, ConversionConfig config, HeContextRegistry &contexts,
     std::shared_ptr<IProtocolTransport> transport,
     std::shared_ptr<IRandomSource> randomness, std::string peer_address,
@@ -1552,37 +1443,51 @@ CkksMpcConverter::CkksMpcConverter(
           std::move(peer_address), worker_port, threads, wire_compression))
 {}
 
-CkksMpcConverter::~CkksMpcConverter() = default;
-CkksMpcConverter::CkksMpcConverter(CkksMpcConverter &&) noexcept = default;
-CkksMpcConverter &CkksMpcConverter::operator=(CkksMpcConverter &&) noexcept =
+BlbReferenceConverter::~BlbReferenceConverter() = default;
+BlbReferenceConverter::BlbReferenceConverter(BlbReferenceConverter &&) noexcept = default;
+BlbReferenceConverter &BlbReferenceConverter::operator=(BlbReferenceConverter &&) noexcept =
     default;
 
-Result<ComplexMpcSharePair> CkksMpcConverter::CkksToMpc(
+Result<ComplexMpcSharePair> BlbReferenceConverter::CkksToMpc(
     const std::optional<SealCipherBatch> &server_input,
-    std::optional<int> output_scale_bits)
+    std::optional<int> output_scale_bits,
+    std::optional<int> public_coefficient_bound_bits)
 {
-    return impl_->CkksToMpc(server_input, output_scale_bits);
+    return impl_->CkksToMpc(server_input, output_scale_bits, public_coefficient_bound_bits);
 }
 
-Result<std::optional<SealCipherBatch>> CkksMpcConverter::MpcToCkks(
+Result<std::optional<SealCipherBatch>> BlbReferenceConverter::MpcToCkks(
     const ComplexMpcSharePair &local_shares,
     const MpcToCkksTarget &target)
 {
     return impl_->MpcToCkks(local_shares, target);
 }
 
-Result<std::optional<SealCipherBatch>> CkksMpcConverter::MpcToCkksPacked(
+Result<std::optional<SealCipherBatch>> BlbReferenceConverter::MpcToCkksPacked(
     const ComplexMpcSharePair &local_shares, const MpcToCkksTarget &target)
 {
     return impl_->MpcToCkksPacked(local_shares, target);
 }
 
-ConversionStats CkksMpcConverter::stats() const noexcept
+Result<std::optional<SealCipherBatch>> BlbReferenceConverter::MpcToCkksPrepared(
+    const PreparedBlbSlots &local, const MpcToCkksTarget &target)
+{
+    // Markers supply public shape/numeric metadata only; the engine reads
+    // actual slot values exclusively from local in the prepared branch.
+    const auto count = target.slot_map.assignments.size();
+    const TensorShape shape{{target.slot_map.ciphertext_count, target.slot_map.slots_per_ciphertext}};
+    ComplexMpcSharePair markers{
+        {std::vector<std::uint64_t>(count), shape, {impl_->config().ring_bits, impl_->config().scale_bits}, ComplexComponent::kReal},
+        {std::vector<std::uint64_t>(count), shape, {impl_->config().ring_bits, impl_->config().scale_bits}, ComplexComponent::kImaginary}};
+    return impl_->MpcToCkks(markers, target, {}, false, &local);
+}
+
+ConversionStats BlbReferenceConverter::stats() const noexcept
 {
     return impl_->stats();
 }
 
-void CkksMpcConverter::Cancel() noexcept
+void BlbReferenceConverter::Cancel() noexcept
 {
     if (impl_) impl_->Cancel();
 }

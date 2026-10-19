@@ -1,42 +1,61 @@
 # HERA
 
 基于 CKKS/MPC 的私有 Transformer 推理原型，支持单层、多层和可变维度配置。
-示例参数仅用于研究，部分 HE profile 使用 `security_level=none`。
+示例参数仅用于研究。
 
-## 构建
+## 云服务器构建与测试
 
-支持 Ubuntu 22.04/24.04、x86-64。首次构建需要访问 GitHub/GitLab。
+使用 Linux x86-64 服务器（Ubuntu 22.04/24.04），CPU 需要 AES-NI、AVX2 和 SSE4.1；不需要 GPU 或 RDSEED。默认回归建议至少 2 vCPU、8 GiB 内存、20 GiB 可用磁盘。首次下载需要访问 GitHub/GitLab，依赖从固定提交构建，不需要机器上已有 SEAL、SCI 或 EMP。
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
   build-essential cmake git patch rsync ca-certificates python3 util-linux \
-  libssl-dev libgmp-dev libmpfr-dev libboost-dev
+  libssl-dev libgmp-dev libmpfr-dev libboost-dev libzstd-dev zlib1g-dev
 
-git clone git@github.com:fatwltr/Hera.git
+git clone https://github.com/fatwltr/Hera.git
 cd Hera
 
 ./scripts/bootstrap_dependencies.sh .deps 2
 ./scripts/build_and_test.sh full 2 .deps
 ```
 
-脚本会下载固定版本依赖、以 Release 编译并运行回归测试。
-`2` 是编译并行数；依赖位于 `.deps/`，程序位于 `build/full/`。
-构建成功后输出 `HERA_BUILD_STATUS=PASS`。新机器请重新编译依赖和程序。
+`2` 是编译并行数。脚本先检查工具、CMake（至少 3.21）和 CPU 指令集，再下载源码、安装依赖、以 Release 编译并顺序运行全部 19 项 CTest 回归。覆盖转换、HE/MPC 算子、双层推理及 OpenMP 单线程限制下的端到端正确性，不跳过完整集成测试。
 
-构建会运行16项关键回归，覆盖配置、转换、HE/MPC算子及双层端到端正确性。
+成功时应看到：
 
-如果只想先下载依赖源码，不进行编译或安装，运行：
+```text
+HERA_DEPENDENCIES_STATUS=PASS
+100% tests passed, 0 tests failed out of 19
+HERA_BUILD_STATUS=PASS
+```
+
+也可用 `./scripts/reproduce.sh 2` 一次执行上述依赖构建、项目构建和测试。
+依赖位于 `.deps/`，程序位于 `build/full/`。准备脚本只修改生成的依赖副本，重复运行相同命令会复用已完成的依赖；换机器后需重新编译。
+
+仅下载固定版本源码、暂不编译：
 
 ```bash
 ./scripts/download_dependencies.sh .deps
 ```
 
-源码保存在 `.deps/src/`，下载成功后输出 `HERA_DEPENDENCY_DOWNLOAD_STATUS=PASS`。
-之后运行 `./scripts/bootstrap_dependencies.sh .deps 2` 编译并安装依赖，
-再运行 `./scripts/build_and_test.sh full 2 .deps` 编译并测试 Hera。
+下载成功输出 `HERA_DEPENDENCY_DOWNLOAD_STATUS=PASS`。之后运行前面的 bootstrap 和 build/test 命令即可。压缩使用系统 `libzstd-dev`，构建过程无需再下载 Microsoft GSL 或 Zstandard 源码。
 
-先检查 BERT-large 配置和计算图：
+编译并行数与运行时 workers 独立。构建脚本默认把 OpenMP 限制为 2 个线程，CTest 也设置相同的可复现环境；修补后的 SCI 在 `OMP_THREAD_LIMIT=1` 或动态缩小线程团队时仍执行全部通信方向。
+
+## 小规模运行检查
+
+完整测试通过后，运行一个物化权重的双进程 tiny 推理：
+
+```bash
+./build/full/hera_private_inference \
+  --config=configs/runtime_tiny.json --party=local --port=27100 \
+  --threads=2 --verify
+```
+
+应输出两个 `HERA_PRIVATE_INFERENCE_STATUS=PASS`。`--party=local` 自动启动双方，无需两台机器；保持本机端口区间 `27100–27600` 空闲。
+
+只检查较大配置和计算图：
 
 ```bash
 ./build/full/hera_private_inference \
@@ -59,7 +78,7 @@ mkdir -p build/benchmarks
   --config=configs/bert_large_single_layer_seq128.json \
   --party=local --port=27900 --threads=6 \
   --weight-mode=virtual --weight-template-count=1 \
-  --he-memory-mib=1024 --plaintext-cache-mib=1024 \
+  --he-memory-mib=1024 \
   --stage-timeout-seconds=600 --warmup=1 --repeat=3 --verify \
   2>&1 | tee build/benchmarks/bert_large_single_layer.log
 ```
@@ -69,16 +88,20 @@ mkdir -p build/benchmarks
 
 ## 查看结果
 
-日志中的主要指标：
+Transformer block 测试仅输出双方标识、每个 block 的六项在线指标和最终状态；多层模型另输出 `HERA_TOTAL` 汇总。
 
 | 指标 | 含义 |
 | --- | --- |
-| `HERA_END_TO_END_ONLINE_MS` | 正式推理平均耗时，含HE、MPC、转换和最终输出传输；双方取较大值 |
-| `HERA_SETUP_MS` | 初始化耗时，已包含权重Prepare；双方取较大值 |
-| `HERA_COMMUNICATION_BYTES` | 最后一次正式推理的计算协议发送量；双方相加 |
+| `HE_MS` | HE 算子的执行时间 |
+| `MPC_MS` | Softmax、LayerNorm 倒平方根、GeLU 等非线性 MPC 的执行时间 |
+| `CONVERSION_MS` | HE/MPC 转换时间，包含转换内部的加解密、FFT、OT 与密文传输 |
+| `HE_COMM_BYTES` | 本地 HE 算子通信量，当前为 0 |
+| `MPC_COMM_BYTES` | 非线性 MPC 发送的字节数 |
+| `CONVERSION_COMM_BYTES` | 转换协议及其密文传输发送的字节数 |
 
-`--warmup=1 --repeat=3`表示预热一次、正式测量三次，在线均值不包含初始化和预热。
-通信量不包含初始化密钥/输入和阶段外最终输出传输。
+每个 block 输出一行 `HERA_BLOCK=layer0,HE_MS=...,MPC_MS=...,CONVERSION_MS=...,HE_COMM_BYTES=0,MPC_COMM_BYTES=...,CONVERSION_COMM_BYTES=...`。
+时间单位为毫秒，时间和通信量均为正式轮次的每次平均值。`--warmup=1 --repeat=3` 表示预热一次、正式测量三次。
+
 
 ## 单独测试 QK、XW、Attention×V
 
@@ -95,27 +118,16 @@ cfg=configs/bert_large_single_layer_seq128.json
 XW 可选择 `wq/wk/wv/wo/wu/wd`，每次测一个投影，包含其生产实现中的打包、缩放和偏置。
 单独测 Q/K/V 时各自包含 baby rotations；三个结果相加不会体现联合 QKV 的旋转复用。
 默认使用实际合成权重；大矩阵可加 `--weight-mode=virtual` 降低预处理和存储成本，
-此模式会明确跳过明文数值对照。实际权重模式最多抽查256个输出，小规模输出全部检查。
+此模式跳过明文数值对照。实际权重模式最多抽查256个输出，小规模输出全部检查。
 
-`HERA_MEAN_MS`、`HERA_MEDIAN_MS`、`HERA_MIN_MS` 为纯 HE 算子耗时，
-不含密钥生成、输入加密、权重/掩码预处理、预热和解密校验；这些算子不包含 MPC 或域转换。
-`HERA_SETUP_MS`、`HERA_PREPARE_MS`、`HERA_WARMUP_MS` 单独报告。
-`HERA_KS_PER_RUN` 是单次执行的 **旋转 + 共轭 + 重线性化** 次数，三项分别输出，
-`HERA_KS_MEASURED_TOTAL` 为正式重复的总次数，不含预热；`HERA_ROTATION_KEY_COUNT` 是生成的密钥数量。
-输出还包含输入/输出 level、密文数和明文校验误差。参数说明见 `--help`。
+矩阵乘法测试输出：
 
-## 常用说明
+```text
+HERA_BENCHMARK=qk
+HERA_KS_PER_RUN=实际调用次数
+HERA_MEAN_MS=正式执行平均毫秒数
+HERA_BENCHMARK_STATUS=PASS
+```
 
-- `--threads=6`设置HE、MPC、转换各6 workers；也可分别使用
-  `--he-threads`、`--mpc-workers`、`--conversion-workers`。内存或核数不足时降低worker数。
-- worker数没有固定性能上限；HE按任务数和`--he-memory-mib`预算调度，
-  LayerNorm和GeLU MPC按输入元素分片。阶段日志中的`LN_HE_WORKERS`、
-  `LN_MPC_WORKERS`、`GELU_MPC_WORKERS`显示实际使用数量。
-  较大worker数会扩展端口区间，MPC起始端口见`HERA_MPC_BASE_PORT`；
-  仍需满足TCP端口范围，双方使用相同参数及同一版本程序。
-- 虚拟权重用于性能测试；`--verify`检查最终解密输出有限性，不代表预训练模型精度验证。
-- `--dry-run`只检查配置和计算图，不执行实际HE/MPC计算。
-- `.gitignore`排除`docs/`、依赖副本、构建产物、日志、缓存和指定的调试脚本。
-  源码、配置、测试、必要补丁和构建脚本正常提交。
 
 第三方来源及许可证说明见 [THIRD_PARTY.md](THIRD_PARTY.md)。

@@ -39,17 +39,25 @@ grep -Eq 'project\(SEAL VERSION 4\.4\.5([[:space:]]|\))' \
   exit 2
 }
 
-# The checked-in CKKS hoisting patch is part of the HERA SEAL build.
+# Patch a generated copy: downloaded pinned checkouts stay clean and reusable.
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-if ! grep -q 'HERA_SEAL_ROTATION_HOISTING' "$seal_source/native/src/seal/evaluator.h"; then
-  patch -d "$seal_source" -p1 --forward < "$script_dir/seal_rotation_hoisting.patch"
+commit=unknown
+if git -C "$seal_source" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  commit=$(git -C "$seal_source" rev-parse HEAD)
 fi
+mkdir -p "$output/source" "$output/build" "$output/install"
+rsync -a --exclude .git --exclude build --exclude install --exclude thirdparty \
+  "$seal_source/" "$output/source/"
+patch -d "$output/source" -p1 --forward < "$script_dir/seal_rotation_hoisting.patch"
+patch -d "$output/source" -p1 --forward < "$script_dir/seal_system_zstd.patch"
+cp "$script_dir/../cmake/Findzstd.cmake" "$output/source/cmake/Findzstd.cmake"
 
-mkdir -p "$output/build" "$output/install"
-cmake -S "$seal_source" -B "$output/build" \
+cmake -S "$output/source" -B "$output/build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$output/install" \
-  -DSEAL_BUILD_DEPS=ON \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DSEAL_BUILD_DEPS=OFF \
+  -DSEAL_USE_MSGSL=OFF \
   -DSEAL_BUILD_EXAMPLES=OFF \
   -DSEAL_BUILD_TESTS=OFF \
   -DSEAL_BUILD_BENCH=OFF \
@@ -64,11 +72,8 @@ seal_dir="$output/install/lib/cmake/SEAL-4.4"
   echo "SEALConfig.cmake was not installed at $seal_dir" >&2
   exit 1
 }
+cp "$script_dir/../cmake/Findzstd.cmake" "$seal_dir/Findzstd.cmake"
 
-commit=unknown
-if git -C "$seal_source" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  commit=$(git -C "$seal_source" rev-parse HEAD)
-fi
 mkdir -p "$output/install/share/hera-seal"
 printf '%s\n' \
   'HERA_SEAL_ABI=1' \

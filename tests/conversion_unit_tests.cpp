@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <random>
 #include <set>
 #include <stdexcept>
 
@@ -48,11 +49,62 @@ private:
     std::uint64_t position_{};
 };
 
+void VerifyCoefficientNormBounds()
+{
+    std::mt19937_64 random(20261018);
+    constexpr int input_bits = 83, working_bits = 103, guard = 20, retained = 8;
+    for (std::size_t degree : {16, 2048, 32768}) {
+        auto left_transform = hera::conversion_internal::FixedCkksTransform::Create(
+            degree, 20, working_bits, false).take_value();
+        auto right_transform = hera::conversion_internal::FixedCkksTransform::Create(
+            degree, 20, working_bits, true).take_value();
+        for (int value_bits : {19, 31}) {
+            const auto bound = left_transform.EncodedCoefficientBoundBits(value_bits, guard, retained);
+            Require(bound && *bound <= value_bits + retained + 2,
+                    "complex norm bound lost its normalized-FFT headroom");
+            hera::conversion_internal::SlotSharePair left, right;
+            left.real.resize(degree / 2); left.imag.resize(degree / 2);
+            right.real.resize(degree / 2); right.imag.resize(degree / 2);
+            for (std::size_t i = 0; i < degree / 2; ++i) {
+                for (bool imaginary : {false, true}) {
+                    auto clear = hera::WideFromLow((std::uint64_t{1} << value_bits) - 1, input_bits);
+                    if ((i + imaginary) % 3) clear = hera::WideNegate(clear, input_bits);
+                    auto share = WideRingShare{random(), random() & ((std::uint64_t{1} << 19) - 1)};
+                    (imaginary ? left.imag : left.real)[i] = hera::WideShiftLeft(share, guard, working_bits);
+                    (imaginary ? right.imag : right.real)[i] = hera::WideShiftLeft(
+                        hera::WideSubtract(clear, share, input_bits), guard, working_bits);
+                }
+            }
+            auto l = left_transform.Encode(left).take_value();
+            auto r = right_transform.Encode(right).take_value();
+            for (std::size_t i = 0; i < degree; ++i) {
+                auto value = hera::WideAdd(
+                    hera::WideLocalTruncate(l[i], guard - retained, working_bits, false),
+                    hera::WideLocalTruncate(r[i], guard - retained, working_bits, true),
+                    51);
+                auto signed_value = Signed(value, 51);
+                auto limit = static_cast<__int128>(U128{1} << *bound);
+                if (!(signed_value > -limit && signed_value < limit))
+                    std::cerr << "NORM_BOUND_FAILURE degree=" << degree << " input_bits=" << value_bits
+                        << " bound=" << *bound << " coefficient=" << i << " high=" << value.high
+                        << " low=" << value.low << '\n';
+                Require(signed_value > -limit && signed_value < limit,
+                        "two-party encoded coefficient exceeded the norm bound");
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main()
 {
     try {
+        VerifyCoefficientNormBounds();
+        const auto decode_range = hera::conversion_internal::FixedCkksTransform::Create(
+            16384, 20, 105).take_value().DecodedSlotBoundBits(58, 5, 33);
+        Require(decode_range && *decode_range == 40,
+                "quarter-q/scale46 did not establish the GeLU MPC range");
         constexpr int bits = 83;
         Require(!hera::ValidateWideRingBits(128).ok(),
                 "128-bit wide ring was accepted");

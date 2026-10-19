@@ -226,29 +226,55 @@ std::optional<int> FixedCkksTransform::EncodedCoefficientBoundBits(
         slot_bound_bits + guard_bits >= 100)
         return std::nullopt;
     using U128 = unsigned __int128;
-    auto magnitude = U128{1} << (slot_bound_bits + guard_bits);
+    // Track a complex Euclidean norm. Quantizing each unit root to S=2^f
+    // changes its norm by at most 1/S. Componentwise local truncation adds
+    // a reconstructed complex error of norm < 2, under the existing
+    // statistical truncation contract. This avoids the loose 3^log(N) bound.
+    auto magnitude = (3 * (U128{1} << (slot_bound_bits + guard_bits)) + 1) / 2;
     const auto limit = U128{1} << (working_bits_ - 2);
     const int levels = seal::util::get_power_of_two(degree_);
-    // For each component, |root_product| <= 2*M + 1. A butterfly
-    // therefore increases the bound to 3*M + 1. The +1 accommodates
-    // the reconstructed two-party local-truncation rounding error.
+    const auto root_scale = U128{1} << root_scale_bits_;
+    const auto ceil_div = [](U128 value, U128 divisor) {
+        return (value + divisor - 1) / divisor;
+    };
     for (int level = 1; level < levels; ++level) {
-        if (magnitude >= limit / 3) return std::nullopt;
-        magnitude = 3 * magnitude + 1;
+        // Also reserve room for the untruncated root product.
+        if (magnitude >= limit / (2 * (root_scale + 1))) return std::nullopt;
+        magnitude = 2 * magnitude + ceil_div(2 * magnitude, root_scale) + 2;
     }
-    // The last stage uses root >> log2(N). Its components are bounded
-    // by 2^root_scale/N + 1, so for N <= 2^root_scale the coefficient
-    // bound is <= 8*M/N + 2, including final rounding. Keep margin for
-    // the unshifted root multiplication before its local truncation.
-    if (magnitude >= limit / 8 ||
-        magnitude >= limit / (U128{1} << (root_scale_bits_ + 2)))
+    // The final root is arithmetically shifted by log2(N), so its norm
+    // is <= S/N + 2. Include this coarser quantization and final rounding.
+    if (magnitude >= limit / (2 * (root_scale / degree_ + 2)))
         return std::nullopt;
-    magnitude = (8 * magnitude + degree_ - 1) / degree_ + 2;
+    magnitude = ceil_div(2 * magnitude, degree_) +
+        ceil_div(4 * magnitude, root_scale) + 2;
     const auto divisor = U128{1} << (guard_bits - retained_precision_bits);
-    magnitude = (magnitude + divisor - 1) / divisor + 1;
+    magnitude = ceil_div(magnitude, divisor) + 1;
     int bound_bits = 0;
     while (magnitude != 0) { ++bound_bits; magnitude >>= 1; }
     return bound_bits;
+}
+
+std::optional<int> FixedCkksTransform::DecodedSlotBoundBits(
+    int coefficient_bound_bits, int guard_bits, int scale_shift) const
+{
+    if (coefficient_bound_bits < 0 || guard_bits < 0 || scale_shift < 0 ||
+        coefficient_bound_bits + guard_bits >= 120 || scale_shift + guard_bits >= 127)
+        return std::nullopt;
+    using U128 = unsigned __int128;
+    auto magnitude = U128{1} << (coefficient_bound_bits + guard_bits);
+    const auto scale = U128{1} << root_scale_bits_;
+    const auto limit = U128{1} << (working_bits_ - 2);
+    const int levels = seal::util::get_power_of_two(degree_);
+    for (int level = 0; level < levels; ++level) {
+        if (magnitude >= limit / (scale + 1)) return std::nullopt;
+        magnitude = 2 * magnitude + (magnitude + scale - 1) / scale + 2;
+    }
+    const auto divisor = U128{1} << (scale_shift + guard_bits);
+    magnitude = (magnitude + divisor - 1) / divisor + 1;
+    int bits = 0;
+    while (magnitude) { ++bits; magnitude >>= 1; }
+    return bits;
 }
 
 } // namespace hera::conversion_internal

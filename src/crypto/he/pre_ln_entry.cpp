@@ -1,7 +1,9 @@
+#include "hera/blb_reference.h"
 #include "hera/pre_ln_entry.h"
 #include "hera/detail/he_level.h"
 #include "hera/detail/he_packing.h"
 #include "hera/detail/packing_utils.h"
+#include "hera/detail/scoped_wall_timer.h"
 
 #include <chrono>
 #include <algorithm>
@@ -110,7 +112,7 @@ void AddConversion(const ConversionStats &before, const ConversionStats &after,
 SealSciPreLnEntryExecutor::SealSciPreLnEntryExecutor(
     const HeraConfig &config, std::size_t layer_index,
     HeContextRegistry &contexts, RuntimeTensorArena &arena,
-    SealPlainParameterStore &parameters, CkksMpcConverter &converter,
+    SealPlainParameterStore &parameters, BlbReferenceConverter &converter,
     MpcLayerNormRuntime &mpc_layer_norm, const CompiledLayerExecutionPlan *plan)
     : SealSciPreLnEntryExecutor(config, layer_index, contexts, arena.he, arena.mpc,
           parameters, converter, mpc_layer_norm, &arena.ids, plan)
@@ -120,7 +122,7 @@ SealSciPreLnEntryExecutor::SealSciPreLnEntryExecutor(
     const HeraConfig &config, std::size_t layer_index,
     HeContextRegistry &contexts, SealCipherTensorStore &he_tensors,
     CryptoTensorStore &mpc_tensors, SealPlainParameterStore &parameters,
-    CkksMpcConverter &converter, MpcLayerNormRuntime &mpc_layer_norm,
+    BlbReferenceConverter &converter, MpcLayerNormRuntime &mpc_layer_norm,
     TensorIdAllocator *ids, const CompiledLayerExecutionPlan *plan)
     : config_(config), layer_index_(layer_index), contexts_(contexts),
       he_tensors_(he_tensors), mpc_tensors_(mpc_tensors), ids_(ids),
@@ -131,7 +133,6 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
     const TensorHandle &hidden, const LayerWeightHandles &weights,
     PreLnEntryExecutionReport *report, PreLnEntryShareOutputs *retained_shares)
 {
-    const auto started = Clock::now();
     try {
         if (report) *report = {};
         if (retained_shares) *retained_shares = {};
@@ -217,6 +218,7 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
         std::optional<MpcShareTensor> hidden_shares;
         if (!direct_region1) {
             if (contexts_.role() == PartyRole::kServer) {
+                detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
                 auto paired = detail::PairRealCiphertexts(source_tensor->ciphertexts, source, config_.threads);
                 if (!paired.ok()) return paired.status();
                 source_batch = SealCipherBatch{
@@ -280,6 +282,7 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
         if (!region1_plan.ok()) return region1_plan.status();
         std::optional<SealCipherTensor> region1_input;
         if (contexts_.role() == PartyRole::kServer && direct_region1) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             region1_input = std::move(source_tensor);
             auto target = LevelId(region1, region1_start);
             if (!target.ok()) return target.status();
@@ -316,6 +319,7 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
 
         std::optional<LayerNormStatisticsOutputs> statistics;
         if (contexts_.role() == PartyRole::kServer) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             auto computed = LayerNormStatisticsKernel::Evaluate(
                 *region1_input, layer, region1,
                 report ? &report->statistics : nullptr, config_.threads, statistics_input_bits);
@@ -333,6 +337,7 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
             if (!map.ok()) return map.status();
             std::optional<SealCipherBatch> batch;
             if (contexts_.role() == PartyRole::kServer) {
+                detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
                 const auto &tensor = centered ? statistics->centered
                                               : statistics->variance;
                 auto ciphertexts = centered
@@ -438,6 +443,7 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
             plan_ ? plan_->retained_value_level : std::size_t{2},
             shared.parameters.default_scale_bits, config_.mpc_numeric);
         if (contexts_.role() == PartyRole::kServer) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             SealBlock2Executor block2(config_, layer, contexts_, he_tensors_,
                                       parameters_,
                                       plan_ ? &plan_->block2_rotation_steps
@@ -460,10 +466,6 @@ Result<PreLnEntryOutputs> SealSciPreLnEntryExecutor::Evaluate(
             he_tensors_.Erase(centered_id);
             he_tensors_.Erase(inverse_id);
         }
-        if (report)
-            report->he_milliseconds = std::chrono::duration<double,
-                std::milli>(Clock::now() - started).count() -
-                report->conversion_milliseconds - report->mpc_milliseconds;
         PreLnEntryOutputs outputs;
         outputs.block2 = {{score_id, score_spec}, {value_id, value_spec}};
         if (layer.attention_residual) outputs.attention_residual = {residual_id, residual_spec};

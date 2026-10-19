@@ -1,4 +1,6 @@
+#include "hera/blb_reference.h"
 #include "hera/attention_ln2.h"
+#include "hera/detail/scoped_wall_timer.h"
 #include "hera/detail/he_level.h"
 #include "hera/detail/level_schedule.h"
 #include "hera/detail/he_packing.h"
@@ -445,7 +447,6 @@ Result<SealCipherTensor> ComputeAttentionValue(
     auto program = GetAvPlaintexts(layer, context, probabilities.ciphertexts.front().parms_id(),
         probabilities.ciphertexts.front().scale(), value.ciphertexts.front().scale(), report);
     if (!program.ok()) return program.status();
-    seal::Evaluator evaluator(*context.context);
     std::vector<seal::Ciphertext> output(
         plan_result.value().output_packing.ciphertext_count);
 
@@ -477,216 +478,254 @@ Result<SealCipherTensor> ComputeAttentionValue(
         // once, then replicate two complex diagonals together. Inner-rotation
         // masks are folded into seed selection so all A preprocessing still
         // consumes only one level.
-        const auto probability_rotations_before = report ? report->rotations : 0;
-        std::vector<seal::Ciphertext> prepared_a(layer.tokens);
-        for (std::size_t giant = 0; giant < giant_steps; ++giant) {
-            const auto diagonal_begin = giant * baby_steps;
-            const auto valid_babies = std::min(
-                baby_steps, layer.tokens - diagonal_begin);
-            const auto complex_diagonals = (valid_babies + 1) / 2;
-            const auto row_shift = diagonal_begin;
-            const auto &source = probabilities.ciphertexts[
-                tile.probability_begin + giant];
-            auto main = Rotate(source, -static_cast<int>(
-                row_shift), context, evaluator, report);
-            std::optional<seal::Ciphertext> wrapped;
-            if (row_shift != 0)
-                wrapped = Rotate(source, static_cast<int>(
-                    (layer.tokens - row_shift)),
-                    context, evaluator, report);
-
-            const bool paired = tile.lanes % 2 == 0;
-            for (std::size_t first = 0; first < complex_diagonals;
-                 first += paired ? 2 : 1) {
-                const auto selected = std::min<std::size_t>(
-                    paired ? 2 : 1, complex_diagonals - first);
-                const auto &seed_masks = masks.seeds[giant][first / (paired ? 2 : 1)];
-                seal::Ciphertext seed;
-                evaluator.multiply_plain(main, *seed_masks.main, seed);
-                if (report) ++report->ciphertext_plain_multiplications;
-                if (wrapped) {
-                    seal::Ciphertext term;
-                    evaluator.multiply_plain(*wrapped, *seed_masks.wrap, term);
-                    evaluator.add_inplace(seed, term);
-                    if (report) ++report->ciphertext_plain_multiplications;
-                }
-                // Expand in place: select left/right from the seed position,
-                // avoiding a separate alignment rotation and physical wrap.
-                auto replicated = seed;
-                std::size_t populated = paired ? 2 : 1;
-                while (populated < tile.lanes) {
-                    auto copy = Rotate(replicated,
-                        static_cast<int>(ReplicationRotation(
-                            first, populated, block)),
-                        context, evaluator, report);
-                    evaluator.add_inplace(replicated, copy);
-                    populated *= 2;
-                }
-                for (std::size_t local = 0; local < selected; ++local) {
-                    auto diagonal = replicated;
-                    if (paired) {
-                        evaluator.multiply_plain_inplace(diagonal, *masks.parity[local]);
-                        auto complement = Rotate(diagonal,
-                            local == 0 ? -static_cast<int>(block)
-                                       : static_cast<int>(block),
-                            context, evaluator, report);
-                        evaluator.add_inplace(diagonal, complement);
-                        if (report) ++report->ciphertext_plain_multiplications;
-                    }
-                    evaluator.rescale_to_next_inplace(diagonal);
-                    auto normalized = NormalizeScale(diagonal, prepared_a_scale);
-                    if (!normalized.ok()) return normalized.status();
-                    seal::Ciphertext conjugated;
-                    evaluator.complex_conjugate(
-                        diagonal, context.galois_keys, conjugated);
-                    const auto index = diagonal_begin + 2 * (first + local);
-                    evaluator.add(diagonal, conjugated, prepared_a[index]);
-                    if (index + 1 < diagonal_begin + valid_babies)
-                        evaluator.sub(diagonal, conjugated, prepared_a[index + 1]);
-                    // The odd diagonal is i*D. Step 2 folds -i into the
-                    // corresponding V mask, making their product D*V without
-                    // another plaintext multiplication or CKKS level.
-                    if (report) {
-                        ++report->rescales;
-                        ++report->conjugations;
-                    }
-                }
-            }
-        }
-        if (report)
-            report->attention_probability_rotations +=
-                report->rotations - probability_rotations_before;
-
-        std::vector<AttentionLn2ExecutionReport> group_reports(
-            tile.value_groups);
-        auto group_status = detail::ParallelRanges(
-            tile.value_groups, he_workers, 1,
-            [&](std::size_t begin, std::size_t end) -> Result<void> {
-            seal::Evaluator evaluator(*context.context);
-            for (std::size_t value_group = begin;
-                 value_group < end; ++value_group) {
-            auto *report = &group_reports[value_group];
-            const auto &v_source = value.ciphertexts[
-                tile.value_begin + value_group];
-
-            // Step 2: share one boundary rotation across all baby steps.
-            // Masks are applied in source coordinates before a single baby
-            // rotation; this also works with partially occupied CKKS vectors.
-            std::optional<seal::Ciphertext> boundary;
-            if (baby_steps > 1)
-                boundary = Rotate(v_source, -static_cast<int>(layer.tokens),
-                                  context, evaluator, report);
-            std::vector<seal::Ciphertext> prepared_v(baby_steps);
-            for (std::size_t baby = 0; baby < baby_steps; ++baby) {
-                const auto shift = baby;
-                seal::Ciphertext main;
-                evaluator.multiply_plain(v_source, *masks.babies[baby].main, main);
-                std::size_t multiplications = 1;
-                if (baby != 0) {
-                    seal::Ciphertext term;
-                    evaluator.multiply_plain(*boundary, *masks.babies[baby].wrap, term);
-                    evaluator.add_inplace(main, term);
-                    ++multiplications;
-                }
-                main = Rotate(main, static_cast<int>(shift), context,
-                              evaluator, report);
-                evaluator.rescale_to_next_inplace(main);
-                auto normalized = NormalizeScale(main, target);
-                if (!normalized.ok()) return normalized.status();
-                report->ciphertext_plain_multiplications += multiplications;
-                ++report->rescales;
-                prepared_v[baby] = std::move(main);
-            }
-            report->attention_value_rotations = report->rotations;
-
-            // Step 3: ciphertext x ciphertext products. Products belonging to
-            // one giant group are accumulated before one lazy relinearization
-            // and rescale. Giant groups are then row-inner recovered and added.
-            std::vector<seal::Ciphertext> partials;
-            partials.reserve(giant_steps);
-            for (std::size_t giant = 0; giant < giant_steps; ++giant) {
-                const auto diagonal_begin = giant * baby_steps;
-                const auto valid_babies = std::min(
-                    baby_steps, layer.tokens - diagonal_begin);
-                seal::Ciphertext partial;
-                for (std::size_t baby = 0; baby < valid_babies; ++baby) {
-                    seal::Ciphertext product;
-                    evaluator.multiply(
-                        prepared_a[diagonal_begin + baby],
-                        prepared_v[baby], product);
-                    if (baby == 0)
-                        partial = std::move(product);
-                    else
-                        evaluator.add_inplace(partial, product);
-                    if (report) ++report->ciphertext_multiplications;
-                }
-                evaluator.relinearize_inplace(
-                    partial, context.relinearization_keys);
-                evaluator.rescale_to_next_inplace(partial);
-                auto normalized = NormalizeScale(partial, target);
-                if (!normalized.ok()) return normalized.status();
-                if (report) {
-                    ++report->relinearizations;
-                    ++report->rescales;
-                }
-                partials.push_back(std::move(partial));
-            }
-
-            const auto recovery_rotations_before = report->rotations;
-            std::optional<seal::Ciphertext> accumulated;
-            for (std::size_t giant = 0; giant < giant_steps; ++giant) {
-                const auto row_shift = giant * baby_steps;
-                const int shift = static_cast<int>(
-                    row_shift);
-                auto recovered = Rotate(
-                    partials[giant], shift, context, evaluator, report);
-                evaluator.multiply_plain_inplace(recovered, *masks.recovery[giant].main);
-                std::size_t multiplications = 1;
-                if (masks.recovery[giant].wrap) {
-                    auto wrapped = Rotate(
-                        partials[giant], shift - static_cast<int>(layer.tokens),
-                        context, evaluator, report);
-                    evaluator.multiply_plain_inplace(wrapped, *masks.recovery[giant].wrap);
-                    evaluator.add_inplace(recovered, wrapped);
-                    ++multiplications;
-                }
-                report->ciphertext_plain_multiplications += multiplications;
-                if (!accumulated)
-                    accumulated = std::move(recovered);
-                else
-                    evaluator.add_inplace(*accumulated, recovered);
-            }
-            if (!accumulated)
-                return Status::Internal("A*V Step 3 produced no output");
-            evaluator.rescale_to_next_inplace(*accumulated);
-            auto normalized = NormalizeScale(*accumulated, target);
-            if (!normalized.ok()) return normalized.status();
-            ++report->rescales;
-            output[tile.value_begin + value_group] =
-                std::move(*accumulated);
-            report->attention_recovery_rotations =
-                report->rotations - recovery_rotations_before;
-            }
-            return {};
-        }, detail::EstimatedHeWorkerBytes(
-            context.parameters.polynomial_degree,
-            context.parameters.coefficient_modulus_bits.size(),
-            baby_steps + giant_steps + 8));
-        if (!group_status.ok()) return group_status.status();
-        if (report) {
-            for (const auto &counts : group_reports) {
+        const auto active_primes = context.context->get_context_data(
+            probabilities.ciphertexts.front().parms_id())->parms().coeff_modulus().size();
+        const auto worker_bytes = [&](std::size_t live) {
+            return detail::EstimatedHeWorkerBytes(
+                context.parameters.polynomial_degree, active_primes, live);
+        };
+        const auto merge_reports = [&](const std::vector<AttentionLn2ExecutionReport> &reports) {
+            if (!report) return;
+            for (const auto &counts : reports) {
                 report->rotations += counts.rotations;
                 report->conjugations += counts.conjugations;
-                report->ciphertext_plain_multiplications +=
-                    counts.ciphertext_plain_multiplications;
-                report->ciphertext_multiplications +=
-                    counts.ciphertext_multiplications;
+                report->ciphertext_plain_multiplications += counts.ciphertext_plain_multiplications;
+                report->ciphertext_multiplications += counts.ciphertext_multiplications;
                 report->relinearizations += counts.relinearizations;
                 report->rescales += counts.rescales;
-                report->modulus_switches += counts.modulus_switches;
+                report->attention_probability_rotations += counts.attention_probability_rotations;
                 report->attention_value_rotations += counts.attention_value_rotations;
                 report->attention_recovery_rotations += counts.attention_recovery_rotations;
             }
+        };
+        const auto record_preparation_workers = [&](std::size_t workers) {
+            if (report) report->attention_preparation_workers = std::max(
+                report->attention_preparation_workers, workers);
+        };
+        std::vector<seal::Ciphertext> prepared_a(layer.tokens);
+        std::vector<AttentionLn2ExecutionReport> probability_reports(giant_steps);
+        std::size_t actual_workers = 0;
+        auto prepared = detail::ParallelRanges(giant_steps, he_workers, 1,
+            [&](std::size_t begin, std::size_t end) -> Result<void> {
+                seal::Evaluator evaluator(*context.context);
+                for (auto giant = begin; giant < end; ++giant) {
+                    auto *report = &probability_reports[giant];
+                    const auto diagonal_begin = giant * baby_steps;
+                    const auto valid_babies = std::min(
+                        baby_steps, layer.tokens - diagonal_begin);
+                    const auto complex_diagonals = (valid_babies + 1) / 2;
+                    const auto row_shift = diagonal_begin;
+                    const auto &source = probabilities.ciphertexts[
+                        tile.probability_begin + giant];
+                    auto main = Rotate(source, -static_cast<int>(
+                        row_shift), context, evaluator, report);
+                    std::optional<seal::Ciphertext> wrapped;
+                    if (row_shift != 0)
+                        wrapped = Rotate(source, static_cast<int>(
+                            (layer.tokens - row_shift)),
+                            context, evaluator, report);
+
+                    const bool paired = tile.lanes % 2 == 0;
+                    for (std::size_t first = 0; first < complex_diagonals;
+                         first += paired ? 2 : 1) {
+                        const auto selected = std::min<std::size_t>(
+                            paired ? 2 : 1, complex_diagonals - first);
+                        const auto &seed_masks = masks.seeds[giant][first / (paired ? 2 : 1)];
+                        seal::Ciphertext seed;
+                        evaluator.multiply_plain(main, *seed_masks.main, seed);
+                        if (report) ++report->ciphertext_plain_multiplications;
+                        if (wrapped) {
+                            seal::Ciphertext term;
+                            evaluator.multiply_plain(*wrapped, *seed_masks.wrap, term);
+                            evaluator.add_inplace(seed, term);
+                            if (report) ++report->ciphertext_plain_multiplications;
+                        }
+                        // Expand in place: select left/right from the seed position,
+                        // avoiding a separate alignment rotation and physical wrap.
+                        auto replicated = seed;
+                        std::size_t populated = paired ? 2 : 1;
+                        while (populated < tile.lanes) {
+                            auto copy = Rotate(replicated,
+                                static_cast<int>(ReplicationRotation(
+                                    first, populated, block)),
+                                context, evaluator, report);
+                            evaluator.add_inplace(replicated, copy);
+                            populated *= 2;
+                        }
+                        for (std::size_t local = 0; local < selected; ++local) {
+                            auto diagonal = replicated;
+                            if (paired) {
+                                evaluator.multiply_plain_inplace(diagonal, *masks.parity[local]);
+                                auto complement = Rotate(diagonal,
+                                    local == 0 ? -static_cast<int>(block)
+                                               : static_cast<int>(block),
+                                    context, evaluator, report);
+                                evaluator.add_inplace(diagonal, complement);
+                                if (report) ++report->ciphertext_plain_multiplications;
+                            }
+                            evaluator.rescale_to_next_inplace(diagonal);
+                            auto normalized = NormalizeScale(diagonal, prepared_a_scale);
+                            if (!normalized.ok()) return normalized.status();
+                            seal::Ciphertext conjugated;
+                            evaluator.complex_conjugate(
+                                diagonal, context.galois_keys, conjugated);
+                            const auto index = diagonal_begin + 2 * (first + local);
+                            evaluator.add(diagonal, conjugated, prepared_a[index]);
+                            if (index + 1 < diagonal_begin + valid_babies)
+                                evaluator.sub(diagonal, conjugated, prepared_a[index + 1]);
+                            // The odd diagonal is i*D. Step 2 folds -i into the
+                            // corresponding V mask, making their product D*V without
+                            // another plaintext multiplication or CKKS level.
+                            if (report) {
+                                ++report->rescales;
+                                ++report->conjugations;
+                            }
+                        }
+                    }
+                    report->attention_probability_rotations = report->rotations;
+                }
+                return {};
+            }, worker_bytes(8), &actual_workers);
+        if (!prepared.ok()) return prepared.status();
+        record_preparation_workers(actual_workers);
+        merge_reports(probability_reports);
+
+        // Bound retained V babies and recovered giants by processing value
+        // groups in batches. Within a batch, both babies and (value, giant)
+        // products are flat tasks, even when there is only one output group.
+        const auto batch_groups = std::max<std::size_t>(1, std::min({
+            tile.value_groups, std::max<std::size_t>(1, he_workers),
+            detail::HeWorkerPool::Instance().MemoryBudget() /
+                worker_bytes(baby_steps + giant_steps + 8)}));
+        for (std::size_t value_begin = 0; value_begin < tile.value_groups;
+             value_begin += batch_groups) {
+            const auto groups = std::min(batch_groups, tile.value_groups - value_begin);
+            std::vector<seal::Ciphertext> boundaries(groups);
+            std::vector<AttentionLn2ExecutionReport> boundary_reports(groups);
+            prepared = detail::ParallelRanges(groups, he_workers, 1,
+                [&](std::size_t begin, std::size_t end) -> Result<void> {
+                    seal::Evaluator evaluator(*context.context);
+                    if (baby_steps > 1)
+                        for (auto group = begin; group < end; ++group) {
+                            auto *report = &boundary_reports[group];
+                            boundaries[group] = Rotate(value.ciphertexts[
+                                tile.value_begin + value_begin + group],
+                                -static_cast<int>(layer.tokens), context, evaluator, report);
+                            report->attention_value_rotations = report->rotations;
+                        }
+                    return {};
+                }, worker_bytes(3), &actual_workers);
+            if (!prepared.ok()) return prepared.status();
+            record_preparation_workers(actual_workers);
+            merge_reports(boundary_reports);
+
+            std::vector<std::vector<seal::Ciphertext>> prepared_v(groups);
+            for (auto &babies : prepared_v) babies.resize(baby_steps);
+            std::vector<AttentionLn2ExecutionReport> baby_reports(groups * baby_steps);
+            prepared = detail::ParallelRanges(baby_reports.size(), he_workers, 1,
+                [&](std::size_t begin, std::size_t end) -> Result<void> {
+                    seal::Evaluator evaluator(*context.context);
+                    for (auto job = begin; job < end; ++job) {
+                        const auto group = job / baby_steps;
+                        const auto baby = job % baby_steps;
+                        auto *report = &baby_reports[job];
+                        const auto &source = value.ciphertexts[
+                            tile.value_begin + value_begin + group];
+                        seal::Ciphertext main;
+                        evaluator.multiply_plain(source, *masks.babies[baby].main, main);
+                        ++report->ciphertext_plain_multiplications;
+                        if (baby != 0) {
+                            seal::Ciphertext term;
+                            evaluator.multiply_plain(boundaries[group], *masks.babies[baby].wrap, term);
+                            evaluator.add_inplace(main, term);
+                            ++report->ciphertext_plain_multiplications;
+                        }
+                        main = Rotate(main, static_cast<int>(baby), context, evaluator, report);
+                        evaluator.rescale_to_next_inplace(main);
+                        auto normalized = NormalizeScale(main, target);
+                        if (!normalized.ok()) return normalized.status();
+                        ++report->rescales;
+                        report->attention_value_rotations = report->rotations;
+                        prepared_v[group][baby] = std::move(main);
+                    }
+                    return {};
+                }, worker_bytes(4), &actual_workers);
+            if (!prepared.ok()) return prepared.status();
+            record_preparation_workers(actual_workers);
+            merge_reports(baby_reports);
+            boundaries.clear();
+
+            // Preserve lazy relinearization: sum all babies of one giant
+            // before relinearizing, rescaling and applying recovery masks.
+            std::vector<std::vector<seal::Ciphertext>> recovered(groups);
+            for (auto &giants : recovered) giants.resize(giant_steps);
+            std::vector<AttentionLn2ExecutionReport> product_reports(groups * giant_steps);
+            auto multiplied = detail::ParallelRanges(product_reports.size(), he_workers, 1,
+                [&](std::size_t begin, std::size_t end) -> Result<void> {
+                    seal::Evaluator evaluator(*context.context);
+                    for (auto job = begin; job < end; ++job) {
+                        const auto group = job / giant_steps;
+                        const auto giant = job % giant_steps;
+                        auto *report = &product_reports[job];
+                        const auto diagonal_begin = giant * baby_steps;
+                        const auto valid_babies = std::min(baby_steps, layer.tokens - diagonal_begin);
+                        seal::Ciphertext partial;
+                        for (std::size_t baby = 0; baby < valid_babies; ++baby) {
+                            seal::Ciphertext product;
+                            evaluator.multiply(prepared_a[diagonal_begin + baby],
+                                               prepared_v[group][baby], product);
+                            if (baby == 0) partial = std::move(product);
+                            else evaluator.add_inplace(partial, product);
+                            ++report->ciphertext_multiplications;
+                        }
+                        evaluator.relinearize_inplace(partial, context.relinearization_keys);
+                        evaluator.rescale_to_next_inplace(partial);
+                        auto normalized = NormalizeScale(partial, target);
+                        if (!normalized.ok()) return normalized.status();
+                        ++report->relinearizations;
+                        ++report->rescales;
+                        const auto shift = static_cast<int>(diagonal_begin);
+                        auto main = Rotate(partial, shift, context, evaluator, report);
+                        evaluator.multiply_plain_inplace(main, *masks.recovery[giant].main);
+                        ++report->ciphertext_plain_multiplications;
+                        if (masks.recovery[giant].wrap) {
+                            auto wrapped = Rotate(partial, shift - static_cast<int>(layer.tokens),
+                                                  context, evaluator, report);
+                            evaluator.multiply_plain_inplace(wrapped, *masks.recovery[giant].wrap);
+                            evaluator.add_inplace(main, wrapped);
+                            ++report->ciphertext_plain_multiplications;
+                        }
+                        report->attention_recovery_rotations = report->rotations;
+                        recovered[group][giant] = std::move(main);
+                    }
+                    return {};
+                }, worker_bytes(8), &actual_workers);
+            if (!multiplied.ok()) return multiplied.status();
+            if (report) report->attention_product_workers = std::max(
+                report->attention_product_workers, actual_workers);
+            merge_reports(product_reports);
+            prepared_v.clear();
+
+            // Each output has a single writer and a fixed giant-order sum,
+            // so scheduling never changes the floating-point reduction order.
+            std::vector<AttentionLn2ExecutionReport> output_reports(groups);
+            auto reduced = detail::ParallelRanges(groups, he_workers, 1,
+                [&](std::size_t begin, std::size_t end) -> Result<void> {
+                    seal::Evaluator evaluator(*context.context);
+                    for (auto group = begin; group < end; ++group) {
+                        auto sum = std::move(recovered[group].front());
+                        for (std::size_t giant = 1; giant < giant_steps; ++giant)
+                            evaluator.add_inplace(sum, recovered[group][giant]);
+                        evaluator.rescale_to_next_inplace(sum);
+                        auto normalized = NormalizeScale(sum, target);
+                        if (!normalized.ok()) return normalized.status();
+                        ++output_reports[group].rescales;
+                        output[tile.value_begin + value_begin + group] = std::move(sum);
+                    }
+                    return {};
+                }, worker_bytes(3));
+            if (!reduced.ok()) return reduced.status();
+            merge_reports(output_reports);
         }
     }
 
@@ -838,14 +877,14 @@ Result<std::shared_ptr<const PreparedProjectionPlan>> CompileRealOutputBsgs(
                     const auto baby = CanonicalRotation(static_cast<long long>(i * stride),
                                                         context.slot_count());
                     if (nonzero) {
-                        auto encoded = CompileProjectionPlaintext(encoder, mask, input_id, plain_scale,
-                                                              "attention.wo.bsgs.diagonal", context);
+                        auto encoded = CompileModelPlaintext(encoder, mask, input_id, plain_scale,
+                                                              "attention.wo.bsgs.diagonal");
                         if (!encoded.ok()) return encoded.status();
                         group.terms.push_back({source, ComplexLane::kReal, baby, encoded.take_value()});
                     }
                     if (phase_nonzero) {
-                        auto encoded = CompileProjectionPlaintext(encoder, phase_mask, input_id, plain_scale,
-                                                              "attention.wo.bsgs.diagonal", context);
+                        auto encoded = CompileModelPlaintext(encoder, phase_mask, input_id, plain_scale,
+                                                              "attention.wo.bsgs.diagonal");
                         if (!encoded.ok()) return encoded.status();
                         group.phase_terms.push_back({source, ComplexLane::kReal, baby, encoded.take_value()});
                     }
@@ -2278,7 +2317,7 @@ SealSciAttentionLn2Executor::SealSciAttentionLn2Executor(
     const HeraConfig &config, const TransformerLayerConfig &layer,
     HeContextRegistry &contexts, SealCipherTensorStore &he_tensors,
     SealPlainParameterStore &parameters, CryptoTensorStore &mpc_tensors,
-    CkksMpcConverter &converter, MpcLayerNormRuntime &mpc,
+    BlbReferenceConverter &converter, MpcLayerNormRuntime &mpc,
     TensorIdAllocator *ids)
     : config_(config), layer_(layer), contexts_(contexts),
       he_tensors_(he_tensors), parameters_(parameters),
@@ -2380,7 +2419,6 @@ Result<AttentionLn2Outputs> SealSciAttentionLn2Executor::Evaluate(
     const AttentionLn2Inputs &inputs, const LayerWeightHandles &weights,
     AttentionLn2ExecutionReport *report)
 {
-    const auto started = Clock::now();
     try {
         if (report) *report = {};
         const auto *execution = FindLayerExecution(config_, layer_.id);
@@ -2469,6 +2507,7 @@ Result<AttentionLn2Outputs> SealSciAttentionLn2Executor::Evaluate(
 
         std::optional<SealCipherTensor> attention_tensor;
         if (contexts_.role() == PartyRole::kServer) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             if (!probability_he.value())
                 return Status::Internal(
                     "server did not receive Softmax CKKS ciphertexts");
@@ -2564,6 +2603,7 @@ Result<AttentionLn2Outputs> SealSciAttentionLn2Executor::Evaluate(
 
         std::optional<LayerNormStatisticsOutputs> statistics;
         if (contexts_.role() == PartyRole::kServer) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             std::shared_ptr<const SealCipherTensor> residual;
             if (layer_.attention_residual) {
                 auto loaded = he_tensors_.GetShared(inputs.attention_residual.id);
@@ -2711,10 +2751,6 @@ Result<AttentionLn2Outputs> SealSciAttentionLn2Executor::Evaluate(
         stored = mpc_tensors_.PutMpcShare(
             inverse_id, inverse.take_value());
         if (!stored.ok()) return stored.status();
-        if (report)
-            report->he_milliseconds += std::chrono::duration<double,
-                std::milli>(Clock::now() - started).count() -
-                report->conversion_milliseconds - report->mpc_milliseconds;
         return AttentionLn2Outputs{
             TensorHandle{centered_id, centered_spec},
             TensorHandle{inverse_id, inverse_spec},

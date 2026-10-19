@@ -16,6 +16,36 @@ struct NodeExecutionDiagnostic {
 
 struct ExecutionReport {
     std::vector<NodeExecutionDiagnostic> nodes;
+    // Disjoint computation intervals for this party. HE is explicitly timed;
+    // conversion includes its HE operations, transport and peer waiting;
+    // other nonlinear covers MPC calls. Work outside these intervals is
+    // recorded separately, never attributed to HE by subtraction.
+    struct CostBreakdown {
+        double he_computation_milliseconds{};
+        double he_mpc_conversion_milliseconds{};
+        double other_nonlinear_milliseconds{};
+        double local_overhead_milliseconds{};
+
+        double total_milliseconds() const noexcept
+        {
+            return he_computation_milliseconds + he_mpc_conversion_milliseconds +
+                   other_nonlinear_milliseconds;
+        }
+
+        double stage_milliseconds() const noexcept
+        {
+            return total_milliseconds() + local_overhead_milliseconds;
+        }
+
+        CostBreakdown &operator+=(const CostBreakdown &value) noexcept
+        {
+            he_computation_milliseconds += value.he_computation_milliseconds;
+            he_mpc_conversion_milliseconds += value.he_mpc_conversion_milliseconds;
+            other_nonlinear_milliseconds += value.other_nonlinear_milliseconds;
+            local_overhead_milliseconds += value.local_overhead_milliseconds;
+            return *this;
+        }
+    };
     struct StageMetrics {
         std::uint64_t communication_bytes{};
         std::uint64_t rounds{};
@@ -29,6 +59,10 @@ struct ExecutionReport {
         std::size_t layer_norm_he_workers{};
         std::size_t layer_norm_mpc_workers{};
         std::size_t gelu_mpc_workers{};
+        CostBreakdown costs;
+        // Bytes sent during this stage's online calls, after session setup.
+        std::uint64_t mpc_communication_bytes{};
+        std::uint64_t conversion_communication_bytes{};
     };
     struct Stage {
         std::size_t layer{};
@@ -43,6 +77,7 @@ struct ExecutionReport {
     double output_transfer_milliseconds{};
     std::uint64_t communication_bytes{};
     std::uint64_t rounds{};
+    CostBreakdown costs;
 };
 
 struct PreparationReport {

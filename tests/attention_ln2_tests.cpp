@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/attention_ln2.h"
 #include "hera/detail/packing_utils.h"
 #include "hera/detail/parallel_ranges.h"
@@ -382,7 +383,7 @@ void TestComplexProbabilityInputs(bool terminal_suffix = false)
                 "complex A input packing lost a probability component");
         hera::AttentionLn2ExecutionReport report;
         auto output = hera::MultiHeadAttentionValueKernel::Evaluate(
-            a_ct, v_ct, layer, server_context, &report, 2);
+            a_ct, v_ct, layer, server_context, &report, 8);
         Require(output.ok(), output.status().message());
         Require(MaxError(Decrypt(output.value(), client_context), expected) <
                     1e-4,
@@ -402,12 +403,19 @@ void TestComplexProbabilityInputs(bool terminal_suffix = false)
         {
             hera::ModelPlaintextCacheScope scope(&prepared, layer.id);
             hera::AttentionLn2ExecutionReport warm;
-            auto cached = hera::MultiHeadAttentionValueKernel::Evaluate(a_ct, v_ct, layer, server_context, &warm, 2);
+            auto cached = hera::MultiHeadAttentionValueKernel::Evaluate(a_ct, v_ct, layer, server_context, &warm, 8);
             Require(cached.ok(), cached.status().message());
             Require(MaxError(Decrypt(cached.value(), client_context), expected) < 1e-4 &&
                         prepared.encoded_plaintext_count() == mask_count &&
                         warm.attention_value_plaintext_encodings == 0,
                 "prepared AV changed numerics or encoded masks online");
+        }
+        if (layer.tokens == 1) {
+            auto unreported = hera::MultiHeadAttentionValueKernel::Evaluate(
+                a_ct, v_ct, layer, server_context, nullptr, 8);
+            Require(unreported.ok(), unreported.status().message());
+            Require(MaxError(Decrypt(unreported.value(), client_context), expected) < 1e-4,
+                    "AV without an execution report changed its result");
         }
         const auto tiles = (layer.q_heads +
                             client_context.slot_count() / hera::detail::TokenColumnStride(layer.tokens) - 1) /
@@ -432,6 +440,39 @@ void TestComplexProbabilityInputs(bool terminal_suffix = false)
                     "padded four-lane A*V no longer matches the 121-KS plan");
         }
         if (layer.tokens == 128) {
+            const auto same_counts = [&](const hera::AttentionLn2ExecutionReport &other) {
+                return report.rotations == other.rotations &&
+                    report.conjugations == other.conjugations &&
+                    report.ciphertext_plain_multiplications == other.ciphertext_plain_multiplications &&
+                    report.ciphertext_multiplications == other.ciphertext_multiplications &&
+                    report.relinearizations == other.relinearizations &&
+                    report.rescales == other.rescales &&
+                    report.attention_probability_rotations == other.attention_probability_rotations &&
+                    report.attention_value_rotations == other.attention_value_rotations &&
+                    report.attention_recovery_rotations == other.attention_recovery_rotations;
+            };
+            Require(report.attention_product_workers > output.value().ciphertexts.size() &&
+                        report.attention_preparation_workers > 1,
+                    "AV is still limited to output-group parallelism");
+            hera::AttentionLn2ExecutionReport serial_report;
+            auto serial = hera::MultiHeadAttentionValueKernel::Evaluate(
+                a_ct, v_ct, layer, server_context, &serial_report, 1);
+            Require(serial.ok(), serial.status().message());
+            Require(same_counts(serial_report) && MaxError(
+                        Decrypt(serial.value(), client_context), expected) < 1e-4,
+                    "AV serial schedule changed its result or operation counts");
+            auto &pool = hera::detail::HeWorkerPool::Instance();
+            const auto budget = pool.MemoryBudget();
+            pool.SetMemoryBudget(1);
+            hera::AttentionLn2ExecutionReport constrained;
+            auto limited = hera::MultiHeadAttentionValueKernel::Evaluate(
+                a_ct, v_ct, layer, server_context, &constrained, 8);
+            pool.SetMemoryBudget(budget);
+            Require(limited.ok(), limited.status().message());
+            Require(constrained.attention_preparation_workers == 1 &&
+                        constrained.attention_product_workers == 1 && same_counts(constrained) &&
+                        MaxError(Decrypt(limited.value(), client_context), expected) < 1e-4,
+                    "AV batching under a small budget changed the result or operation counts");
             Require(report.attention_probability_rotations == 166 &&
                         report.attention_value_rotations == 64 &&
                         report.attention_recovery_rotations == 12 &&
@@ -1399,8 +1440,8 @@ void RunIntegratedParty(
         auto transport = hera::MakeNetIoTransport(
             role, role == hera::PartyRole::kClient ? "127.0.0.1" : "",
             control_port);
-        hera::CkksMpcConverter converter(
-            role, {43, 13, 40, 20, true}, registry, transport,
+        hera::BlbReferenceConverter converter(
+            role, {43, 13, 40, 20, true,0,true,true}, registry, transport,
             hera::MakeDeterministicRandomSourceForTesting(
                 role == hera::PartyRole::kClient
                     ? std::vector<std::uint8_t>{11, 13, 17}
@@ -1699,9 +1740,11 @@ void TestSharedProfileStatistics(bool compact)
 
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
     try {
+        const bool he_only = argc == 2 && std::string(argv[1]) == "--he-only";
+        Require(argc == 1 || he_only, "usage: hera_attention_ln2_tests [--he-only]");
         TestPackingAndLevels();
         TestComplexProbabilityInputs();
         TestComplexProbabilityInputs(true);
@@ -1712,6 +1755,10 @@ int main()
         TestSevenPrimeDirectResidual();
         TestRealWoBsgsPackingVariants();
         TestParallelWoProjection();
+        if (he_only) {
+            std::cout << "ATTENTION_LN2_HE_STATUS=PASS\n";
+            return EXIT_SUCCESS;
+        }
         TestIntegratedExecutor();
         std::cout << "ATTENTION_LN2_HE_READY=YES\n"
                   << "ATTENTION_LN2_STATUS=PASS\n";

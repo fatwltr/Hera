@@ -152,8 +152,10 @@ inline std::size_t EstimatedHeWorkerBytes(std::size_t degree,
 template <typename Operation>
 Result<void> ParallelRanges(std::size_t count, std::size_t requested_workers,
                             std::size_t minimum_grain, Operation operation,
-                            std::size_t estimated_bytes_per_worker = 0)
+                            std::size_t estimated_bytes_per_worker = 0,
+                            std::size_t *actual_workers = nullptr)
 {
+    if (actual_workers) *actual_workers = 0;
     if (count == 0) return {};
     const auto grain = std::max<std::size_t>(1, minimum_grain);
     auto workers = std::max<std::size_t>(1, std::min(
@@ -163,6 +165,7 @@ Result<void> ParallelRanges(std::size_t count, std::size_t requested_workers,
             1, HeWorkerPool::Instance().MemoryBudget() /
                    estimated_bytes_per_worker));
     if (HeWorkerPool::OnWorkerThread()) workers = 1;
+    if (actual_workers) *actual_workers = workers;
     std::vector<Status> statuses(workers);
     std::vector<std::future<void>> futures;
     futures.reserve(workers - 1);

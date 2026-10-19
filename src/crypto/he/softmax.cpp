@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/softmax.h"
 #include "hera/detail/he_level.h"
 #include "hera/detail/he_packing.h"
@@ -1207,7 +1208,7 @@ Result<void> SealSciSoftmaxExecutor::Prepare(
 SealSciSoftmaxExecutor::SealSciSoftmaxExecutor(
     const HeraConfig &config, const TransformerLayerConfig &layer,
     HeContextRegistry &contexts, SealCipherTensorStore &he_tensors,
-    CryptoTensorStore &mpc_tensors, CkksMpcConverter &converter,
+    CryptoTensorStore &mpc_tensors, BlbReferenceConverter &converter,
     MpcSoftmaxRuntime &mpc, TensorIdAllocator *ids)
     : config_(config), layer_(layer), contexts_(contexts),
       he_tensors_(he_tensors), mpc_tensors_(mpc_tensors),

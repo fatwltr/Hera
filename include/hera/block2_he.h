@@ -2,7 +2,6 @@
 
 #include "hera/backend.h"
 #include "hera/he_context_registry.h"
-#include "hera/detail/projection_plaintext.h"
 
 #include <atomic>
 #include <complex>
@@ -169,7 +168,7 @@ struct PreparedProjectionTerm {
     std::size_t source_ct{};
     ComplexLane source_component{ComplexLane::kReal};
     int baby_rotation{};
-    ProjectionPlaintext plaintext;
+    std::shared_ptr<const seal::Plaintext> plaintext;
 };
 
 struct PreparedProjectionGroup {
@@ -282,14 +281,6 @@ public:
     // counts and levels but intentionally does not preserve model semantics.
     Result<void> ConfigureVirtualWeightPlaintexts(
         std::size_t templates_per_compatibility_group);
-    Result<void> ConfigureProjectionPlaintextMemory(std::size_t bytes);
-    std::size_t projection_resident_bytes() const;
-    std::size_t projection_spilled_bytes() const;
-    std::size_t projection_plaintext_loads() const;
-    Result<ProjectionPlaintext> PrepareProjectionPlaintext(
-        seal::CKKSEncoder &encoder, const std::vector<std::complex<double>> &values,
-        const seal::parms_id_type &parms_id, double scale, std::string_view kernel_tag,
-        std::shared_ptr<seal::SEALContext> context);
     void BeginPlaintextPreparation();
     void FreezePlaintextCache();
     void AbortPlaintextPreparation() noexcept;
@@ -345,8 +336,6 @@ private:
         staged_projections_;
     std::map<std::string, std::shared_ptr<const PreparedBlock2Program>>
         prepared_block2_programs_, staged_block2_programs_;
-    std::shared_ptr<ProjectionPlaintextCache> projection_plaintexts_, staged_projection_plaintexts_;
-    std::size_t projection_memory_budget_{256ULL << 20};
     bool preparing_plaintexts_{};
     bool plaintext_cache_frozen_{};
     std::size_t encoded_plaintext_bytes_{};
@@ -388,11 +377,6 @@ Result<seal::Plaintext> EncodeModelPlaintext(
     const seal::parms_id_type &parms_id, double scale,
     std::string_view kernel_tag);
 
-Result<ProjectionPlaintext> CompileProjectionPlaintext(
-    seal::CKKSEncoder &encoder, const std::vector<std::complex<double>> &values,
-    const seal::parms_id_type &parms_id, double scale, std::string_view kernel_tag,
-    const HeContext &context);
-
 struct Block2HeInputs {
     // centered uses real strict-column [tokens, model_width]; inverse_stddev
     // is a single real reduction [tokens,1] repeated in every feature column.
@@ -413,6 +397,8 @@ struct Block2ExecutionReport {
     std::size_t relinearizations{};
     std::size_t rescales{};
     std::vector<int> required_rotation_steps;
+    std::size_t qk_preparation_workers{};
+    std::size_t qk_product_workers{};
 };
 
 class Block2LevelPlanner {

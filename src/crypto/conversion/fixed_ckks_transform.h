@@ -43,6 +43,10 @@ public:
     // subject to the transform's existing statistical truncation contract.
     std::optional<int> EncodedCoefficientBoundBits(
         int slot_bound_bits, int guard_bits, int retained_precision_bits) const;
+    // Public coefficient contract -> reconstructed decoded fixed-point range.
+    // Uses the same root/rounding and statistical assumptions as Decode.
+    std::optional<int> DecodedSlotBoundBits(
+        int coefficient_bound_bits, int guard_bits, int scale_shift) const;
 
     std::size_t degree() const noexcept { return degree_; }
     std::size_t slot_count() const noexcept { return degree_ / 2; }

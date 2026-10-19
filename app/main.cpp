@@ -26,7 +26,6 @@ struct CliOptions {
     std::size_t mpc_workers{};
     std::size_t he_memory_mib{512};
     std::size_t projection_baby_steps{};
-    std::size_t plaintext_cache_mib{256};
     std::size_t stage_timeout_seconds{30};
     std::string seal_compression{"zstd"};
     std::uint64_t input_seed{1};
@@ -68,8 +67,6 @@ hera::Result<CliOptions> ParseCli(int argc, char **argv)
             options.conversion_batch_elements = std::stoul(argument.substr(std::string("--conversion-batch-elements=").size()));
         else if (argument.rfind("--mpc-workers=", 0) == 0)
             options.mpc_workers = std::stoul(argument.substr(14));
-        else if (argument.rfind("--plaintext-cache-mib=", 0) == 0)
-            options.plaintext_cache_mib = std::stoul(argument.substr(std::string("--plaintext-cache-mib=").size()));
         else if (argument.rfind("--projection-baby-steps=", 0) == 0)
             options.projection_baby_steps = std::stoul(argument.substr(std::string("--projection-baby-steps=").size()));
         else if (argument.rfind("--stage-timeout-seconds=", 0) == 0)
@@ -141,56 +138,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    std::cout << "HERA_CONFIG_STATUS=PASS\n"
-              << "HERA_LAYER_COUNT=" << context.value()->config().layers.size()
-              << "\nHERA_GRAPH_NODE_COUNT="
-              << context.value()->graph().nodes().size() << '\n';
-    for (const auto &entry : context.value()->config().he_parameter_profiles) {
-        std::cout << "HERA_HE_PROFILE=" << entry.first
-                  << ",N=" << entry.second.polynomial_degree
-                  << ",SCALE_BITS=" << entry.second.default_scale_bits
-                  << ",DECLARED_DEPTH=" << entry.second.declared_depth
-                  << ",SECURITY=" << hera::ToString(entry.second.security_level)
-                  << '\n';
-        if (entry.second.security_level == hera::SecurityLevel::kNone)
-            std::cout << "HERA_SECURITY_WARNING=" << entry.first
-                      << " uses security_level=none for research only\n";
-    }
-#ifdef HERA_SOFTMAX_TO_MPC_BUILT
-    std::cout << "SOFTMAX_TO_MPC_READY=YES\n";
-#else
-    std::cout << "SOFTMAX_TO_MPC_READY=NO\n";
-#endif
-#ifdef HERA_ATTENTION_LN2_BUILT
-    std::cout << "SOFTMAX_MPC_TO_HE_READY=YES\n"
-              << "SOFTMAX_AV_INTEGRATION_READY=YES\n"
-              << "ATTENTION_LN2_TO_MPC_READY=YES\n";
-#else
-    std::cout << "SOFTMAX_MPC_TO_HE_READY=NO\n"
-              << "SOFTMAX_AV_INTEGRATION_READY=NO\n"
-              << "ATTENTION_LN2_TO_MPC_READY=NO\n";
-#endif
-#ifdef HERA_FFN_GELU_BUILT
-    std::cout << "FFN_GELU_TO_MPC_READY=YES\n";
-#else
-    std::cout << "FFN_GELU_TO_MPC_READY=NO\n";
-#endif
-#ifdef HERA_BLOCK5_BRIDGE_BUILT
-    std::cout << "GELU_MPC_TO_HE_READY=YES\n"
-              << "FFN_WD_INTEGRATION_READY=YES\n"
-              << "FFN_RESIDUAL_DIRECT_ADD_READY=YES\n"
-              << "CROSS_LAYER_BLOCK2_READY=YES\n";
-#else
-    std::cout << "GELU_MPC_TO_HE_READY=NO\n"
-              << "FFN_WD_INTEGRATION_READY=NO\n"
-              << "FFN_RESIDUAL_DIRECT_ADD_READY=NO\n"
-              << "CROSS_LAYER_BLOCK2_READY=NO\n";
-#endif
-#ifdef HERA_PRIVATE_RUNTIME_BUILT
-    std::cout << "HERA_END_TO_END_READY=YES\n";
-#else
-    std::cout << "HERA_END_TO_END_READY=NO\n";
-#endif
+    if (options.value().party.empty() || options.value().dry_run)
+        std::cout << "HERA_CONFIG_STATUS=PASS\n"
+                  << "HERA_LAYER_COUNT=" << context.value()->config().layers.size()
+                  << "\nHERA_GRAPH_NODE_COUNT="
+                  << context.value()->graph().nodes().size() << '\n';
     if (options.value().dump_graph)
         std::cout << context.value()->graph().Dump();
     if (options.value().dry_run && !options.value().record_execution) {
@@ -217,7 +169,6 @@ int main(int argc, char **argv)
         runtime_options.weight_template_count =
             options.value().weight_template_count;
         runtime_options.warmup = options.value().warmup;
-        runtime_options.plaintext_cache_mib = options.value().plaintext_cache_mib;
         runtime_options.stage_timeout_seconds = options.value().stage_timeout_seconds;
         runtime_options.projection_baby_steps = options.value().projection_baby_steps;
         runtime_options.repeat = options.value().repeat;

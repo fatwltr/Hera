@@ -1,0 +1,9 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -239 +239 @@
+-        find_package(zstd 1 CONFIG)
++        find_package(zstd 1 MODULE)
+--- a/cmake/SEALConfig.cmake.in
++++ b/cmake/SEALConfig.cmake.in
+@@ -99,0 +100 @@
++        list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")

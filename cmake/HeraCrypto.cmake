@@ -5,7 +5,7 @@ if(NOT (HERA_ENABLE_CONVERSION OR HERA_ENABLE_HE))
 endif()
 
 if(HERA_ENABLE_CONVERSION)
-    # SCI's exported package performs a C-language RDSEED feature probe.
+    # SCI exports C/C++ dependencies.
     enable_language(C)
 endif()
 find_package(SEAL 4.4.5 EXACT CONFIG REQUIRED)
@@ -53,6 +53,12 @@ if(HERA_ENABLE_CONVERSION)
        "(^|\n)MPC_COMPARISON=CORRELATED_AND_V1(\n|$)")
         message(FATAL_ERROR "Rebuild HERA-SCI using scripts/bootstrap_dependencies.sh for correlated conversion comparisons")
     endif()
+    foreach(contract "MPC_OPENMP=DIRECTION_TASKS_V2" "RANDOM_SOURCE=OS_RANDOM_DEVICE"
+                     "EMP_SOURCE=VENDORED_HEADERS")
+        if(NOT HERA_SCI_MANIFEST_CONTENT MATCHES "(^|\n)${contract}(\n|$)")
+            message(FATAL_ERROR "Rebuild portable HERA-SCI using scripts/bootstrap_dependencies.sh: missing ${contract}")
+        endif()
+    endforeach()
     # This package's SilentOT facade is backed by FerretCOT. Keep the ABI
     # and exported USE_VOLE=1 definition together rather than switching only
     # application-side macros.
@@ -61,7 +67,7 @@ if(HERA_ENABLE_CONVERSION)
 
     add_library(hera_conversion STATIC
         ${HERA_CRYPTO_ROOT}/conversion/wide_ring.cpp
-        ${HERA_CRYPTO_ROOT}/conversion/wide_b2a.cpp
+        ${HERA_CRYPTO_ROOT}/conversion/bounded_carry.cpp
         ${HERA_CRYPTO_ROOT}/conversion/conversion_types.cpp
         ${HERA_CRYPTO_ROOT}/conversion/random_source.cpp
         ${HERA_CRYPTO_ROOT}/conversion/random_sampling.cpp
@@ -69,7 +75,9 @@ if(HERA_ENABLE_CONVERSION)
         ${HERA_CRYPTO_ROOT}/conversion/netio_transport.cpp
         ${HERA_CRYPTO_ROOT}/conversion/protocol_wire.cpp
         ${HERA_CRYPTO_ROOT}/conversion/fixed_ckks_transform.cpp
-        ${HERA_CRYPTO_ROOT}/conversion/ckks_mpc_converter.cpp
+        ${HERA_CRYPTO_ROOT}/conversion/blb_ring_protocol.cpp
+        ${HERA_CRYPTO_ROOT}/conversion/blb_encoding.cpp
+        ${HERA_CRYPTO_ROOT}/conversion/blb_reference.cpp
         ${HERA_CRYPTO_ROOT}/conversion/conversion_backend.cpp)
     hera_configure_target(hera_conversion WIDE_INTEGER)
     target_include_directories(hera_conversion PRIVATE
@@ -151,4 +159,14 @@ if(HERA_ENABLE_BLOCK5_BRIDGE)
         ${PROJECT_SOURCE_DIR}/app/private_runtime_cli.cpp)
     target_link_libraries(hera_private_inference PRIVATE hera_private_runtime)
 
+endif()
+
+if(TARGET hera_conversion)
+    add_executable(hera_blb_reference_benchmark EXCLUDE_FROM_ALL
+        ${PROJECT_SOURCE_DIR}/tests/blb_reference_benchmark.cpp)
+    hera_configure_target(hera_blb_reference_benchmark WIDE_INTEGER)
+    target_include_directories(hera_blb_reference_benchmark PRIVATE ${HERA_CRYPTO_ROOT}/conversion)
+    target_compile_definitions(hera_blb_reference_benchmark PRIVATE
+        HERA_BENCH_CONFIG_PATH="${PROJECT_SOURCE_DIR}/configs/bert_base_single_layer_seq128.json")
+    target_link_libraries(hera_blb_reference_benchmark PRIVATE hera_conversion)
 endif()

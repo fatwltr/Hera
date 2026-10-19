@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hera/blb_reference.h"
+
 #include "hera/attention_ln2.h"
 
 #include <atomic>
@@ -190,7 +192,7 @@ public:
         HeContextRegistry &contexts,
         SealPlainParameterStore &parameters,
         CryptoTensorStore &tensors,
-        CkksMpcConverter &converter,
+        BlbReferenceConverter &converter,
         MpcGeluRuntime &mpc,
         TensorIdAllocator *ids = nullptr,
         SealCipherTensorStore *he_tensors = nullptr);
@@ -210,7 +212,7 @@ private:
     HeContextRegistry &contexts_;
     SealPlainParameterStore &parameters_;
     CryptoTensorStore &tensors_;
-    CkksMpcConverter &converter_;
+    BlbReferenceConverter &converter_;
     MpcGeluRuntime &mpc_;
     TensorIdAllocator *ids_{};
     SealCipherTensorStore *he_tensors_{};

@@ -22,6 +22,29 @@ command -v git >/dev/null 2>&1 || {
 source "$repo_root/dependencies.lock"
 mkdir -p "$src_root"
 
+# Older HERA recipes applied this exact patch to the download itself. Only
+# undo a byte-for-byte match of that generated change; preserve user edits.
+restore_legacy_seal_patch() {
+  local destination=$1
+  local expected_status=$' M native/src/seal/evaluator.cpp\n M native/src/seal/evaluator.h'
+  [[ "$(git -C "$destination" status --porcelain)" == "$expected_status" &&
+     "$(git -C "$destination" rev-parse HEAD)" == "$SEAL_COMMIT" ]] || return 0
+  local comparison
+  comparison=$(mktemp -d)
+  mkdir -p "$comparison/native/src/seal"
+  for file in evaluator.cpp evaluator.h; do
+    git -C "$destination" show "HEAD:native/src/seal/$file" \
+      > "$comparison/native/src/seal/$file"
+  done
+  if patch --silent -d "$comparison" -p1 < "$script_dir/seal_rotation_hoisting.patch" &&
+     cmp -s "$comparison/native/src/seal/evaluator.cpp" "$destination/native/src/seal/evaluator.cpp" &&
+     cmp -s "$comparison/native/src/seal/evaluator.h" "$destination/native/src/seal/evaluator.h"; then
+    echo "Restoring the pinned SEAL checkout from the legacy generated HERA patch"
+    git -C "$destination" apply --reverse "$script_dir/seal_rotation_hoisting.patch"
+  fi
+  rm -rf -- "$comparison"
+}
+
 checkout_pinned() {
   local name=$1
   local repository=$2
@@ -33,14 +56,18 @@ checkout_pinned() {
       echo "Refusing non-git dependency path: $destination" >&2
       exit 2
     }
-    git clone --filter=blob:none "$repository" "$destination"
+    git init --quiet "$destination"
+    git -C "$destination" remote add origin "$repository"
   fi
 
+  if [[ "$name" == seal ]]; then
+    restore_legacy_seal_patch "$destination"
+  fi
   if [[ -n "$(git -C "$destination" status --porcelain)" ]]; then
     echo "Dependency checkout has local changes: $destination" >&2
     exit 2
   fi
-  if [[ "$(git -C "$destination" rev-parse HEAD)" != "$commit" ]]; then
+  if [[ "$(git -C "$destination" rev-parse --verify HEAD 2>/dev/null || true)" != "$commit" ]]; then
     git -C "$destination" fetch --depth 1 origin "$commit"
     git -C "$destination" checkout --detach "$commit"
   fi

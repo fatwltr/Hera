@@ -44,7 +44,7 @@ std::size_t Product(std::size_t a, std::size_t b)
 struct Options {
     std::string op, projection{"wq"}, config{HERA_DEFAULT_CONFIG_PATH};
     std::size_t layer{}, threads{1}, warmup{1}, repeat{3};
-    std::size_t memory_mib{512}, cache_mib{256};
+    std::size_t memory_mib{512};
     bool virtual_weights{};
 };
 
@@ -54,7 +54,7 @@ void Usage()
               << "  --projection=wq|wk|wv|wo|wu|wd  XW only; default wq\n"
               << "  --layer=0 --threads=1 --warmup=1 --repeat=3\n"
               << "  --weight-mode=materialized|virtual  XW only; default materialized\n"
-              << "  --he-memory-mib=512 --plaintext-cache-mib=256\n"
+              << "  --he-memory-mib=512\n"
               << "Dimensions, HE profiles and input levels follow the selected layer.\n"
               << "KS = rotations + conjugations + relinearizations, per invocation.\n";
 }
@@ -89,7 +89,6 @@ Options Parse(int argc, char **argv)
             else if (name == "--warmup") o.warmup = n;
             else if (name == "--repeat") o.repeat = n;
             else if (name == "--he-memory-mib") o.memory_mib = n;
-            else if (name == "--plaintext-cache-mib") o.cache_mib = n;
             else throw std::runtime_error("unknown option: " + name);
         }
     }
@@ -359,9 +358,8 @@ double Reference(std::size_t index, const Options &o, const Plan &p, const Fixtu
 
 void Run(const Options &o)
 {
-    const auto setup_start = Clock::now();
-    const auto p = MakePlan(o);
     hera::detail::HeWorkerPool::Instance().SetMemoryBudget(Product(o.memory_mib, 1ULL << 20));
+    const auto p = MakePlan(o);
     hera::HeContextRegistry client, server;
     Check(client.CreateClientProfiles(p.config, o.op != "xw"));
     Check(client.CompileRotationKeys(p.profile, p.rotations));
@@ -377,9 +375,7 @@ void Run(const Options &o)
     auto elapsed = [](Clock::time_point start) {
         return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     };
-    const double setup_ms = elapsed(setup_start);
     hera::SealPlainParameterStore cache;
-    Check(cache.ConfigureProjectionPlaintextMemory(Product(o.cache_mib, 1ULL << 20)));
     if (o.virtual_weights) Check(cache.ConfigureVirtualWeightPlaintexts(1));
     auto evaluate = [&](Counts &counts) -> hera::Result<Tensor> {
         hera::ModelPlaintextCacheScope scope(&cache, p.layer.id);
@@ -410,7 +406,6 @@ void Run(const Options &o)
         }
         return result;
     };
-    const auto prepare_start = Clock::now();
     cache.BeginPlaintextPreparation();
     {
         hera::ModelPlaintextCacheScope scope(&cache, p.layer.id);
@@ -419,11 +414,8 @@ void Run(const Options &o)
         else { Counts unused; Take(evaluate(unused)); }
     }
     cache.FreezePlaintextCache();
-    const double prepare_ms = elapsed(prepare_start);
     const auto prepared_count = cache.encoded_plaintext_count();
-    const auto warmup_start = Clock::now();
     for (std::size_t i = 0; i < o.warmup; ++i) { Counts unused; Take(evaluate(unused)); }
-    const double warmup_ms = elapsed(warmup_start);
     Counts operations;
     Tensor output;
     std::vector<double> samples;
@@ -437,8 +429,6 @@ void Run(const Options &o)
         if (i != 0) Require(SameCounts(counts, operations), "operation counts changed between repetitions");
         operations = counts;
         samples.push_back(ms);
-        std::cout << "HERA_SAMPLE_" << i << "_MS=" << ms << '\n'
-                  << "HERA_SAMPLE_" << i << "_KS=" << Ks(counts) << '\n';
     }
     Require(cache.encoded_plaintext_count() == prepared_count, "online evaluation encoded new plaintexts");
     Check(output.Validate(cc));
@@ -464,60 +454,12 @@ void Run(const Options &o)
                 "executed QK KS differs from its plan");
     }
     const double mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
-    std::sort(samples.begin(), samples.end());
-    const auto mid = samples.size() / 2;
-    const double median = samples.size() % 2 ? samples[mid] : (samples[mid - 1] + samples[mid]) / 2;
     std::cout << std::fixed << std::setprecision(3)
-              << "HERA_BENCHMARK=" << o.op << '\n'
-              << "HERA_XW_PROJECTION=" << (o.op == "xw" ? o.projection : "N/A") << '\n'
-              << "HERA_CONFIG=" << o.config << '\n'
-              << "HERA_LAYER=" << p.layer.id << '\n'
-              << "HERA_TOKENS=" << p.layer.tokens << '\n'
-              << "HERA_MODEL_WIDTH=" << p.layer.model_width << '\n'
-              << "HERA_Q_HEADS=" << p.layer.q_heads << '\n'
-              << "HERA_KV_HEADS=" << p.layer.kv_heads << '\n'
-              << "HERA_QK_HEAD_WIDTH=" << p.layer.qk_head_width << '\n'
-              << "HERA_VALUE_HEAD_WIDTH=" << p.layer.value_head_width << '\n'
-              << "HERA_FFN_WIDTH=" << p.layer.ffn_width << '\n'
-              << "HERA_PROFILE=" << p.profile << '\n'
-              << "HERA_POLYNOMIAL_DEGREE=" << sc.parameters.polynomial_degree << '\n'
-              << "HERA_SECURITY_LEVEL=" << hera::ToString(sc.parameters.security_level) << '\n'
-              << "HERA_THREADS=" << o.threads << '\n'
-              << "HERA_HE_POOL_THREADS=" << hera::detail::HeWorkerPool::Instance().WorkerThreadCount() << '\n'
-              << "HERA_INPUT_LEVEL=" << p.level << '\n'
-              << "HERA_OUTPUT_LEVEL=" << *output.logical_spec.planned_level << '\n'
-              << "HERA_INPUT_SCALE_BITS=" << p.scale_bits << '\n'
-              << "HERA_OUTPUT_SCALE_BITS=" << *output.logical_spec.planned_scale_bits << '\n'
-              << "HERA_FIRST_INPUT_CIPHERTEXTS=" << f.first.ciphertexts.size() << '\n'
-              << "HERA_SECOND_INPUT_CIPHERTEXTS=" << f.second.ciphertexts.size() << '\n'
-              << "HERA_OUTPUT_CIPHERTEXTS=" << output.ciphertexts.size() << '\n'
-              << "HERA_SETUP_MS=" << setup_ms << '\n'
-              << "HERA_PREPARE_MS=" << prepare_ms << '\n'
-              << "HERA_WARMUP=" << o.warmup << '\n'
-              << "HERA_WARMUP_MS=" << warmup_ms << '\n'
-              << "HERA_REPEAT=" << o.repeat << '\n'
-              << "HERA_MEAN_MS=" << mean << '\n'
-              << "HERA_MEDIAN_MS=" << median << '\n'
-              << "HERA_MIN_MS=" << samples.front() << '\n'
-              << "HERA_MAX_MS=" << samples.back() << '\n'
-              << "HERA_ROTATIONS=" << operations.rotations << '\n'
-              << "HERA_CONJUGATIONS=" << operations.conjugations << '\n'
-              << "HERA_RELINEARIZATIONS=" << operations.relinearizations << '\n'
+              << "HERA_BENCHMARK=" << o.op
+              << (o.op == "xw" ? "." + o.projection : "") << '\n'
               << "HERA_KS_PER_RUN=" << Ks(operations) << '\n'
-              << "HERA_KS_MEASURED_TOTAL=" << Product(Ks(operations), o.repeat) << '\n'
-              << "HERA_ROTATION_KEY_COUNT=" << sc.galois_keys.size() << '\n'
-              << "HERA_CT_CT_MULTIPLICATIONS=" << operations.ciphertext_multiplications << '\n'
-              << "HERA_CT_PLAIN_MULTIPLICATIONS=" << operations.ciphertext_plain_multiplications << '\n'
-              << "HERA_RESCALES=" << operations.rescales << '\n'
-              << "HERA_WEIGHT_MODE=" << (o.op != "xw" ? "N/A" : (o.virtual_weights ? "VIRTUAL" : "MATERIALIZED")) << '\n'
-              << "HERA_PREPARED_PLAINTEXTS=" << prepared_count << '\n'
-              << "HERA_PROJECTION_SPILLED_BYTES=" << cache.projection_spilled_bytes() << '\n'
-              << "HERA_ORACLE_CHECK=" << (o.virtual_weights ? "SKIPPED_VIRTUAL_WEIGHTS" : "PASS") << '\n'
-              << "HERA_ORACLE_CHECKED_VALUES=" << checked << '\n'
-              << "HERA_ORACLE_MAX_ABS_ERROR=";
-    if (o.virtual_weights) std::cout << "N/A\n";
-    else std::cout << std::scientific << error << '\n';
-    std::cout << "HERA_BENCHMARK_STATUS=PASS\n";
+              << "HERA_MEAN_MS=" << mean << '\n'
+              << "HERA_BENCHMARK_STATUS=PASS\n";
 }
 } // namespace
 

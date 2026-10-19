@@ -1,7 +1,7 @@
 #pragma once
 
 #include "hera/backend.h"
-#include "hera/conversion.h"
+#include "hera/blb_reference.h"
 
 #include <map>
 #include <atomic>
@@ -45,13 +45,13 @@ private:
     std::map<Key, PhysicalSlotMap> maps_;
 };
 
-// Graph adapter for CkksMpcConverter. HeToMpc compacts the physical real/imag
+// Graph adapter for BlbReferenceConverter. HeToMpc compacts the physical real/imag
 // planes into one logical arithmetic-share tensor; MpcToHe scatters it back
 // according to the target HE producer's PhysicalSlotMap.
 class SealSciConversionBackend final : public IConversionBackend {
 public:
     SealSciConversionBackend(PartyRole role, HeContextRegistry &contexts,
-                             CkksMpcConverter &converter,
+                             BlbReferenceConverter &converter,
                              CryptoTensorStore &store,
                              ConversionPackingRegistry &packing);
 
@@ -67,7 +67,7 @@ public:
 private:
     PartyRole role_;
     HeContextRegistry &contexts_;
-    CkksMpcConverter &converter_;
+    BlbReferenceConverter &converter_;
     CryptoTensorStore &store_;
     ConversionPackingRegistry &packing_;
     std::atomic<TensorId> next_id_{2000000};

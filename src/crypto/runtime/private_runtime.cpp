@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/private_runtime.h"
 #include "hera/detail/he_level.h"
 #include "hera/detail/level_schedule.h"
@@ -35,11 +36,17 @@ void AppendStage(ExecutionReport *report, std::size_t layer,
                   << " status=" << (status.ok() ? "OK" : status.message())
                   << '\n';
     if (!report) return;
+    const auto milliseconds = std::chrono::duration<double, std::milli>(
+        Clock::now() - started).count();
+    // Preserve explicit, nonoverlapping HE/conversion/MPC intervals. Local
+    // planning, share packing and tensor bookkeeping stay outside HE.
+    metrics.costs.local_overhead_milliseconds = milliseconds -
+        metrics.costs.total_milliseconds();
     report->communication_bytes += metrics.communication_bytes;
     report->rounds += metrics.rounds;
+    report->costs += metrics.costs;
     report->stages.push_back({layer, std::move(name),
-        std::chrono::duration<double, std::milli>(Clock::now() - started).count(),
-        status, std::move(metrics)});
+        milliseconds, status, std::move(metrics)});
 }
 
 ExecutionReport::StageMetrics Metrics(const PreLnEntryExecutionReport &value,
@@ -53,7 +60,9 @@ ExecutionReport::StageMetrics Metrics(const PreLnEntryExecutionReport &value,
             value.block2.ciphertext_multiplications + value.statistics.ciphertext_multiplications,
             value.block2.relinearizations + value.statistics.relinearizations,
             value.block2.rescales + value.statistics.rescales, tokens,
-            value.statistics.layer_norm_workers, value.statistics.reciprocal_sqrt_workers};
+            value.statistics.layer_norm_workers, value.statistics.reciprocal_sqrt_workers,
+            0, {value.he_milliseconds, value.conversion_milliseconds, value.mpc_milliseconds},
+            value.statistics.mpc_communication_bytes, value.conversion_communication_bytes};
 }
 
 ExecutionReport::StageMetrics Metrics(const SoftmaxExecutionReport &value)
@@ -65,7 +74,10 @@ ExecutionReport::StageMetrics Metrics(const SoftmaxExecutionReport &value)
             value.rotations, value.ciphertext_plain_multiplications,
             value.ciphertext_multiplications, value.relinearizations,
             value.rescales, value.comparisons + value.muxes + value.row_sums +
-                value.reciprocals + value.secure_multiplications};
+                value.reciprocals + value.secure_multiplications,
+            0, 0, 0, {value.he_milliseconds, value.ckks_to_mpc_milliseconds +
+                value.mpc_to_ckks_milliseconds, value.mpc_milliseconds},
+            value.mpc_communication_bytes, value.conversion_communication_bytes};
 }
 
 ExecutionReport::StageMetrics Metrics(
@@ -78,7 +90,9 @@ ExecutionReport::StageMetrics Metrics(
             value.rotations, value.ciphertext_plain_multiplications,
             value.ciphertext_multiplications, value.relinearizations,
             value.rescales, value.reciprocal_square_roots,
-            value.layer_norm_workers, value.reciprocal_sqrt_workers};
+            value.layer_norm_workers, value.reciprocal_sqrt_workers,
+            0, {value.he_milliseconds, value.conversion_milliseconds, value.mpc_milliseconds},
+            value.mpc_communication_bytes, value.conversion_communication_bytes};
 }
 
 ExecutionReport::StageMetrics Metrics(const FfnGeluExecutionReport &value)
@@ -89,17 +103,22 @@ ExecutionReport::StageMetrics Metrics(const FfnGeluExecutionReport &value)
             value.ckks_to_mpc_calls + value.mpc_to_ckks_calls,
             value.rotations, value.ciphertext_plain_multiplications,
             value.ciphertext_multiplications, value.relinearizations,
-            value.rescales, value.comparisons + value.muxes, 0, 0, value.mpc_workers};
+            value.rescales, value.comparisons + value.muxes, 0, 0, value.mpc_workers,
+            {value.he_milliseconds, value.conversion_milliseconds, value.mpc_milliseconds},
+            value.mpc_communication_bytes, value.conversion_communication_bytes};
 }
 
 ExecutionReport::StageMetrics Metrics(
     const Block5BridgeExecutionReport &value)
 {
-    return {value.conversion_communication_bytes, value.conversion_rounds,
+    return {value.conversion_communication_bytes + value.layer_norm.mpc_communication_bytes,
+            value.conversion_rounds + value.layer_norm.mpc_rounds,
             value.ckks_to_mpc_calls + value.mpc_to_ckks_calls,
             value.he.rotations, value.he.ciphertext_plain_multiplications,
             value.he.ciphertext_multiplications, value.he.relinearizations,
-            value.he.rescales, 0};
+            value.he.rescales, 0, 0, 0, 0,
+            {value.he_milliseconds, value.conversion_milliseconds, value.layer_norm.mpc_milliseconds},
+            value.layer_norm.mpc_communication_bytes, value.conversion_communication_bytes};
 }
 
 Result<void> ValidateRuntimeConfig(const HeraConfig &config)
@@ -191,7 +210,7 @@ private:
 SealSciTransformerRuntime::SealSciTransformerRuntime(
     const HeraConfig &config, HeContextRegistry &contexts,
     RuntimeTensorArena &arena, SealPlainParameterStore &parameters,
-    CkksMpcConverter &converter, MpcSoftmaxRuntime &softmax_mpc,
+    BlbReferenceConverter &converter, MpcSoftmaxRuntime &softmax_mpc,
     MpcLayerNormRuntime &layer_norm_mpc, MpcGeluRuntime &gelu_mpc,
     RuntimeCoordinator *coordinator,
     std::shared_ptr<const CompiledTransformerExecutionPlan> plan)
@@ -563,6 +582,7 @@ Result<TensorHandle> SealSciTransformerRuntime::Evaluate(
         report->online_milliseconds = 0.0;
         report->communication_bytes = 0;
         report->rounds = 0;
+        report->costs = {};
     }
     const auto online_started = Clock::now();
     TensorHandle hidden = input;

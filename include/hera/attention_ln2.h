@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hera/blb_reference.h"
+
 #include "hera/softmax.h"
 
 #include <memory>
@@ -56,6 +58,9 @@ struct AttentionLn2ExecutionReport {
     std::size_t wo_giant_rotations{};
     std::size_t wo_output_conjugations{};
     std::size_t wo_phase_multiplications{};
+    // Peak actual concurrency of the A/V preparation and giant products.
+    std::size_t attention_preparation_workers{};
+    std::size_t attention_product_workers{};
 };
 
 struct AttentionValuePlan {
@@ -229,7 +234,7 @@ public:
         SealCipherTensorStore &he_tensors,
         SealPlainParameterStore &parameters,
         CryptoTensorStore &mpc_tensors,
-        CkksMpcConverter &converter,
+        BlbReferenceConverter &converter,
         MpcLayerNormRuntime &mpc,
         TensorIdAllocator *ids = nullptr);
 
@@ -252,7 +257,7 @@ private:
     SealCipherTensorStore &he_tensors_;
     SealPlainParameterStore &parameters_;
     CryptoTensorStore &mpc_tensors_;
-    CkksMpcConverter &converter_;
+    BlbReferenceConverter &converter_;
     MpcLayerNormRuntime &mpc_;
     TensorIdAllocator *ids_{};
     std::atomic<TensorId> next_id_{7000000};

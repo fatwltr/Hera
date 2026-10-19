@@ -1,4 +1,6 @@
+#include "hera/blb_reference.h"
 #include "hera/ffn_gelu.h"
+#include "hera/detail/scoped_wall_timer.h"
 #include "hera/detail/he_level.h"
 #include "hera/detail/he_packing.h"
 #include "hera/detail/mpc_session_internal.h"
@@ -149,7 +151,8 @@ Result<MpcShareTensor> CompactSegment(
         output[logical] = value;
     }
     return MpcShareTensor{std::move(output), std::move(shape),
-                          physical.real.numeric, ComplexComponent::kReal};
+                          physical.real.numeric, ComplexComponent::kReal,
+                          physical.real.public_value_bound_bits};
 }
 
 int CanonicalRotation(long long value, std::size_t slots)
@@ -841,8 +844,8 @@ Result<SealCipherTensor> ComplexColumnProjectionKernel::Evaluate(
                             }
                         }
                         if (!nonzero) continue;
-                        auto encoded = CompileProjectionPlaintext(encoder, mask, input_id,
-                            plain_scale, "ffn.projection.diagonal", context);
+                        auto encoded = CompileModelPlaintext(encoder, mask, input_id,
+                            plain_scale, "ffn.projection.diagonal");
                         if (!encoded.ok()) return encoded.status();
                         PreparedProjectionTerm term{source,
                             split.raw_complex || component == 0 ? ComplexLane::kReal : ComplexLane::kImaginary,
@@ -1393,8 +1396,12 @@ public:
                 auto values = local.EvaluateRange(input, negative, positive, threshold, begin, end);
                 std::copy(values.begin(), values.end(), output.begin() + begin);
             });
+        std::optional<int> output_bound;
+        if (input.public_value_bound_bits && negative.public_value_bound_bits && positive.public_value_bound_bits)
+            output_bound = std::max({*input.public_value_bound_bits,
+                *negative.public_value_bound_bits, *positive.public_value_bound_bits});
         return MpcShareTensor{std::move(output), input.physical_shape,
-                             input.numeric, ComplexComponent::kReal};
+                             input.numeric, ComplexComponent::kReal, output_bound};
     }
 
     std::uint64_t communication() const
@@ -1490,7 +1497,7 @@ SealSciFfnGeluExecutor::SealSciFfnGeluExecutor(
     HeContextRegistry &contexts,
     SealPlainParameterStore &parameters,
     CryptoTensorStore &tensors,
-    CkksMpcConverter &converter,
+    BlbReferenceConverter &converter,
     MpcGeluRuntime &mpc,
     TensorIdAllocator *ids,
     SealCipherTensorStore *he_tensors)
@@ -1544,7 +1551,6 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
     const LayerWeightHandles &weights,
     FfnGeluExecutionReport *report)
 {
-    const auto started = Clock::now();
     try {
         if (report) *report = {};
         if (layer_.activation != ActivationKind::kGelu)
@@ -1675,6 +1681,7 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
         std::optional<SealCipherTensor> normalized_residual;
         std::optional<GeluPolynomialOutputs> polynomials;
         if (contexts_.role() == PartyRole::kServer) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             if (!converted.value() || converted.value()->ciphertexts.size() != centered_cts + 1)
                 return Status::Internal(
                     "server did not receive FFN MPC-to-CKKS outputs");
@@ -1801,6 +1808,7 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
         }
         std::optional<SealCipherBatch> batch;
         if (contexts_.role() == PartyRole::kServer) {
+            detail::ScopedWallTimer he_timer(report ? &report->he_milliseconds : nullptr);
             std::vector<seal::Ciphertext> ciphertexts;
             const auto paired_count = (polynomials->input.ciphertexts.size() + 1) / 2;
             ciphertexts.resize(paired_count);
@@ -1893,10 +1901,6 @@ Result<FfnGeluOutputs> SealSciFfnGeluExecutor::Evaluate(
             if (!stored.ok()) return stored.status();
             residual_handle = TensorHandle{residual_id, residual_spec};
         }
-        if (report)
-            report->he_milliseconds += std::chrono::duration<double,
-                std::milli>(Clock::now() - started).count() -
-                report->conversion_milliseconds - report->mpc_milliseconds;
         return FfnGeluOutputs{TensorHandle{id, spec}, residual_handle, he_residual_handle};
     } catch (const std::exception &error) {
         return Status::Internal(std::string("FFN/GeLU stage failed: ") +

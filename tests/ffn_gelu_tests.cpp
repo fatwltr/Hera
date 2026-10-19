@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/ffn_gelu.h"
 #include "hera/mpc_session.h"
 
@@ -478,32 +479,47 @@ void TestHeKernels()
             "Wu numerical error exceeds 5e-3");
 
     {
-        hera::SealPlainParameterStore bounded;
-        Require(bounded.ConfigureProjectionPlaintextMemory(1).ok(), "spill budget configuration failed");
-        bounded.BeginPlaintextPreparation();
+        hera::SealPlainParameterStore resident;
+        resident.BeginPlaintextPreparation();
         {
-            hera::ModelPlaintextCacheScope scope(&bounded, "bounded-wu");
+            hera::ModelPlaintextCacheScope scope(&resident, "resident-wu");
             auto ready = hera::FfnUpProjectionKernel::Evaluate(normalized.value(), wu_parameter,
                 bu_parameter, layer, server_context);
             Require(ready.ok(), ready.status().message());
         }
-        bounded.FreezePlaintextCache();
-        Require(bounded.projection_resident_bytes() <= 1 && bounded.projection_spilled_bytes() > 0,
-            "projection cache did not respect its resident budget");
+        resident.FreezePlaintextCache();
+        const auto encoded_count = resident.encoded_plaintext_count();
+        auto plan = resident.GetPreparedProjection("resident-wu/ffn/Wu");
+        Require(encoded_count > 0 && plan.ok(), "projection plaintexts were not prepared");
         {
-            hera::ModelPlaintextCacheScope scope(&bounded, "bounded-wu");
+            hera::ModelPlaintextCacheScope scope(&resident, "resident-wu");
             auto result = hera::FfnUpProjectionKernel::Evaluate(normalized.value(), wu_parameter,
                 bu_parameter, layer, server_context, nullptr, 2);
             Require(result.ok(), result.status().message());
             Require(MaxError(Decrypt(result.value(), client_context), expected_projected) < 5e-3 &&
-                        bounded.projection_plaintext_loads() > 0 && bounded.projection_resident_bytes() <= 1,
-                "spill/reload changed Wu values or exceeded the resident budget");
+                        resident.encoded_plaintext_count() == encoded_count,
+                "resident projection changed Wu values or encoded plaintexts online");
         }
-        // A new transaction must not invalidate a live immutable plan.
-        bounded.BeginPlaintextPreparation();
-        bounded.AbortPlaintextPreparation();
-        Require(bounded.projection_resident_bytes() <= 1,
-            "aborting Prepare invalidated the frozen projection cache");
+        resident.BeginPlaintextPreparation();
+        resident.AbortPlaintextPreparation();
+        auto restored = resident.GetPreparedProjection("resident-wu/ffn/Wu");
+        Require(restored.ok() && restored.value() == plan.value() &&
+                    resident.encoded_plaintext_count() == encoded_count,
+            "aborting Prepare invalidated the resident projection plan");
+
+        // A retained immutable plan owns its plaintexts even after the store
+        // publishes a replacement cache and drops its old plaintext entries.
+        resident.BeginPlaintextPreparation();
+        resident.FreezePlaintextCache();
+        Require(resident.encoded_plaintext_count() == 0,
+            "replacement preparation retained the previous plaintext cache");
+        auto retained = hera::EvaluatePreparedProjection(
+            *plan.value(), normalized.value(), server_context, nullptr, nullptr, 2);
+        Require(retained.ok(), retained.status().message());
+        auto retained_output = projected.value();
+        retained_output.ciphertexts = retained.take_value();
+        Require(MaxError(Decrypt(retained_output, client_context), expected_projected) < 5e-3,
+            "retained projection plan lost its resident plaintexts");
     }
 
     Require(projected.value().logical_spec.layout == hera::Layout::kStrictColumn &&
@@ -1109,8 +1125,11 @@ void RunIntegratedParty(
         auto transport = hera::MakeNetIoTransport(
             role, role == hera::PartyRole::kClient ? "127.0.0.1" : "",
             19800);
-        hera::CkksMpcConverter converter(
-            role, {43, 13, 40, 20, true}, registry, transport,
+        auto conversion = hera::ConversionConfig{43, 13, 40, 20, true};
+        conversion.public_c2m_quarter_range = true;
+        conversion.public_m2c_quarter_range = true;
+        hera::BlbReferenceConverter converter(
+            role, conversion, registry, transport,
             hera::MakeDeterministicRandomSourceForTesting(
                 role == hera::PartyRole::kClient
                     ? std::vector<std::uint8_t>{11, 13, 17}
@@ -1167,6 +1186,9 @@ void RunIntegratedParty(
         auto shares = tensors.GetMpcShare(output.value().activation_shares.id);
         Require(shares.ok() && shares.value().local_share.size() == 10,
                 "integrated FFN output shares are absent");
+        Require(shares.value().public_value_bound_bits == std::optional<int>{39} &&
+                    converter.stats().bounded_field_to_ring_elements != 0,
+                "quarter-q range was not propagated through the GeLU selection");
         std::copy(shares.value().local_share.begin(),
                   shares.value().local_share.end(), packet->shares);
         Require(report.mpc_to_ckks_calls == 1 &&

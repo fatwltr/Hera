@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/softmax.h"
 #include "hera/mpc_session.h"
 
@@ -579,8 +580,8 @@ void RunExecutorParty(
         auto transport = hera::MakeNetIoTransport(
             role, role == hera::PartyRole::kClient ? "127.0.0.1" : "",
             control_port);
-        hera::CkksMpcConverter converter(
-            role, {43, 13, 40, 20, true}, registry, transport,
+        hera::BlbReferenceConverter converter(
+            role, {43, 13, 40, 20, true,0,true,true}, registry, transport,
             hera::MakeDeterministicRandomSourceForTesting(
                 role == hera::PartyRole::kClient
                     ? std::vector<std::uint8_t>{1, 3, 5}

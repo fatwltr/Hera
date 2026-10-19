@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hera/blb_reference.h"
+
 #include "hera/block2_he.h"
 #include "hera/conversion_backend.h"
 
@@ -162,7 +164,7 @@ public:
         HeContextRegistry &contexts,
         SealCipherTensorStore &he_tensors,
         CryptoTensorStore &mpc_tensors,
-        CkksMpcConverter &converter,
+        BlbReferenceConverter &converter,
         MpcSoftmaxRuntime &mpc,
         TensorIdAllocator *ids = nullptr);
 
@@ -176,7 +178,7 @@ private:
     HeContextRegistry &contexts_;
     SealCipherTensorStore &he_tensors_;
     CryptoTensorStore &mpc_tensors_;
-    CkksMpcConverter &converter_;
+    BlbReferenceConverter &converter_;
     MpcSoftmaxRuntime &mpc_;
     TensorIdAllocator *ids_{};
     std::atomic<TensorId> next_id_{6000000};

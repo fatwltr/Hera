@@ -1,4 +1,5 @@
 #include "hera/block2_he.h"
+#include "hera/detail/parallel_ranges.h"
 
 #include <algorithm>
 #include <cmath>
@@ -257,7 +258,7 @@ void TestParallelQkGroups(bool padded_tokens = false, bool split_heads = false)
     {
         hera::ModelPlaintextCacheScope scope(&qk_cache, layer.id);
         parallel = hera::MultiHeadQkKernel::Evaluate(
-            q_cipher, k_cipher, layer, server_context, &parallel_report, 2);
+            q_cipher, k_cipher, layer, server_context, &parallel_report, 8);
         Require(qk_cache.encoded_plaintext_count() == prepared_masks,
                 "frozen QK encoded more plaintexts online");
         auto incompatible_layer = layer;
@@ -310,6 +311,41 @@ void TestParallelQkGroups(bool padded_tokens = false, bool split_heads = false)
               << MaxError(serial_values, expected) << '\n';
     Require(MaxError(serial_values, parallel_values) < 1e-4,
             "parallel QK differs from serial QK");
+    const auto same_counts = [&](const hera::Block2ExecutionReport &other) {
+        return serial_report.rotations == other.rotations &&
+            serial_report.conjugations == other.conjugations &&
+            serial_report.ciphertext_plain_multiplications == other.ciphertext_plain_multiplications &&
+            serial_report.ciphertext_multiplications == other.ciphertext_multiplications &&
+            serial_report.relinearizations == other.relinearizations &&
+            serial_report.rescales == other.rescales;
+    };
+    Require(same_counts(parallel_report) && parallel_report.qk_preparation_workers > 1,
+            "QK parallel preparation changed operation counts or stayed serial");
+    if (padded_tokens) {
+        auto &pool = hera::detail::HeWorkerPool::Instance();
+        const auto budget = pool.MemoryBudget();
+        pool.SetMemoryBudget(1);
+        hera::Block2ExecutionReport constrained;
+        auto limited = hera::MultiHeadQkKernel::Evaluate(
+            q_cipher, k_cipher, layer, server_context, &constrained, 8);
+        pool.SetMemoryBudget(budget);
+        Require(limited.ok(), limited.status().message());
+        Require(constrained.qk_preparation_workers == 1 &&
+                    constrained.qk_product_workers == 1 && same_counts(constrained) &&
+                    MaxError(Decrypt(limited.value(), client_context), expected) < 1e-4,
+                "memory-constrained QK changed the result or operation counts");
+        hera::Block2ExecutionReport nested_report;
+        auto task = hera::detail::SubmitLocalTask(2, [&] {
+            return hera::MultiHeadQkKernel::Evaluate(
+                q_cipher, k_cipher, layer, server_context, &nested_report, 8);
+        });
+        auto nested = task.get();
+        Require(nested.ok(), nested.status().message());
+        Require(nested_report.qk_preparation_workers == 1 &&
+                    nested_report.qk_product_workers == 1 && same_counts(nested_report) &&
+                    MaxError(Decrypt(nested.value(), client_context), expected) < 1e-4,
+                "nested QK scheduling changed its result or failed to serialize");
+    }
     std::cout << "HERA_QK_SERIAL_KS="
               << serial_report.rotations + serial_report.conjugations +
                      serial_report.relinearizations << '\n'

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hera/blb_reference.h"
+
 #include "hera/ffn_gelu.h"
 
 #include <map>
@@ -38,6 +40,7 @@ struct Block5BridgeExecutionReport {
     std::uint64_t conversion_communication_bytes{};
     std::uint64_t conversion_rounds{};
     double conversion_milliseconds{};
+    double he_milliseconds{};
     std::vector<int> required_rotation_steps;
 };
 
@@ -58,7 +61,7 @@ public:
         SealCipherTensorStore &he_tensors,
         SealPlainParameterStore &parameters,
         CryptoTensorStore &mpc_tensors,
-        CkksMpcConverter &converter,
+        BlbReferenceConverter &converter,
         MpcLayerNormRuntime &mpc_layer_norm,
         TensorIdAllocator *ids = nullptr);
 
@@ -80,7 +83,7 @@ private:
     SealCipherTensorStore &he_tensors_;
     SealPlainParameterStore &parameters_;
     CryptoTensorStore &mpc_tensors_;
-    CkksMpcConverter &converter_;
+    BlbReferenceConverter &converter_;
     MpcLayerNormRuntime &mpc_layer_norm_;
     TensorIdAllocator *ids_{};
     TensorIdAllocator owned_ids_{9000000};

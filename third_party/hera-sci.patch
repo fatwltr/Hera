@@ -1267,3 +1267,183 @@ diff --git a/src/Millionaire/millionaire_with_equality.h b/src/Millionaire/milli
              (triples_corr.ai) + ((2 * counter_triples_used + 1) * num_cmps) / 8,
              (triples_corr.bi) + ((2 * counter_triples_used + 1) * num_cmps) / 8,
              num_cmps);
+
+--- a/src/FloatingPoint/bool-data.cpp
++++ b/src/FloatingPoint/bool-data.cpp
+@@ -76,3 +76,4 @@
+-#pragma omp parallel num_threads(2)
+-  {
+-    if (omp_get_thread_num() == 1 && party_ != BOB) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++  for (int direction = 0; direction < 2; ++direction) {
++    if (direction == 1 && party_ != BOB) {
+@@ -84 +85 @@
+-    } else if (omp_get_thread_num() == 0 && party_ != ALICE) {
++    } else if (direction == 0 && party_ != ALICE) {
+--- a/src/FloatingPoint/fixed-point.cpp
++++ b/src/FloatingPoint/fixed-point.cpp
+@@ -134,3 +134,4 @@
+-#pragma omp parallel num_threads(2)
+-  {
+-    if (omp_get_thread_num() == 1 && party_ != BOB) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++  for (int direction = 0; direction < 2; ++direction) {
++    if (direction == 1 && party_ != BOB) {
+@@ -142 +143 @@
+-    } else if (omp_get_thread_num() == 0 && party_ != ALICE) {
++    } else if (direction == 0 && party_ != ALICE) {
+--- a/src/FloatingPoint/floating-point.cpp
++++ b/src/FloatingPoint/floating-point.cpp
+@@ -339,3 +339,4 @@
+-#pragma omp parallel num_threads(2)
+-  {
+-    if (omp_get_thread_num() == 1 && party_ != BOB) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++  for (int direction = 0; direction < 2; ++direction) {
++    if (direction == 1 && party_ != BOB) {
+@@ -353 +354 @@
+-    } else if (omp_get_thread_num() == 0 && party_ != ALICE) {
++    } else if (direction == 0 && party_ != ALICE) {
+@@ -576,3 +577,3 @@
+-#pragma omp parallel num_threads(2)
+-  {
+-    if (omp_get_thread_num() == 1) {
++// Schedule both directions even when OpenMP supplies only one thread.
++  for (int direction = 0; direction < 2; ++direction) {
++    if (direction == 1) {
+--- a/src/utils/cmake/source_of_randomness.cmake
++++ b/src/utils/cmake/source_of_randomness.cmake
+@@ -1,27 +1,4 @@
+-OPTION(USE_RANDOM_DEVICE "Option description" OFF)
+-set(CMAKE_C_FLAGS "-mrdseed")
+-
+-# Use rdseed if available
+-unset(RDSEED_COMPILE_RESULT CACHE)
+-unset(RDSEED_RUN_RESULT CACHE)
+-file(WRITE ${CMAKE_SOURCE_DIR}/rdseedtest.c "#include <stdio.h>\n#include <x86intrin.h>\nint main(){\nunsigned long long r;\n_rdseed64_step(&r);\nreturn 0;\n}\n")
+-try_run(RDSEED_RUN_RESULT RDSEED_COMPILE_RESULT ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/rdseedtest.c CMAKE_FLAGS ${CMAKE_C_FLAGS})
+-file(REMOVE ${CMAKE_SOURCE_DIR}/rdseedtest.c)
+-
+-cmake_policy(SET CMP0012 NEW)
+-IF(NOT ${RDSEED_COMPILE_RESULT})
+-        set(USE_RANDOM_DEVICE ON)
+-ELSE(NOT ${RDSEED_COMPILE_RESULT})
+-	string(COMPARE EQUAL "${RDSEED_RUN_RESULT}" "0" RDSEED_RUN_SUCCESS)
+-        IF(NOT ${RDSEED_RUN_SUCCESS})
+-                set(USE_RANDOM_DEVICE ON)
+-        ELSE(NOT ${RDSEED_RUN_SUCCESS})
+-                set(USE_RANDOM_DEVICE OFF)
+-        ENDIF(NOT ${RDSEED_RUN_SUCCESS})
+-ENDIF(NOT ${RDSEED_COMPILE_RESULT})
+-
+-IF(${USE_RANDOM_DEVICE})
+-	message("${Red}-- Source of Randomness: random_device${ColourReset}")
+-ELSE(${USE_RANDOM_DEVICE})
+-	message("${Green}-- Source of Randomness: rdseed${ColourReset}")
+-ENDIF(${USE_RANDOM_DEVICE})
++# Use the OS CSPRNG on physical hosts and virtual machines alike. Do not run
++# an RDSEED probe or write test sources into a consumer's source directory.
++set(USE_RANDOM_DEVICE ON)
++message(STATUS "SCI source of randomness: OS random_device")
+--- a/src/utils/CMakeLists.txt
++++ b/src/utils/CMakeLists.txt
+@@ -4 +3,0 @@
+-set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl")
+
+--- a/src/Millionaire/millionaire.h
++++ b/src/Millionaire/millionaire.h
+@@ -451,3 +451,4 @@
+-#pragma omp parallel num_threads(2)
+-      {
+-        if (omp_get_thread_num() == 1) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++      for (int direction = 0; direction < 2; ++direction) {
++        if (direction == 1) {
+--- a/src/Millionaire/millionaire_with_equality.h
++++ b/src/Millionaire/millionaire_with_equality.h
+@@ -309,3 +309,4 @@
+-#pragma omp parallel num_threads(2)
+-      {
+-        if (omp_get_thread_num() == 1) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++      for (int direction = 0; direction < 2; ++direction) {
++        if (direction == 1) {
+--- a/src/Millionaire/equality.h
++++ b/src/Millionaire/equality.h
+@@ -281,3 +281,4 @@
+-#pragma omp parallel num_threads(2)
+-      {
+-        if (omp_get_thread_num() == 1) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++      for (int direction = 0; direction < 2; ++direction) {
++        if (direction == 1) {
+--- a/src/LinearOT/linear-ot.cpp
++++ b/src/LinearOT/linear-ot.cpp
+@@ -297,3 +297,4 @@
+-#pragma omp parallel num_threads(2)
+-    {
+-      if (omp_get_thread_num() == 1 && use_reversed_ot) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++    for (int direction = 0; direction < 2; ++direction) {
++      if (direction == 1 && use_reversed_ot) {
+@@ -317 +318 @@
+-      } else if (omp_get_thread_num() == 0 && use_straight_ot) {
++      } else if (direction == 0 && use_straight_ot) {
+@@ -496,3 +497,4 @@
+-#pragma omp parallel num_threads(2)
+-  {
+-    if (omp_get_thread_num() == 1 && use_reversed_ot) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++  for (int direction = 0; direction < 2; ++direction) {
++    if (direction == 1 && use_reversed_ot) {
+@@ -505 +507 @@
+-    } else if (omp_get_thread_num() == 0 && use_straight_ot) {
++    } else if (direction == 0 && use_straight_ot) {
+--- a/src/NonLinear/relu-ring.h
++++ b/src/NonLinear/relu-ring.h
+@@ -201,3 +201,4 @@
+-#pragma omp parallel num_threads(2)
+-    {
+-      if (omp_get_thread_num() == 1) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++    for (int direction = 0; direction < 2; ++direction) {
++      if (direction == 1) {
+--- a/src/NonLinear/relu-field.h
++++ b/src/NonLinear/relu-field.h
+@@ -166,3 +166,4 @@
+-#pragma omp parallel num_threads(2)
+-    {
+-      if (omp_get_thread_num() == 1) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++    for (int direction = 0; direction < 2; ++direction) {
++      if (direction == 1) {
+--- a/src/NonLinear/argmax.h
++++ b/src/NonLinear/argmax.h
+@@ -239,3 +239,4 @@
+-#pragma omp parallel num_threads(2)
+-    {
+-      if (omp_get_thread_num() == 1) {
++// Schedule both directions even when OpenMP supplies only one thread.
++#pragma omp parallel for num_threads(2) schedule(static)
++    for (int direction = 0; direction < 2; ++direction) {
++      if (direction == 1) {
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -37 +36,0 @@
+-set(EMP-TOOL_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/deps/emp-tool")
+@@ -40,2 +39,2 @@
+-find_package(emp-tool REQUIRED PATHS ${EMP-TOOL_INCLUDE_DIR})
+-find_package(emp-ot REQUIRED PATHS ${EMP-OT_INCLUDE_DIR})
++set(EMP-TOOL_INCLUDE_DIRS ${EMP-TOOL_INCLUDE_DIR})
++set(EMP-OT_INCLUDE_DIRS ${EMP-OT_INCLUDE_DIR})

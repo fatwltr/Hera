@@ -1,4 +1,4 @@
-#include "hera/conversion.h"
+#include "hera/blb_reference.h"
 #include "hera/detail/he_packing.h"
 #include "hera/detail/conversion_lanes.h"
 #include "hera/seal_wire.h"
@@ -39,7 +39,7 @@ void Run(hera::PartyRole role, hera::HeContextRegistry &registry)
     const auto &context = registry.Require("test", role);
     const auto slots = context.slot_count();
     auto transport = hera::MakeNetIoTransport(role, "127.0.0.1", 17900);
-    hera::CkksMpcConverter converter(role, {43,13,40,20,true,4096}, registry,
+    hera::BlbReferenceConverter converter(role, {43,13,40,20,true,4096,true,true}, registry,
         transport, hera::MakeProductionRandomSource(), "127.0.0.1", 17920, 3);
     constexpr auto mask = (std::uint64_t{1} << 43) - 1;
     double maximum = 0;
@@ -104,10 +104,8 @@ void Run(hera::PartyRole role, hera::HeContextRegistry &registry)
         Check(shares.real.local_share == original.real.local_share && shares.imag.local_share == original.imag.local_share,
             "packed conversion mutated its input shares");
         const auto after = converter.stats();
-        Check(after.correlated_comparison_elements > before.correlated_comparison_elements,
-            "M2C did not exercise the correlated comparison path");
-        Check(after.radix5_comparison_elements == before.radix5_comparison_elements,
-            "M2C unexpectedly changed its comparison radix");
+        Check(after.bounded_signed_extension_elements>before.bounded_signed_extension_elements,
+            "M2C did not exercise the bounded OT path");
         Check(after.packed_real_wire_ciphertexts - before.packed_real_wire_ciphertexts == (fixture == 8 ? 0 : fixture == 0 || fixture == 4 || fixture == 7 ? 2 : 1),
             "packed conversion did not reduce real wire ciphertext count");
         if (fixture >= 5) {
@@ -153,10 +151,10 @@ void Run(hera::PartyRole role, hera::HeContextRegistry &registry)
         if (fixture == 2 && server) shares.real.local_share[4] = 1;
         if (fixture == 3 && server) target.public_slot_periods[0][0] = 8;
         if (fixture == 4) target.public_slot_periods[0][0] = 2 * slots;
-        const auto before = converter.stats().generic_signed_extension_elements;
+        const auto before = converter.stats().signed_extension_batches;
         auto result = converter.MpcToCkksPacked(shares, target);
         Check(!result.ok(), "invalid or mismatched period contract was accepted");
-        Check(before == converter.stats().generic_signed_extension_elements, "invalid period entered extension");
+        Check(before == converter.stats().signed_extension_batches, "invalid period entered extension");
     }
     if (!server) std::cout << "PACKED_M2C_MAX_ULP=" << std::ldexp(maximum,13) << '\n';
 }

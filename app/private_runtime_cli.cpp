@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/private_runtime.h"
 #include "hera/mpc_session.h"
 #include "hera/detail/parallel_ranges.h"
@@ -5,7 +6,6 @@
 #include "hera/seal_wire.h"
 
 #include <seal/seal.h>
-#include <seal/version.h>
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -15,13 +15,12 @@
 #include <complex>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 #include <limits>
-#include <sstream>
+#include <map>
 
 namespace hera {
 namespace {
-
-using Clock = std::chrono::steady_clock;
 
 // Each SCI IOPack owns three sockets at p, p+50, and p+100. Expand the
 // nonlinear range after conversion sockets when more workers are requested.
@@ -46,6 +45,22 @@ void Check(const Result<void> &result)
     if (!result.ok()) throw std::runtime_error(result.status().message());
 }
 
+ConversionConfig ProtocolConfig(const HeraConfig &config,
+                                const PrivateRuntimeCliOptions &options)
+{
+    ConversionConfig protocol{
+        config.mpc_numeric.ring_bits, config.mpc_numeric.scale_bits,
+        config.conversion.statistical_security_bits,
+        config.conversion.fft_scale_bits,
+        config.conversion.allow_internal_mod_switch};
+    // Model runs simulate the conversion directly, with either weight mode.
+    protocol.benchmark_unchecked_range = true;
+    protocol.batch_elements = options.conversion_batch_elements
+        ? options.conversion_batch_elements
+        : ConversionConfig::DefaultBatchElements(options.conversion_workers);
+    return protocol;
+}
+
 std::uint64_t RuntimeFingerprint(const HeraConfig &config,
                                  const PrivateRuntimeCliOptions &options)
 {
@@ -58,7 +73,7 @@ std::uint64_t RuntimeFingerprint(const HeraConfig &config,
         }
     };
     auto scalar = [&](const auto &value) { mix(&value, sizeof(value)); };
-    constexpr std::uint32_t wire_protocol_version = 9;
+    constexpr std::uint32_t wire_protocol_version = 12;
     scalar(wire_protocol_version);
     scalar(config.schema_version);
     scalar(config.mpc_numeric.ring_bits);
@@ -133,12 +148,13 @@ std::uint64_t RuntimeFingerprint(const HeraConfig &config,
 #else
     scalar(false);
 #endif
-    scalar(options.plaintext_cache_mib);
     scalar(options.projection_baby_steps);
     scalar(options.he_memory_mib); // The automatic BSGS split depends on this budget.
     scalar(options.he_threads);
     scalar(options.conversion_workers);
-    scalar(options.conversion_batch_elements ? options.conversion_batch_elements : ConversionConfig::DefaultBatchElements(options.conversion_workers));
+    const auto conversion_protocol = ProtocolConfig(config, options);
+    scalar(conversion_protocol.batch_elements);
+    scalar(conversion_protocol.benchmark_unchecked_range);
     scalar(options.mpc_workers ? options.mpc_workers : options.he_threads);
     scalar(options.stage_timeout_seconds);
     mix(options.seal_compression.data(), options.seal_compression.size());
@@ -256,14 +272,6 @@ SealCipherTensor EncryptSyntheticInput(const HeraConfig &config,
             packing.take_value()};
 }
 
-ConversionConfig ProtocolConfig(const HeraConfig &config)
-{
-    return {config.mpc_numeric.ring_bits, config.mpc_numeric.scale_bits,
-            config.conversion.statistical_security_bits,
-            config.conversion.fft_scale_bits,
-            config.conversion.allow_internal_mod_switch};
-}
-
 PublicAttentionMask MakeMask(const TransformerLayerConfig &layer)
 {
     PublicAttentionMask mask;
@@ -278,7 +286,6 @@ PublicAttentionMask MakeMask(const TransformerLayerConfig &layer)
 int RunOneParty(const PrivateRuntimeCliOptions &options,
                 const HeraConfig &config, PartyRole role)
 {
-    const auto setup_started = Clock::now();
     const auto compression = CompressionMode(options.seal_compression);
     auto compiled = CompiledTransformerExecutionPlan::Compile(config);
     if (!compiled.ok())
@@ -286,10 +293,6 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
     std::shared_ptr<const CompiledTransformerExecutionPlan> plan =
         std::make_shared<CompiledTransformerExecutionPlan>(
             compiled.take_value());
-    std::size_t rotation_key_steps = 0;
-    for (const auto &entry : plan->rotation_steps_by_profile)
-        rotation_key_steps += entry.second.size();
-    std::size_t galois_key_bytes = 0;
     auto control = MakeNetIoTransport(
         role, role == PartyRole::kClient ? options.ip : "", options.port);
     HeContextRegistry contexts;
@@ -300,8 +303,6 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
         SendU64(*control, RuntimeFingerprint(config, options));
         auto bundle = contexts.ExportSerializedPublicBundle(compression);
         if (!bundle.ok()) throw std::runtime_error(bundle.status().message());
-        for (const auto &profile : bundle.value().profiles)
-            galois_key_bytes += profile.galois_keys.size();
         Check(SendPublicContextBundle(*control, bundle.value()));
         Check(contexts.ReleaseClientEvaluationKeys());
     } else {
@@ -310,8 +311,6 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
                 "client/server configs or benchmark modes differ");
         auto bundle = ReceivePublicContextBundle(*control);
         if (!bundle.ok()) throw std::runtime_error(bundle.status().message());
-        for (const auto &profile : bundle.value().profiles)
-            galois_key_bytes += profile.galois_keys.size();
         Check(contexts.CreateServerProfiles(config, bundle.value()));
         for (const auto &entry : config.he_parameter_profiles)
             if (contexts.Require(entry.first, PartyRole::kServer).has_secret_key())
@@ -340,7 +339,6 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
     }
 
     SealPlainParameterStore parameters;
-    Check(parameters.ConfigureProjectionPlaintextMemory(options.plaintext_cache_mib << 20));
     Check(parameters.ConfigureVirtualWeightPlaintexts(
         options.virtual_weights ? options.weight_template_count : 0));
     std::optional<TransformerWeightData> weight_data;
@@ -352,11 +350,8 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
 
     auto conversion_transport = MakeNetIoTransport(
         role, role == PartyRole::kClient ? options.ip : "", options.port + 10);
-    auto conversion_protocol = ProtocolConfig(config);
-    conversion_protocol.batch_elements = options.conversion_batch_elements;
-    if (!conversion_protocol.batch_elements)
-        conversion_protocol.batch_elements = ConversionConfig::DefaultBatchElements(options.conversion_workers);
-    CkksMpcConverter converter(
+    const auto conversion_protocol = ProtocolConfig(config, options);
+    BlbReferenceConverter converter(
         role, conversion_protocol, contexts, conversion_transport,
         MakeProductionRandomSource(), options.ip,
         options.port + kConversionWorkerOffset,
@@ -394,22 +389,23 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
     auto transformer = PrivateTransformer::Compile(framework.value());
     if (!transformer.ok())
         throw std::runtime_error(transformer.status().message());
-    PreparationReport preparation;
-    Check(transformer.value().Prepare(weights.value(), &preparation));
-    const auto setup_ms = std::chrono::duration<double, std::milli>(
-        Clock::now() - setup_started).count();
+    Check(transformer.value().Prepare(weights.value()));
 
     EncryptedTransformerInput input;
     input.hidden_states.tensor = {input_id, InputSpec(config, input_context, input_plan)};
     input.attention_mask = MakeMask(first_layer);
     const auto total_runs = options.warmup + options.repeat;
-    double measured_online = 0.0, measured_transfer = 0.0;
+    struct BlockMeasurement {
+        ExecutionReport::CostBreakdown costs;
+        std::uint64_t mpc_bytes{};
+        std::uint64_t conversion_bytes{};
+    };
+    std::map<std::size_t, BlockMeasurement> measured_blocks;
     TensorHandle last_output;
     std::optional<SealCipherTensor> received_output;
-    ExecutionReport last_report;
     for (std::size_t run = 0; run < total_runs; ++run) {
         // Both parties finish Prepare and the preceding output transfer before
-        // starting this timer. Otherwise a cold client call includes the
+        // entering measured stages. Otherwise a cold client call includes the
         // server's offline plaintext compilation in its online measurement.
         constexpr std::uint64_t benchmark_ready = 0x4845524100000000ULL;
         const auto ready = benchmark_ready + run;
@@ -422,14 +418,10 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
                 throw std::runtime_error("online benchmark readiness mismatch");
             SendU64(*control, ready);
         }
-        const auto online_started = Clock::now();
         ExecutionReport report;
         auto output = transformer.value().Evaluate(
             input, weights.value(), &report);
         if (!output.ok()) throw std::runtime_error(output.status().message());
-        const auto online_ms = std::chrono::duration<double, std::milli>(
-            Clock::now() - online_started).count();
-        const auto transfer_started = Clock::now();
         if (role == PartyRole::kServer) {
             auto payload = arena.he.Get(output.value().tensor.id);
             if (!payload.ok())
@@ -451,17 +443,18 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
                 output_context.profile, std::move(ciphertexts),
                 output.value().tensor.spec, packing.take_value()};
         }
-        const auto transfer_ms = std::chrono::duration<double, std::milli>(
-            Clock::now() - transfer_started).count();
         if (run >= options.warmup) {
-            measured_online += online_ms;
-            measured_transfer += transfer_ms;
+            for (const auto &stage : report.stages) {
+                auto &block = measured_blocks[stage.layer];
+                block.costs += stage.metrics.costs;
+                block.mpc_bytes += stage.metrics.mpc_communication_bytes;
+                block.conversion_bytes += stage.metrics.conversion_communication_bytes;
+            }
         }
         last_output = output.value().tensor;
-        last_report = std::move(report);
     }
 
-    if (role == PartyRole::kClient && options.verify) {
+    if (role == PartyRole::kClient && options.verify && !options.virtual_weights) {
         const auto &output_context = contexts.Require(
             *last_output.spec.he_parameter_profile, role);
         seal::Decryptor decryptor(*output_context.context,
@@ -480,101 +473,40 @@ int RunOneParty(const PrivateRuntimeCliOptions &options,
         }
     }
     Check(coordinator.value()->Finish());
-    const auto conversion_stats = converter.stats();
     const auto denominator = static_cast<double>(options.repeat);
-    for (const auto &stage : last_report.stages) {
-        const auto &metrics = stage.metrics;
-        std::cout << "HERA_STAGE=layer" << stage.layer << '.' << stage.name
-                  << ",MS=" << stage.milliseconds
-                  << ",COMM=" << metrics.communication_bytes
-                  << ",ROUNDS=" << metrics.rounds
-                  << ",CONVERSIONS=" << metrics.conversions
-                  << ",ROTATIONS=" << metrics.rotations
-                  << ",CT_PT_MUL="
-                  << metrics.ciphertext_plain_multiplications
-                  << ",CT_CT_MUL=" << metrics.ciphertext_multiplications
-                  << ",RELIN=" << metrics.relinearizations
-                  << ",RESCALE=" << metrics.rescales
-                  << ",MPC_OPS=" << metrics.mpc_operations;
-        if (metrics.layer_norm_he_workers)
-            std::cout << ",LN_HE_WORKERS=" << metrics.layer_norm_he_workers;
-        if (metrics.layer_norm_mpc_workers)
-            std::cout << ",LN_MPC_WORKERS=" << metrics.layer_norm_mpc_workers;
-        if (metrics.gelu_mpc_workers)
-            std::cout << ",GELU_MPC_WORKERS=" << metrics.gelu_mpc_workers;
-        std::cout << '\n';
+    // The local parties share stdout. Serialize their reports after all timed
+    // work so buffered writes cannot split metrics or the final PASS marker.
+    constexpr std::uint64_t report_ready = 0x4845524152505431ULL;
+    if (options.party == "local" && role == PartyRole::kClient &&
+        ReceiveU64(*control) != report_ready)
+        throw std::runtime_error("invalid local report synchronization");
+    const auto print_measurement = [&](const std::string &label,
+                                       const BlockMeasurement &value) {
+        std::cout << label
+                  << ",HE_MS=" << value.costs.he_computation_milliseconds / denominator
+                  << ",MPC_MS=" << value.costs.other_nonlinear_milliseconds / denominator
+                  << ",CONVERSION_MS=" << value.costs.he_mpc_conversion_milliseconds / denominator
+                  << ",HE_COMM_BYTES=0"
+                  << ",MPC_COMM_BYTES=" << value.mpc_bytes / denominator
+                  << ",CONVERSION_COMM_BYTES=" << value.conversion_bytes / denominator
+                  << '\n';
+    };
+    std::cout << std::fixed << std::setprecision(3)
+              << "HERA_PARTY="
+              << (role == PartyRole::kClient ? "client" : "server") << '\n';
+    BlockMeasurement total;
+    for (const auto &[layer, block] : measured_blocks) {
+        print_measurement("HERA_BLOCK=layer" + std::to_string(layer), block);
+        total.costs += block.costs;
+        total.mpc_bytes += block.mpc_bytes;
+        total.conversion_bytes += block.conversion_bytes;
     }
-    std::cout << "HERA_PARTY="
-              << (role == PartyRole::kClient ? "client" : "server")
-              << "\nHERA_SEAL_VERSION=" << SEAL_VERSION_MAJOR << '.'
-              << SEAL_VERSION_MINOR << '.' << SEAL_VERSION_PATCH
-              << "\nHERA_HE_THREADS=" << options.he_threads
-              << "\nHERA_CONVERSION_WORKERS=" << options.conversion_workers
-              << "\nHERA_CONVERSION_BATCH_ELEMENTS=" << conversion_protocol.batch_elements
-              << "\nHERA_MPC_WORKERS=" << nonlinear_session->worker_count()
-              << "\nHERA_MPC_BASE_PORT=" << detail::RuntimeMpcPort(options.port,
-                    options.conversion_workers, nonlinear_session->worker_count())
-              << "\nHERA_STAGE_TIMEOUT_SECONDS=" << options.stage_timeout_seconds
-              << "\nHERA_HE_MEMORY_BUDGET_MIB=" << options.he_memory_mib
-              << "\nHERA_HE_POOL_WORKERS="
-              << detail::HeWorkerPool::Instance().WorkerThreadCount()
-              << "\nHERA_SEAL_COMPRESSION=" << options.seal_compression
-              << "\nHERA_SETUP_MS=" << setup_ms
-              << "\nHERA_ROTATION_KEY_STEPS=" << rotation_key_steps
-              << "\nHERA_GALOIS_KEY_BYTES=" << galois_key_bytes
-              << "\nHERA_PREPARE_MS=" << preparation.milliseconds
-              << "\nHERA_PREPARED_PLAINTEXTS="
-              << preparation.encoded_plaintext_count
-              << "\nHERA_PREPARED_BYTES=" << preparation.encoded_bytes
-              << "\nHERA_PROJECTION_RESIDENT_BYTES=" << parameters.projection_resident_bytes()
-              << "\nHERA_PROJECTION_SPILLED_BYTES=" << parameters.projection_spilled_bytes()
-              << "\nHERA_PROJECTION_PLAINTEXT_LOADS=" << parameters.projection_plaintext_loads()
-              << "\nHERA_PREPARED_PROJECTION_PLANS="
-              << parameters.prepared_projection_count()
-              << "\nHERA_ONLINE_PROJECTION_PLAN_HITS="
-              << parameters.prepared_projection_hits()
-              << "\nHERA_PREPARE_CACHE_HITS=" << preparation.cache_hits
-              << "\nHERA_WEIGHT_MODE="
-              << (options.virtual_weights ? "VIRTUAL" : "MATERIALIZED")
-              << "\nHERA_WEIGHT_TEMPLATE_COUNT="
-              << (options.virtual_weights ? options.weight_template_count : 0)
-              << "\nHERA_VIRTUAL_WEIGHT_REQUESTS="
-              << preparation.virtual_weight_requests
-              << "\nHERA_VIRTUAL_WEIGHT_CACHE_HITS="
-              << preparation.virtual_weight_cache_hits
-              << "\nHERA_MODEL_NUMERICAL_VALIDATION="
-              << (options.virtual_weights ? "DISABLED" : "FINAL_FINITE_ONLY")
-              << "\nHERA_ONLINE_MODEL_ENCODES=0"
-              << "\nHERA_CONVERSION_TRANSFORM_CACHE_HITS="
-              << conversion_stats.transform_cache_hits
-              << "\nHERA_CONVERSION_TRANSFORM_CACHE_MISSES="
-              << conversion_stats.transform_cache_misses
-              << "\nHERA_CONVERSION_LOCAL_TASKS="
-              << conversion_stats.local_transform_tasks
-              << "\nHERA_CONVERSION_LOCAL_PEAK_INFLIGHT="
-              << conversion_stats.local_transform_peak_inflight
-              << "\nHERA_CONVERSION_PACKED_REAL_INPUT_CIPHERTEXTS="
-              << conversion_stats.packed_real_input_ciphertexts
-              << "\nHERA_CONVERSION_PACKED_REAL_WIRE_CIPHERTEXTS="
-              << conversion_stats.packed_real_wire_ciphertexts
-              << "\nHERA_CONVERSION_REAL_OUTPUT_SPLIT_CIPHERTEXTS="
-              << conversion_stats.real_output_split_ciphertexts
-              << "\nHERA_CONVERSION_CORRELATED_COMPARISON_ELEMENTS=" << conversion_stats.correlated_comparison_elements
-              << "\nHERA_CONVERSION_RADIX5_COMPARISON_ELEMENTS=" << conversion_stats.radix5_comparison_elements
-              << "\nHERA_CONVERSION_SLOT_EXTENSION_INPUT_ELEMENTS=" << conversion_stats.slot_extension_input_elements
-              << "\nHERA_CONVERSION_SLOT_EXTENSION_UNIQUE_ELEMENTS=" << conversion_stats.slot_extension_unique_elements
-              << "\nHERA_CONVERSION_SLOT_EXTENSION_PADDING_ELEMENTS=" << conversion_stats.slot_extension_padding_elements
-              << "\nHERA_ONLINE_MS=" << measured_online / denominator
-              << "\nHERA_OUTPUT_TRANSFER_MS="
-              << measured_transfer / denominator
-              << "\nHERA_END_TO_END_ONLINE_MS="
-              << (measured_online + measured_transfer) / denominator
-              << "\nHERA_COMMUNICATION_BYTES="
-              << last_report.communication_bytes
-              << "\nHERA_ROUNDS=" << last_report.rounds
-              << "\nHERA_FINAL_LEVEL="
-              << last_output.spec.planned_level.value_or(9999)
-              << "\nHERA_PRIVATE_INFERENCE_STATUS=PASS\n";
+    if (measured_blocks.size() > 1)
+        print_measurement("HERA_TOTAL", total);
+    std::cout << "HERA_PRIVATE_INFERENCE_STATUS=PASS\n";
+    std::cout.flush();
+    if (options.party == "local" && role == PartyRole::kServer)
+        SendU64(*control, report_ready);
     return 0;
 }
 
@@ -593,7 +525,6 @@ int RunPrivateRuntimeCli(const PrivateRuntimeCliOptions &options)
         if (options.he_threads == 0 || options.conversion_workers == 0 ||
             options.conversion_batch_elements > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             options.he_memory_mib == 0 || options.he_memory_mib > (std::numeric_limits<std::size_t>::max() >> 20) ||
-            options.plaintext_cache_mib == 0 || options.plaintext_cache_mib > (std::numeric_limits<std::size_t>::max() >> 20) ||
             options.stage_timeout_seconds == 0 || options.stage_timeout_seconds > 86400 ||
             options.repeat == 0)
             throw std::invalid_argument("invalid thread, memory or repeat budget");
@@ -613,9 +544,7 @@ int RunPrivateRuntimeCli(const PrivateRuntimeCliOptions &options)
             return RunOneParty(options, config, PartyRole::kClient);
         if (options.party == "server")
             return RunOneParty(options, config, PartyRole::kServer);
-        // main() prints the validated configuration before entering the
-        // runtime. Flush it so the forked client cannot replay the parent's
-        // buffered banner.
+        // Flush any explicitly requested graph output before forking.
         std::cout.flush();
         std::cerr.flush();
         const auto child = fork();

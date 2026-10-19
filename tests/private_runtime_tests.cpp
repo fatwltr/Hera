@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/private_runtime.h"
 #include "hera/mpc_session.h"
 
@@ -272,8 +273,8 @@ PartyResult RunParty(
         auto transport = hera::MakeNetIoTransport(
             role, role == hera::PartyRole::kClient ? "127.0.0.1" : "",
             base + 10);
-        hera::CkksMpcConverter converter(
-            role, {43, 13, 40, 20, true}, contexts, transport,
+        hera::BlbReferenceConverter converter(
+            role, {43, 13, 40, 20, true,0,true,true}, contexts, transport,
             hera::MakeDeterministicRandomSourceForTesting(
                 role == hera::PartyRole::kClient
                     ? std::vector<std::uint8_t>{2, 3, 5, 7}
@@ -333,6 +334,8 @@ PartyResult RunParty(
         }
         input.attention_mask.kind = hera::AttentionMaskKind::kNone;
         hera::ExecutionReport report;
+        const auto conversion_bytes_before = converter.stats().communication_bytes;
+        const auto mpc_bytes_before = nonlinear_session->communication_bytes();
         auto output = transformer.value().Evaluate(input, weights, &report);
         if (!output.ok()) return {false, {}, output.status().message()};
         if (role == hera::PartyRole::kServer &&
@@ -343,12 +346,41 @@ PartyResult RunParty(
         Require(report.stages.size() == config.layers.size() * 5,
                 "runtime did not report five fused stages per layer");
         std::uint64_t stage_bytes = 0, stage_rounds = 0;
+        std::uint64_t conversion_bytes = 0, mpc_bytes = 0;
+        double stage_milliseconds = 0.0;
         for (const auto &stage : report.stages) {
             stage_bytes += stage.metrics.communication_bytes;
+            conversion_bytes += stage.metrics.conversion_communication_bytes;
+            mpc_bytes += stage.metrics.mpc_communication_bytes;
+            Require(stage.metrics.communication_bytes ==
+                        stage.metrics.conversion_communication_bytes + stage.metrics.mpc_communication_bytes,
+                    "stage communication categories do not sum to its online traffic");
             stage_rounds += stage.metrics.rounds;
+            stage_milliseconds += stage.milliseconds;
+            const auto &costs = stage.metrics.costs;
+            Require(std::isfinite(costs.he_computation_milliseconds) &&
+                        costs.he_computation_milliseconds >= 0.0 &&
+                        costs.he_mpc_conversion_milliseconds > 0.0 &&
+                        costs.other_nonlinear_milliseconds >= 0.0 &&
+                        costs.local_overhead_milliseconds >= 0.0,
+                    "stage cost breakdown contains invalid durations");
+            Require(std::abs(costs.stage_milliseconds() - stage.milliseconds) < 1e-6,
+                    "stage cost breakdown double counted or lost wall time");
+            Require((costs.he_computation_milliseconds > 0.0) ==
+                        (role == hera::PartyRole::kServer),
+                    "HE timing lost a server interval or counted client bookkeeping");
+            Require((costs.other_nonlinear_milliseconds == 0.0) ==
+                        (stage.name == "block5_bridge"),
+                    "nonlinear MPC time was attributed to the wrong stage");
         }
+        Require(std::abs(report.costs.stage_milliseconds() - stage_milliseconds) < 1e-6 &&
+                    report.costs.stage_milliseconds() <= report.online_milliseconds,
+                "runtime cost totals diverged from the fused-stage wall times");
         Require(report.communication_bytes == stage_bytes && report.rounds == stage_rounds,
                 "runtime totals lost communication recorded by a fused stage");
+        Require(conversion_bytes == converter.stats().communication_bytes - conversion_bytes_before &&
+                    mpc_bytes == nonlinear_session->communication_bytes() - mpc_bytes_before,
+                "communication categories include setup or lose online protocol traffic");
         for (const auto &stage : report.stages)
             if (stage.name == "pre_ln_block2")
                 Require(stage.metrics.conversions == (stage.layer == 0 ? 5 : 3),

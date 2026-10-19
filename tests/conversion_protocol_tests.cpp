@@ -1,4 +1,4 @@
-#include "hera/conversion.h"
+#include "hera/blb_reference.h"
 #include "hera/conversion_backend.h"
 #include "hera/seal_wire.h"
 #include "hera/detail/he_packing.h"
@@ -98,7 +98,7 @@ public:
             if (magic == 0x48455241434f4e56ULL) {
                 const auto *first = static_cast<const std::uint8_t *>(data);
                 std::vector<std::uint8_t> changed(first, first + bytes);
-                const std::uint32_t obsolete_version = 13;
+                const std::uint32_t obsolete_version = 18;
                 std::memcpy(changed.data() + sizeof(magic), &obsolete_version, sizeof(obsolete_version));
                 inner_->Send(changed.data(), changed.size());
                 return;
@@ -153,7 +153,7 @@ private:
     std::size_t position_{};
 };
 
-void VerifyCombinedCiphertextMask(
+void VerifyUniformCiphertextMask(
     const CapturingTransport &wire, const CaptureState &random,
     const hera::HeContext &client_profile, const seal::Ciphertext &input)
 {
@@ -181,34 +181,13 @@ void VerifyCombinedCiphertextMask(
         Require(found != nullptr, "mask stream was not sampled");
         return *found;
     };
-    Require(random.bytes.size() == 4,
-            "single-ciphertext C2M must sample session and independent A/Z masks; wide carry uses OT pads");
+    Require(random.bytes.size() == 2,
+            "single-ciphertext C2M must sample only a session and uniform coefficient mask");
     const auto terminal = client_profile.context->last_context_data();
     const auto modulus = terminal->parms().coeff_modulus().front().value();
     const auto degree = client_profile.parameters.polynomial_degree;
-    const auto slots = client_profile.slot_count();
     ReplayRandomStream a_stream(find_stream("hera/c2m/A/"));
-    ReplayRandomStream real_stream(find_stream("hera/c2m/Z-real/"));
-    ReplayRandomStream imag_stream(find_stream("hera/c2m/Z-imag/"));
-    const auto a = hera::conversion_internal::SampleUniformPrime(
-        a_stream, degree, modulus);
-    const auto real = hera::conversion_internal::SampleUniformRing(
-        real_stream, slots, 43);
-    const auto imag = hera::conversion_internal::SampleUniformRing(
-        imag_stream, slots, 43);
-    constexpr int root_bits = 24;
-    constexpr int scale_shift = 20 - 13;
-    const int wide_bits = seal::util::get_significant_bit_count(modulus) + 40;
-    const int decode_guard = std::min(20, 127 - wide_bits - root_bits - 2);
-    const int mask_value_bits = 43 + scale_shift +
-        seal::util::get_power_of_two(degree) + 2;
-    const int mask_bits = std::max(wide_bits + decode_guard, mask_value_bits);
-    const int mask_guard = std::min(20, mask_bits - mask_value_bits);
-    const auto transform =
-        hera::conversion_internal::FixedCkksTransform::Create(
-            degree, root_bits, mask_bits).take_value();
-    const auto encoded_z = hera::conversion_internal::EncodeRingMask(
-        real, imag, 43, scale_shift, mask_guard, transform, modulus).take_value();
+    const auto a = hera::conversion_internal::SampleUniformPrime(a_stream, degree, modulus);
 
     seal::Evaluator evaluator(*client_profile.context);
     auto terminal_input = input;
@@ -222,18 +201,10 @@ void VerifyCombinedCiphertextMask(
         original_plain.data(), terminal->small_ntt_tables()[0]);
     seal::util::inverse_ntt_negacyclic_harvey(
         masked_plain.data(), terminal->small_ntt_tables()[0]);
-    bool a_contributed = false, z_contributed = false, mask_wrapped = false;
     for (std::size_t i = 0; i < degree; ++i) {
-        const auto combined = (a[i] + encoded_z[i]) % modulus;
         const auto actual = (masked_plain[i] + modulus - original_plain[i]) % modulus;
-        Require(actual == combined,
-                "client ciphertext is not masked with A + Encode(Z)");
-        a_contributed |= actual != encoded_z[i];
-        z_contributed |= actual != a[i];
-        mask_wrapped |= a[i] + encoded_z[i] >= modulus;
+        Require(actual == a[i], "client ciphertext is not masked with the uniform coefficient mask");
     }
-    Require(a_contributed && z_contributed && mask_wrapped,
-            "combined-mask regression did not exercise both domains and wrapping");
 }
 
 hera::HeraConfig TestConfig()
@@ -251,7 +222,8 @@ hera::HeraConfig TestConfig()
                                 true, hera::SecurityLevel::kNone});
     config.he_parameter_profiles.emplace(
         "target_profile",
-        hera::HeParameterConfig{4096, {45, 35, 45}, 24, 24, 24, 1, 1,
+        // Four data primes: exercise direct RNS generation for Q > 128 bits.
+        hera::HeParameterConfig{4096, {50, 45, 45, 45, 50}, 24, 24, 24, 1, 1,
                                 true, hera::SecurityLevel::kNone});
     hera::LayerExecutionConfig execution;
     execution.layer_id = "test";
@@ -346,7 +318,7 @@ void ReadAll(int fd, void *data, std::size_t bytes)
 }
 
 
-void TestPublicZeroImaginary(hera::CkksMpcConverter &converter,
+void TestPublicZeroImaginary(hera::BlbReferenceConverter &converter,
                              hera::PartyRole role,
                              const hera::HeContext &profile, int pipe_fd)
 {
@@ -410,10 +382,8 @@ void TestPublicZeroImaginary(hera::CkksMpcConverter &converter,
                 before.public_zero_imaginary_ciphertexts == 3,
             "general conversion inferred a public-zero contract");
     Require(converter.stats().bounded_signed_extension_elements -
-                before.bounded_signed_extension_elements == 7 * slots &&
-            converter.stats().generic_signed_extension_elements -
-                before.generic_signed_extension_elements == 14 * slots,
-            "public-bound slot/coefficient extensions did not use the expected paths");
+                before.bounded_signed_extension_elements == 21 * slots,
+            "bounded slot/coefficient extension counts differ");
     target.public_zero_imaginary = true;
     target.public_value_bound_bits.reset();
     for (int invalid = 0; invalid < 10; ++invalid) {
@@ -438,7 +408,7 @@ void TestPublicZeroImaginary(hera::CkksMpcConverter &converter,
     }
 }
 
-void TestPairedRealBoundary(hera::CkksMpcConverter &converter,
+void TestPairedRealBoundary(hera::BlbReferenceConverter &converter,
     hera::PartyRole role, const hera::HeContext &profile,
     const seal::Ciphertext &real_input, int pipe_fd)
 {
@@ -514,10 +484,169 @@ void TestPairedRealBoundary(hera::CkksMpcConverter &converter,
     }
 }
 
+void TestBoundedCkksToMpc(hera::BlbReferenceConverter &converter,
+    hera::PartyRole role, const hera::HeContext &profile,
+    const seal::Ciphertext &input, int pipe_fd)
+{
+    const bool server = role == hera::PartyRole::kServer;
+    const auto slots = profile.slot_count();
+    std::optional<hera::SealCipherBatch> batch;
+    if (server) batch = hera::SealCipherBatch{profile.profile, {input},
+        {{2 * slots}}, hera::Layout::kSpatial,
+        hera::PhysicalSlotMap::DenseComplex(2 * slots, slots)};
+    std::vector<std::complex<double>> expected;
+    if (!server) {
+        auto terminal_input = input;
+        seal::Evaluator evaluator(*profile.context);
+        evaluator.mod_switch_to_inplace(terminal_input, profile.context->last_parms_id());
+        seal::Decryptor decryptor(*profile.context, *profile.secret_key);
+        seal::Plaintext plain;
+        decryptor.decrypt(terminal_input, plain);
+        auto coefficient_plain = plain;
+        seal::util::inverse_ntt_negacyclic_harvey(coefficient_plain.data(),
+            profile.context->last_context_data()->small_ntt_tables()[0]);
+        const auto q = profile.context->last_context_data()->parms().coeff_modulus()[0].value();
+        for (std::size_t i = 0; i < 2 * slots; ++i)
+            Require(std::min(coefficient_plain[i], q - coefficient_plain[i]) < (std::uint64_t{1} << 30),
+                "bounded C2M test producer exceeds its coefficient contract");
+        seal::CKKSEncoder encoder(*profile.context);
+        encoder.decode(plain, expected);
+    }
+    for (int bound : {30, 39, 62}) {
+        const auto before = converter.stats();
+        auto converted = converter.CkksToMpc(batch, std::nullopt, bound);
+        Require(converted.ok(), converted.status().message());
+        const auto after = converter.stats();
+        Require(after.bounded_field_to_ring_elements - before.bounded_field_to_ring_elements ==
+                    2 * slots, "C2M did not use the bounded-only path");
+
+        if (server) {
+            WriteAll(pipe_fd, converted.value().real.local_share.data(), slots * sizeof(std::uint64_t));
+            WriteAll(pipe_fd, converted.value().imag.local_share.data(), slots * sizeof(std::uint64_t));
+        } else {
+            std::vector<std::uint64_t> real(slots), imag(slots);
+            ReadAll(pipe_fd, real.data(), slots * sizeof(std::uint64_t));
+            ReadAll(pipe_fd, imag.data(), slots * sizeof(std::uint64_t));
+            const auto mask = (std::uint64_t{1} << 43) - 1;
+            const auto decode = [mask](std::uint64_t value) {
+                value &= mask;
+                return static_cast<std::int64_t>(value & (std::uint64_t{1} << 42) ? value | ~mask : value) / 8192.0;
+            };
+            for (std::size_t i = 0; i < slots; ++i)
+                Require(std::abs(decode(real[i] + converted.value().real.local_share[i]) - expected[i].real()) <= 2.0 / 8192.0 &&
+                        std::abs(decode(imag[i] + converted.value().imag.local_share[i]) - expected[i].imag()) <= 2.0 / 8192.0,
+                        "bounded C2M exceeds two ULP");
+        }
+    }
+    for (int invalid = 0; invalid < 6; ++invalid) {
+        std::optional<int> bound;
+        if (invalid == 0) bound = -1;
+        if (invalid == 1) bound = 63;
+        if (invalid == 2) bound = server ? 30 : 31;
+        if (invalid == 3 && server) bound = 30;
+        if (invalid == 4 && server) bound = -1;
+        if (invalid == 5 && !server) bound = -1;
+        const auto before = converter.stats();
+        auto rejected = converter.CkksToMpc(batch, std::nullopt, bound);
+        Require(!rejected.ok(), "invalid or mismatched C2M bound was accepted");
+        Require(converter.stats().field_to_ring_batches == before.field_to_ring_batches,
+            "invalid C2M bound entered secure work");
+    }
+}
+
+void TestPublicQuarterRange(hera::PartyRole role,
+                           hera::HeContextRegistry &registry,
+                           const seal::Ciphertext &input, int pipe_fd)
+{
+    const bool server = role == hera::PartyRole::kServer;
+    const auto &profile = registry.Require("test_profile", role);
+    auto config = hera::ConversionConfig{43, 13, 40, 24, true};
+    config.public_c2m_quarter_range = true;
+    config.public_m2c_quarter_range = true;
+    auto wire = hera::MakeNetIoTransport(role, "127.0.0.1", 18950);
+    hera::BlbReferenceConverter converter(role, config, registry, wire,
+        hera::MakeDeterministicRandomSourceForTesting({4, 6, 8}),
+        "127.0.0.1", 19000, 1);
+    std::optional<hera::SealCipherBatch> batch;
+    if (server) batch = hera::SealCipherBatch{profile.profile, {input}, {{8}},
+        hera::Layout::kSpatial, ComplexTestMap(profile.slot_count())};
+    auto converted = converter.CkksToMpc(batch);
+    Require(converted.ok(), converted.status().message());
+    const auto degree = profile.parameters.polynomial_degree;
+    Require(converter.stats().bounded_field_to_ring_elements == degree,
+            "public quarter-range C2M did not use one-OT conversion");
+    if (server) {
+        WriteAll(pipe_fd, converted.value().real.local_share.data(), profile.slot_count() * sizeof(std::uint64_t));
+        WriteAll(pipe_fd, converted.value().imag.local_share.data(), profile.slot_count() * sizeof(std::uint64_t));
+    } else {
+        seal::Evaluator evaluator(*profile.context);
+        auto terminal = input;
+        evaluator.mod_switch_to_inplace(terminal, profile.context->last_parms_id());
+        seal::Decryptor decryptor(*profile.context, *profile.secret_key);
+        seal::Plaintext plain;
+        decryptor.decrypt(terminal, plain);
+        // Establish the fixture precondition independently, including noise.
+        seal::util::inverse_ntt_negacyclic_harvey(plain.data(), profile.context->last_context_data()->small_ntt_tables()[0]);
+        const auto q = profile.context->last_context_data()->parms().coeff_modulus()[0].value();
+        for (std::size_t i = 0; i < degree; ++i)
+            Require(std::min(plain[i], q - plain[i]) < q / 4, "quarter-range fixture is outside its domain");
+        decryptor.decrypt(terminal, plain);
+        seal::CKKSEncoder encoder(*profile.context);
+        std::vector<std::complex<double>> expected;
+        encoder.decode(plain, expected);
+        for (bool imaginary : {false, true}) {
+            std::vector<std::uint64_t> peer(profile.slot_count());
+            ReadAll(pipe_fd, peer.data(), peer.size() * sizeof(std::uint64_t));
+            const auto &local = imaginary ? converted.value().imag.local_share : converted.value().real.local_share;
+            for (std::size_t i = 0; i < peer.size(); ++i) {
+                auto raw = (peer[i] + local[i]) & ((std::uint64_t{1} << 43) - 1);
+                auto signed_value = raw & (std::uint64_t{1} << 42) ?
+                    -static_cast<std::int64_t>((std::uint64_t{1} << 43) - raw) : static_cast<std::int64_t>(raw);
+                const auto target = imaginary ? expected[i].imag() : expected[i].real();
+                Require(std::abs(signed_value / 8192.0 - target) <= 2.0 / 8192,
+                    "public quarter-range C2M exceeds two ULP");
+            }
+        }
+    }
+    // No per-tensor calibration metadata: the exact public quarter-range
+    // precondition must cover both M2C extensions, including Encode output.
+    const auto &target_profile = registry.Require("target_profile", role);
+    const auto target_degree = target_profile.parameters.polynomial_degree;
+    auto source_map = ComplexTestMap(profile.slot_count());
+    auto target_map = ComplexTestMap(target_profile.slot_count());
+    auto encrypted = converter.MpcToCkks(
+        RetargetShares(converted.value(), source_map, target_map),
+        {target_profile.profile, std::size_t{0}, 24, {{8}}, hera::Layout::kSpatial, target_map});
+    Require(encrypted.ok(), encrypted.status().message());
+    const auto stats = converter.stats();
+    Require(stats.bounded_signed_extension_elements == 2 * target_degree &&
+                stats.coefficient_extension_elements == target_degree &&
+                stats.bounded_coefficient_extension_elements == target_degree,
+            "public quarter-range M2C retained generic slot or coefficient comparisons");
+    if (server) hera::SendSealObject(*wire, encrypted.value()->ciphertexts.front());
+    else {
+        auto result = hera::ReceiveSealObject<seal::Ciphertext>(*wire, *target_profile.context);
+        seal::Decryptor decryptor(*profile.context, *profile.secret_key);
+        seal::CKKSEncoder encoder(*profile.context);
+        seal::Decryptor target_decryptor(*target_profile.context, *target_profile.secret_key);
+        seal::CKKSEncoder target_encoder(*target_profile.context);
+        seal::Plaintext plain;
+        std::vector<std::complex<double>> expected, actual;
+        decryptor.decrypt(input, plain);
+        encoder.decode(plain, expected);
+        target_decryptor.decrypt(result, plain);
+        target_encoder.decode(plain, actual);
+        for (std::size_t i = 0; i < actual.size(); ++i)
+            Require(std::abs(actual[i].real() - (i < 4 ? expected[i].real() : 0)) <= 4.0 / 8192 &&
+                        std::abs(actual[i].imag() - (i < 4 ? expected[i].imag() : 0)) <= 4.0 / 8192,
+                    "public quarter-range M2C round trip exceeds four ULP");
+    }
+}
+
 void TestWorkerBatchNegotiation(hera::HeContextRegistry &client_registry,
                                  hera::HeContextRegistry &server_registry)
 {
-    for (int mismatch = 0; mismatch < 2; ++mismatch) {
+    for (int mismatch = 0; mismatch < 5; ++mismatch) {
         const int port = 17500 + 200 * mismatch;
         const auto child = fork();
         Require(child >= 0, "cannot fork converter contract test");
@@ -526,8 +655,11 @@ void TestWorkerBatchNegotiation(hera::HeContextRegistry &client_registry,
         try {
             auto config = hera::ConversionConfig{};
             config.batch_elements = child == 0 && mismatch == 0 ? 32768 : 65536;
+            config.public_c2m_quarter_range = child == 0 && mismatch == 2;
+            config.public_m2c_quarter_range = child == 0 && mismatch == 3;
+            config.benchmark_unchecked_range = child == 0 && mismatch == 4;
             auto transport = hera::MakeNetIoTransport(role, "127.0.0.1", port);
-            hera::CkksMpcConverter converter(role, config,
+            hera::BlbReferenceConverter converter(role, config,
                 child == 0 ? client_registry : server_registry, transport,
                 hera::MakeDeterministicRandomSourceForTesting({1, 3, 5}),
                 "127.0.0.1", port + 20, child == 0 && mismatch == 1 ? 3 : 2);
@@ -550,7 +682,7 @@ int main()
     if (pipe(result_pipe) != 0) return 1;
     try {
         const auto compression = seal::Serialization::compr_mode_default;
-        hera::ConversionConfig protocol{43, 13, 40, 24, true};
+        hera::ConversionConfig protocol{43, 13, 40, 24, true,0,true,true};
         const auto config = TestConfig();
         Require(hera::ValidateHeraConfig(config).ok(), "test config invalid");
         hera::HeContextRegistry client_registry;
@@ -658,7 +790,7 @@ int main()
             try {
                 auto transport = hera::MakeNetIoTransport(
                     hera::PartyRole::kClient, "127.0.0.1", 18150);
-                hera::CkksMpcConverter converter(
+                hera::BlbReferenceConverter converter(
                     hera::PartyRole::kClient, protocol,
                     client_registry, transport,
                     hera::MakeDeterministicRandomSourceForTesting({9, 8, 7}),
@@ -726,7 +858,7 @@ int main()
                 seal::Ciphertext result;
                 result.load(*target_profile.context, stream);
                 Require(target_profile.context->get_context_data(result.parms_id())
-                            ->parms().coeff_modulus().size() == 3,
+                            ->parms().coeff_modulus().size() == 5,
                         "MpcToCkks did not restore the full target RNS level");
                 seal::Decryptor decryptor(*target_profile.context,
                                           target_profile.secret_key.value());
@@ -797,7 +929,7 @@ int main()
                 // Exercise general reduction and a different cached correction,
                 // complementing the full-RNS target's division-free fast path.
                 auto terminal_target = multi_target;
-                terminal_target.target_level = 2;
+                terminal_target.target_level = 4;
                 terminal_target.public_ciphertext_bound_bits = {15, std::nullopt, 15};
                 const auto before_mixed = converter.stats();
                 auto terminal_output = converter.MpcToCkks(
@@ -843,12 +975,15 @@ int main()
                                         target_profile, result_pipe[0]);
                 TestPairedRealBoundary(converter, hera::PartyRole::kClient,
                                        client_profile, real_input, result_pipe[0]);
+                TestBoundedCkksToMpc(converter, hera::PartyRole::kClient,
+                                    client_profile, real_input, result_pipe[0]);
+                TestPublicQuarterRange(hera::PartyRole::kClient, client_registry, real_input, result_pipe[0]);
                 auto obsolete = converter.CkksToMpc(std::nullopt);
                 Require(!obsolete.ok(), "obsolete conversion peer was accepted");
                 const auto client_stats = converter.stats();
                 Require(client_stats.transform_cache_hits >= 2 &&
                             client_stats.transform_cache_misses == 2 &&
-                            client_stats.local_transform_tasks == 19 &&
+                            client_stats.local_transform_tasks == 22 &&
                             client_stats.local_transform_peak_inflight == 2,
                         "client transform cache or pipeline was not exercised");
                 close(result_pipe[0]);
@@ -866,7 +1001,7 @@ int main()
         auto server_random = std::make_shared<CapturingRandomSource>(
             hera::MakeDeterministicRandomSourceForTesting({5, 4, 3}),
             capture);
-        hera::CkksMpcConverter converter(
+        hera::BlbReferenceConverter converter(
             hera::PartyRole::kServer, protocol,
             server_registry, transport, server_random, "", 18300, 2, compression);
         hera::CryptoTensorStore store;
@@ -885,7 +1020,7 @@ int main()
         Require(mpc_handle.ok(), mpc_handle.status().message());
         auto local_share = store.GetMpcShare(mpc_handle.value().id);
         Require(local_share.ok(), local_share.status().message());
-        VerifyCombinedCiphertextMask(*transport, *capture, client_profile, input);
+        VerifyUniformCiphertextMask(*transport, *capture, client_profile, input);
         transport->capture = false;
         transport->sent.clear();
         WriteAll(result_pipe[1], local_share.value().local_share.data(),
@@ -930,7 +1065,7 @@ int main()
             WriteAll(result_pipe[1], multi_bytes.data(), multi_bytes.size());
         }
         auto terminal_target = multi_target;
-        terminal_target.target_level = 2;
+        terminal_target.target_level = 4;
         terminal_target.public_ciphertext_bound_bits = {15, std::nullopt, 15};
         const auto before_mixed = converter.stats();
         auto terminal_output = converter.MpcToCkks(
@@ -954,6 +1089,9 @@ int main()
                                 target_profile, result_pipe[1]);
         TestPairedRealBoundary(converter, hera::PartyRole::kServer,
             server_registry.Require("test_profile", hera::PartyRole::kServer), real_input, result_pipe[1]);
+        TestBoundedCkksToMpc(converter, hera::PartyRole::kServer,
+            server_registry.Require("test_profile", hera::PartyRole::kServer), real_input, result_pipe[1]);
+        TestPublicQuarterRange(hera::PartyRole::kServer, server_registry, real_input, result_pipe[1]);
         transport->obsolete_frame = true;
         auto obsolete = converter.CkksToMpc(batch);
         Require(!obsolete.ok(), "obsolete conversion frame entered secure work");
@@ -963,13 +1101,13 @@ int main()
         Require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
                 "client conversion verification failed");
         const auto stats = converter.stats();
-        Require(stats.a_mask_bytes == 6 * 2048 * sizeof(std::uint64_t),
+        Require(stats.a_mask_bytes == 9 * 2048 * sizeof(std::uint64_t),
                 "A-domain mask accounting mismatch");
-        Require(stats.z_mask_bytes == 6 * 2 * slots * sizeof(std::uint64_t),
-                "Z-domain mask accounting mismatch");
+        Require(stats.z_mask_bytes == 0 && stats.ckks_to_mpc.mask_encode == 0,
+                "redundant Z-mask work remains");
         Require(stats.transform_cache_hits >= 2 &&
                     stats.transform_cache_misses == 2 &&
-                    stats.local_transform_tasks == 19 &&
+                    stats.local_transform_tasks == 22 &&
                     stats.local_transform_peak_inflight == 2,
                 "server transform cache or pipeline was not exercised");
         std::cout << "HERA_CONVERSION_PROTOCOL_STATUS=PASS\n";

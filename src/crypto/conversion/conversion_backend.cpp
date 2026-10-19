@@ -1,3 +1,4 @@
+#include "hera/blb_reference.h"
 #include "hera/conversion_backend.h"
 #include "hera/detail/he_packing.h"
 #include <algorithm>
@@ -113,7 +114,7 @@ Result<PhysicalSlotMap> ConversionPackingRegistry::Resolve(
 }
 
 SealSciConversionBackend::SealSciConversionBackend(
-    PartyRole role, HeContextRegistry &contexts, CkksMpcConverter &converter,
+    PartyRole role, HeContextRegistry &contexts, BlbReferenceConverter &converter,
     CryptoTensorStore &store, ConversionPackingRegistry &packing)
     : role_(role), contexts_(contexts), converter_(converter), store_(store),
       packing_(packing)
